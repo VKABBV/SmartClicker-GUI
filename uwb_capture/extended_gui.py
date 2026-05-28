@@ -1,24 +1,12 @@
 #!/usr/bin/env python3
-"""Launch the UWB capture GUI with added measurement controls.
-
-This file extends the source GUI in serial_to_excel(New).py. The original
-layout is kept; the extensions add:
-
-- a "Constellation Changed" button next to Start/Stop Logging
-- an "Export Measurement List" button in Storage
-- per-anchor true-distance controls in Measurement Session
-- per-anchor Excel export metadata
-"""
+"""Extended UWB capture GUI with measurement workflow controls."""
 
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
 import math
 import re
 import sqlite3
 import statistics
-import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -29,36 +17,8 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill
 from openpyxl.worksheet.datavalidation import DataValidation
 
-sys.dont_write_bytecode = True
+from . import base_gui as original
 
-
-APP_DIR = Path(__file__).resolve().parent
-BASE_DIR = APP_DIR.parent if APP_DIR.name == "__pycache__" else APP_DIR
-ORIGINAL_SOURCE = BASE_DIR / "serial_to_excel(New).py"
-
-
-def load_original_gui_module():
-    if not ORIGINAL_SOURCE.exists():
-        raise FileNotFoundError(
-            "Base GUI source not found. Expected serial_to_excel(New).py at "
-            f"{ORIGINAL_SOURCE}"
-        )
-
-    loader = importlib.machinery.SourceFileLoader(
-        "_original_uwb_capture_gui",
-        str(ORIGINAL_SOURCE),
-    )
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    if spec is None:
-        raise RuntimeError("Could not create loader spec for the original GUI.")
-
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[loader.name] = module
-    loader.exec_module(module)
-    return module
-
-
-original = load_original_gui_module()
 tk = original.tk
 ttk = original.ttk
 filedialog = original.filedialog
@@ -1473,3 +1433,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

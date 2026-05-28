@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compatibility launcher for the base UWB capture GUI."""
+"""Launch the base UWB capture GUI."""
 
 from uwb_capture.base_gui import main
 
