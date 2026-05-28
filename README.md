@@ -12,12 +12,11 @@ python -m pip install -r requirements.txt
 python serial_to_excel_extended_gui.py
 ```
 
-The extended launcher is the normal entry point. Compatibility launchers are
-kept for old shortcuts:
+The extended launcher is the normal entry point. The base GUI is also available
+if you do not need the per-anchor measurement workflow:
 
 ```bash
-python "serial_to_excel(New).py"
-python "serial_to_excel_extended_gui_new (1).py"
+python serial_to_excel.py
 ```
 
 ## Firmware Serial Protocol
