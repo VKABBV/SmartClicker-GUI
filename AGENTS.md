@@ -11,6 +11,8 @@ workflow. Contributors should optimize for recoverability and clarity.
   the prompter directly and suggest one concrete change, such as pausing to
   commit, deleting duplicate files, renaming files consistently, or splitting a
   large request into smaller steps.
+- If the prompter asks for work unrelated to this GUI project, suggest moving
+  that unrelated topic into a separate conversation before continuing.
 - Prefer clear module boundaries: serial I/O, parsing, persistence, export, and
   GUI widgets should stay easy to edit independently.
 - Before finishing, run a lightweight validation command and report what passed
