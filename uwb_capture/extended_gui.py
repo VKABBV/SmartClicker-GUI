@@ -28,6 +28,9 @@ SOURCE_DIRECT = "direct laser"
 SOURCE_PYTHAGOREAN = "pythagorean calculation"
 SOURCE_LEGACY = "legacy session laser"
 ANCHOR_TRUTH_TABLE = "anchor_true_distances"
+RESPONDER_LABEL_TABLE = "responder_los_nlos_labels"
+UNKNOWN_LOS_NLOS = "Unknown"
+LOS_NLOS_OPTIONS = (UNKNOWN_LOS_NLOS, "LOS", "NLOS")
 ILLEGAL_EXCEL_CHARS_RE = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]")
 
 
@@ -94,12 +97,38 @@ def next_constellation_label(current: str) -> str:
     return f"{prefix}{int(number) + 1}"
 
 
+def normalize_los_nlos(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if text == "LOS":
+        return "LOS"
+    if text == "NLOS":
+        return "NLOS"
+    return UNKNOWN_LOS_NLOS
+
+
+def ensure_responder_label_schema(con: sqlite3.Connection) -> None:
+    con.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {RESPONDER_LABEL_TABLE} (
+            session_id TEXT NOT NULL,
+            anchor_id TEXT NOT NULL,
+            ground_truth_los_nlos TEXT NOT NULL DEFAULT 'Unknown',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (session_id, anchor_id),
+            FOREIGN KEY(session_id) REFERENCES sessions(id)
+        )
+        """
+    )
+    con.commit()
+
+
 class ExtendedUwbCaptureApp(original.UwbCaptureApp):
     """Original GUI plus targeted measurement workflow extensions."""
 
     def __init__(self) -> None:
         super().__init__()
         self.anchor_true_distances: dict[str, dict[str, Any]] = {}
+        self.anchor_los_nlos: dict[str, str] = {}
         self.detected_anchor_ids: set[str] = set()
         self._pyth_updating = False
         self._install_extensions()
@@ -129,8 +158,8 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
 
         condition_row = ttk.Frame(frame)
         condition_row.grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
-        ttk.Checkbutton(condition_row, text="LOS", variable=self.los_var).pack(side=tk.LEFT)
-        ttk.Checkbutton(condition_row, text="NLOS", variable=self.nlos_var).pack(side=tk.LEFT, padx=(14, 0))
+        ttk.Checkbutton(condition_row, text="Session hint LOS", variable=self.los_var).pack(side=tk.LEFT)
+        ttk.Checkbutton(condition_row, text="Session hint NLOS", variable=self.nlos_var).pack(side=tk.LEFT, padx=(14, 0))
 
         self._build_serial_control(frame, 3)
 
@@ -194,6 +223,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
 
         self.anchor_id_var = tk.StringVar()
         self.anchor_true_distance_var = tk.StringVar()
+        self.anchor_los_nlos_var = tk.StringVar(value=UNKNOWN_LOS_NLOS)
         self.pyth_side_a_var = tk.StringVar()
         self.pyth_side_b_var = tk.StringVar()
         self.pyth_result_var = tk.StringVar(value="")
@@ -208,7 +238,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
 
         container = ttk.LabelFrame(
             session_frame,
-            text="Per-anchor true distance",
+            text="Per-responder distance and LOS/NLOS",
             padding=8,
         )
         container.grid(
@@ -221,7 +251,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         container.columnconfigure(1, weight=1)
         container.columnconfigure(3, weight=1)
 
-        ttk.Label(container, text="Anchor ID").grid(row=0, column=0, sticky="w")
+        ttk.Label(container, text="Responder ID").grid(row=0, column=0, sticky="w")
         self.anchor_id_combo = ttk.Combobox(
             container,
             textvariable=self.anchor_id_var,
@@ -244,8 +274,23 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             command=self.save_direct_true_distance,
         ).grid(row=0, column=4, sticky="ew")
 
+        ttk.Label(container, text="LOS/NLOS").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.anchor_los_nlos_combo = ttk.Combobox(
+            container,
+            textvariable=self.anchor_los_nlos_var,
+            values=LOS_NLOS_OPTIONS,
+            state="readonly",
+            width=16,
+        )
+        self.anchor_los_nlos_combo.grid(row=1, column=1, sticky="ew", padx=(6, 12), pady=(8, 0))
+        ttk.Button(
+            container,
+            text="Save LOS/NLOS for responder",
+            command=self.save_anchor_los_nlos,
+        ).grid(row=1, column=2, columnspan=3, sticky="ew", pady=(8, 0))
+
         helper = ttk.Frame(container)
-        helper.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+        helper.grid(row=2, column=0, columnspan=5, sticky="ew", pady=(8, 0))
         for col in (1, 3, 5):
             helper.columnconfigure(col, weight=1)
 
@@ -298,17 +343,19 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
 
         self.anchor_truth_table = ttk.Treeview(
             container,
-            columns=("anchor_id", "true_distance_m", "distance_source"),
+            columns=("anchor_id", "true_distance_m", "distance_source", "los_nlos"),
             show="headings",
             height=4,
         )
-        self.anchor_truth_table.heading("anchor_id", text="Anchor ID")
+        self.anchor_truth_table.heading("anchor_id", text="Responder ID")
         self.anchor_truth_table.heading("true_distance_m", text="True distance m")
         self.anchor_truth_table.heading("distance_source", text="True distance source")
+        self.anchor_truth_table.heading("los_nlos", text="LOS/NLOS")
         self.anchor_truth_table.column("anchor_id", width=90, anchor="center")
         self.anchor_truth_table.column("true_distance_m", width=130, anchor="center")
         self.anchor_truth_table.column("distance_source", width=190, anchor="w")
-        self.anchor_truth_table.grid(row=2, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+        self.anchor_truth_table.column("los_nlos", width=90, anchor="center")
+        self.anchor_truth_table.grid(row=3, column=0, columnspan=5, sticky="ew", pady=(8, 0))
         self.anchor_truth_table.bind("<<TreeviewSelect>>", self.on_anchor_truth_selected)
 
         self.pyth_side_a_var.trace_add("write", self._on_pythagorean_sides_changed)
@@ -337,8 +384,8 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         anchor_id = self.anchor_id_var.get().strip()
         if not anchor_id:
             messagebox.showerror(
-                "Missing anchor ID",
-                "Select or enter an Anchor ID before saving a true distance.",
+                "Missing responder ID",
+                "Select or enter a responder ID before saving.",
                 parent=self,
             )
             return None
@@ -469,6 +516,17 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             None,
         )
 
+    def save_anchor_los_nlos(self) -> None:
+        anchor_id = self._selected_anchor_id()
+        if anchor_id is None:
+            return
+        condition = normalize_los_nlos(self.anchor_los_nlos_var.get())
+        self.anchor_los_nlos[anchor_id] = condition
+        self._register_detected_anchor(anchor_id)
+        self._refresh_anchor_truth_table()
+        self._persist_anchor_los_nlos(anchor_id)
+        self.log_raw(f"# LOS/NLOS saved for responder {anchor_id}: {condition}")
+
     def calculate_pythagorean_distance(self) -> float | None:
         side_a = self._positive_float_from_var(self.pyth_side_a_var, "Pythagorean Side A")
         side_b = self._positive_float_from_var(self.pyth_side_b_var, "Pythagorean Side B")
@@ -532,10 +590,16 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         if not values:
             return
         anchor_id = str(values[0])
+        self.anchor_id_var.set(anchor_id)
+        self.anchor_los_nlos_var.set(self._anchor_los_nlos_for(anchor_id))
         data = self.anchor_true_distances.get(anchor_id)
         if not data:
+            self.anchor_true_distance_var.set("")
+            self.pyth_side_a_var.set("")
+            self.pyth_side_b_var.set("")
+            self.pyth_result_var.set("")
+            self._draw_pythagorean_triangle()
             return
-        self.anchor_id_var.set(anchor_id)
         self.anchor_true_distance_var.set(format_meter(data["true_distance_m"]))
         self.pyth_side_a_var.set(
             "" if data.get("pythagorean_side_a_m") is None else format_meter(data["pythagorean_side_a_m"])
@@ -554,15 +618,20 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             return
         for item in self.anchor_truth_table.get_children():
             self.anchor_truth_table.delete(item)
-        for anchor_id in sorted(self.anchor_true_distances, key=str):
-            data = self.anchor_true_distances[anchor_id]
+        anchor_ids = sorted(
+            set(self.detected_anchor_ids) | set(self.anchor_true_distances) | set(self.anchor_los_nlos),
+            key=str,
+        )
+        for anchor_id in anchor_ids:
+            data = self.anchor_true_distances.get(anchor_id)
             self.anchor_truth_table.insert(
                 "",
                 tk.END,
                 values=(
                     anchor_id,
-                    format_meter(data["true_distance_m"]),
-                    data["distance_source"],
+                    format_meter(data["true_distance_m"], "") if data else "",
+                    data["distance_source"] if data else "",
+                    self._anchor_los_nlos_for(anchor_id),
                 ),
             )
 
@@ -572,9 +641,12 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         anchor_text = str(anchor_id).strip()
         if not anchor_text:
             return
+        was_new = anchor_text not in self.detected_anchor_ids
         self.detected_anchor_ids.add(anchor_text)
         if hasattr(self, "anchor_id_combo"):
             self.anchor_id_combo.configure(values=sorted(self.detected_anchor_ids, key=str))
+        if was_new:
+            self._refresh_anchor_truth_table()
 
     def mark_constellation_changed(self) -> None:
         self.open_constellation_dialog()
@@ -728,6 +800,38 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         for anchor_id in list(self.anchor_true_distances):
             self._persist_anchor_true_distance(anchor_id)
 
+    def _ensure_responder_label_schema(self) -> None:
+        store = getattr(self, "store", None)
+        if store is None:
+            return
+        ensure_responder_label_schema(store.conn)
+
+    def _persist_anchor_los_nlos(self, anchor_id: str) -> None:
+        store = getattr(self, "store", None)
+        session_id = getattr(self, "current_session_id", None)
+        if store is None or not session_id:
+            return
+        self._ensure_responder_label_schema()
+        store.conn.execute(
+            f"""
+            INSERT OR REPLACE INTO {RESPONDER_LABEL_TABLE} (
+                session_id, anchor_id, ground_truth_los_nlos, updated_at
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                anchor_id,
+                self._anchor_los_nlos_for(anchor_id),
+                original.now_local_iso(),
+            ),
+        )
+        store.conn.commit()
+
+    def _persist_all_anchor_los_nlos(self) -> None:
+        for anchor_id in list(self.anchor_los_nlos):
+            self._persist_anchor_los_nlos(anchor_id)
+
     def _anchor_true_distance_for(self, anchor_id: Any) -> dict[str, Any] | None:
         if anchor_id not in (None, ""):
             data = self.anchor_true_distances.get(str(anchor_id).strip())
@@ -735,12 +839,19 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
                 return data
         return None
 
+    def _anchor_los_nlos_for(self, anchor_id: Any) -> str:
+        if anchor_id in (None, ""):
+            return UNKNOWN_LOS_NLOS
+        return normalize_los_nlos(self.anchor_los_nlos.get(str(anchor_id).strip(), UNKNOWN_LOS_NLOS))
+
     def start_capture(self) -> None:
         super().start_capture()
         if getattr(self, "store", None) is None or not getattr(self, "current_session_id", None):
             return
         self._ensure_anchor_truth_schema()
+        self._ensure_responder_label_schema()
         self._persist_all_anchor_true_distances()
+        self._persist_all_anchor_los_nlos()
 
     def handle_serial_line(self, line: str) -> None:
         for record in original.parse_serial_line(line):
@@ -764,8 +875,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         if (
             getattr(self, "store", None) is not None
             and getattr(self, "current_session_id", None)
-            and self.los_var.get()
-            and not self.nlos_var.get()
+            and self._anchor_los_nlos_for(record.anchor_id) == "LOS"
             and absolute_error > threshold
         ):
             anchor = record.anchor_id or "unknown"
@@ -848,7 +958,9 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
                 return
 
         self._ensure_anchor_truth_schema()
+        self._ensure_responder_label_schema()
         self._persist_all_anchor_true_distances()
+        self._persist_all_anchor_los_nlos()
 
         output_dir = filedialog.askdirectory(
             initialdir=self.output_dir_var.get(),
@@ -953,6 +1065,23 @@ def fetch_anchor_truths(con: sqlite3.Connection, session_id: str) -> dict[str, d
     }
 
 
+def fetch_anchor_los_nlos(con: sqlite3.Connection, session_id: str) -> dict[str, str]:
+    if not table_exists(con, RESPONDER_LABEL_TABLE):
+        return {}
+    rows = con.execute(
+        f"""
+        SELECT anchor_id, ground_truth_los_nlos
+        FROM {RESPONDER_LABEL_TABLE}
+        WHERE session_id = ?
+        """,
+        (session_id,),
+    ).fetchall()
+    return {
+        str(row["anchor_id"]): normalize_los_nlos(row["ground_truth_los_nlos"])
+        for row in rows
+    }
+
+
 def session_anchor_ids(con: sqlite3.Connection, session_id: str) -> list[str]:
     rows = con.execute(
         """
@@ -993,9 +1122,9 @@ def export_session_per_anchor(
         raise ValueError(f"Unknown session id: {session_id}")
 
     truths = fetch_anchor_truths(con, session_id)
+    los_nlos_by_anchor = fetch_anchor_los_nlos(con, session_id)
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    condition = condition_label_from_session(session)
     constellation = safe_filename(session["constellation_label"] or "constellation")
 
     paths: list[Path] = []
@@ -1018,6 +1147,7 @@ def export_session_per_anchor(
         ).fetchall()
 
         truth = truths.get(anchor_id)
+        los_nlos = los_nlos_by_anchor.get(anchor_id, UNKNOWN_LOS_NLOS)
         mean_measured = measured_mean_for_anchor(samples, summaries)
 
         filename = (
@@ -1025,13 +1155,14 @@ def export_session_per_anchor(
             f"ANCHOR_{safe_filename(anchor_id)}_"
             f"TRUE_{format_meter(truth['true_distance_m'] if truth else None)}m_"
             f"MEASURED_{format_meter(mean_measured)}m_"
-            f"{safe_filename(condition)}_{timestamp}.xlsx"
+            f"{safe_filename(los_nlos)}_{timestamp}.xlsx"
         )
         path = output_dir / filename
         write_anchor_session_workbook(
             session,
             anchor_id,
             truth,
+            los_nlos,
             samples,
             summaries,
             alerts,
@@ -1047,6 +1178,7 @@ def write_anchor_session_workbook(
     session: sqlite3.Row,
     anchor_id: str,
     truth: dict[str, Any] | None,
+    los_nlos: str,
     samples: list[sqlite3.Row],
     summaries: list[sqlite3.Row],
     alerts: list[sqlite3.Row],
@@ -1062,7 +1194,7 @@ def write_anchor_session_workbook(
     true_source = truth["distance_source"] if truth else ""
     side_a = truth.get("pythagorean_side_a_m") if truth else None
     side_b = truth.get("pythagorean_side_b_m") if truth else None
-    condition = condition_label_from_session(session)
+    los_nlos = normalize_los_nlos(los_nlos)
 
     columns = [
         "timestamp",
@@ -1102,7 +1234,7 @@ def write_anchor_session_workbook(
                 true_source,
                 side_a,
                 side_b,
-                condition,
+                los_nlos,
                 row["rx_power_dbm"],
                 row["fp_power_dbm"],
                 row["cir_power"],
@@ -1141,7 +1273,7 @@ def write_anchor_session_workbook(
                 true_source,
                 side_a,
                 side_b,
-                condition,
+                los_nlos,
                 abs(float(row["mean_distance_m"]) - float(true_distance))
                 if row["mean_distance_m"] is not None and true_distance is not None
                 else None,
@@ -1169,7 +1301,8 @@ def write_anchor_session_workbook(
             ["started_at", session["started_at"]],
             ["stopped_at", session["stopped_at"]],
             ["constellation_label", session["constellation_label"]],
-            ["los_nlos", condition],
+            ["session_condition_hint", condition_text(session)],
+            ["los_nlos", los_nlos],
             ["anchor_id", anchor_id],
             ["mean_measured_uwb_distance_m", mean_measured],
             ["true_ground_truth_distance_m", true_distance],
@@ -1261,6 +1394,17 @@ def build_measurement_rows(db_path: Path) -> list[dict[str, Any]]:
             if table_exists(con, ANCHOR_TRUTH_TABLE)
             else []
         )
+
+        label_rows = (
+            con.execute(
+                f"""
+                SELECT session_id, anchor_id, ground_truth_los_nlos
+                FROM {RESPONDER_LABEL_TABLE}
+                """
+            ).fetchall()
+            if table_exists(con, RESPONDER_LABEL_TABLE)
+            else []
+        )
     finally:
         con.close()
 
@@ -1279,6 +1423,11 @@ def build_measurement_rows(db_path: Path) -> list[dict[str, Any]]:
     for row in truth_rows:
         anchor_id = row["anchor_id"] or ""
         truth_by_key[(row["session_id"], anchor_id)] = row
+
+    label_by_key: dict[tuple[str, str], str] = {}
+    for row in label_rows:
+        anchor_id = row["anchor_id"] or ""
+        label_by_key[(row["session_id"], anchor_id)] = normalize_los_nlos(row["ground_truth_los_nlos"])
 
     session_by_id = {row["id"]: row for row in sessions}
     keys = sorted(
@@ -1317,6 +1466,7 @@ def build_measurement_rows(db_path: Path) -> list[dict[str, Any]]:
                 "pythagorean_side_b_m": truth["pythagorean_side_b_m"] if truth is not None else None,
                 "session_ground_truth_m": session["ground_truth_m"],
                 "outlier_threshold_m": session["outlier_threshold_m"],
+                "ground_truth_los_nlos": label_by_key.get((session_id, anchor_id), UNKNOWN_LOS_NLOS),
                 "status": latest_summary["status"] if latest_summary is not None else "",
                 "source": latest_summary["source"] if latest_summary is not None else "",
             }
@@ -1413,7 +1563,7 @@ def write_measurement_workbook(rows: list[dict[str, Any]], path: Path) -> None:
 
     info = wb.create_sheet("Instructions")
     info.append(["Field", "How to use it"])
-    info.append(["Yellow cells", "Fill these after the capture session: tag ID, LOS/NLOS ground truth, and notes."])
+    info.append(["Yellow cells", "Review or adjust after the capture session: tag ID, LOS/NLOS ground truth, and notes."])
     info.append(["true_ground_truth_distance_m", "Per-anchor true tag-to-anchor distance saved in the Measurement Session controls."])
     info.append(["true_distance_source", "direct laser or pythagorean calculation."])
     info.append(["range_minus_true_m", "UWB mean distance minus the saved per-anchor true distance."])

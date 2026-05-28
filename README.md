@@ -19,6 +19,11 @@ if you do not need the per-anchor measurement workflow:
 python serial_to_excel.py
 ```
 
+In the extended GUI, detected responder IDs appear in the per-responder table.
+After a capture, select each responder ID and save its own LOS/NLOS label before
+exporting; the per-anchor workbooks and measurement-list workbook use those
+independent labels.
+
 ## Firmware Serial Protocol
 
 The GUI parses these CSV-style firmware rows:
