@@ -67,6 +67,9 @@ class UwbCaptureApp(tk.Tk):
         self.constellation_var = tk.StringVar()
         self.los_var = tk.BooleanVar(value=True)
         self.nlos_var = tk.BooleanVar(value=False)
+        self.send_start_stop_var = tk.BooleanVar(value=True)
+        self.start_command_var = tk.StringVar(value="START")
+        self.stop_command_var = tk.StringVar(value="STOP")
         self.ground_truth_var = tk.StringVar()
         self.threshold_var = tk.StringVar(value="0.50")
         self.instability_threshold_var = tk.StringVar(value="0.35")
@@ -168,8 +171,10 @@ class UwbCaptureApp(tk.Tk):
         ttk.Checkbutton(condition_row, text="LOS", variable=self.los_var).pack(side=tk.LEFT)
         ttk.Checkbutton(condition_row, text="NLOS", variable=self.nlos_var).pack(side=tk.LEFT, padx=(14, 0))
 
+        self._build_serial_control(frame, 5)
+
         action_row = ttk.Frame(frame)
-        action_row.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        action_row.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(10, 0))
         action_row.columnconfigure(0, weight=1)
         action_row.columnconfigure(1, weight=1)
         self.start_button = ttk.Button(action_row, text="Start Logging", style="Accent.TButton", command=self.start_capture)
@@ -178,11 +183,39 @@ class UwbCaptureApp(tk.Tk):
         self.stop_button.grid(row=0, column=1, sticky="ew", padx=(5, 0))
 
         ttk.Label(frame, textvariable=self.session_status_var, style="Status.TLabel").grid(
-            row=6,
+            row=7,
             column=0,
             columnspan=3,
             sticky="w",
             pady=(8, 0),
+        )
+
+    def _build_serial_control(self, parent: ttk.Frame, row: int) -> None:
+        control = ttk.LabelFrame(parent, text="Firmware serial control", padding=6)
+        control.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        control.columnconfigure(1, weight=1)
+        control.columnconfigure(3, weight=1)
+
+        ttk.Checkbutton(
+            control,
+            text="Send START/STOP",
+            variable=self.send_start_stop_var,
+        ).grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(control, text="Start").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(control, textvariable=self.start_command_var, width=10).grid(
+            row=1,
+            column=1,
+            sticky="ew",
+            padx=(6, 12),
+            pady=(6, 0),
+        )
+        ttk.Label(control, text="Stop").grid(row=1, column=2, sticky="w", pady=(6, 0))
+        ttk.Entry(control, textvariable=self.stop_command_var, width=10).grid(
+            row=1,
+            column=3,
+            sticky="ew",
+            padx=(6, 0),
+            pady=(6, 0),
         )
 
     def _build_storage_panel(self, parent: ttk.Frame) -> None:
@@ -394,11 +427,16 @@ class UwbCaptureApp(tk.Tk):
         self.anchor_distance_windows.clear()
         self.session_status_var.set(f"Capturing: {self.current_session_id[:8]}")
         self.log_raw(f"# Started session {self.current_session_id}")
-        self.log_raw("# Waiting for button-triggered serial readings from the tag.")
+        if metadata["send_start_stop"]:
+            self.send_serial_command(str(metadata["start_command"] or ""), "start")
+        else:
+            self.log_raw("# Waiting for button-triggered serial readings from the tag.")
 
     def stop_capture(self) -> None:
         if not self.capture_active:
             return
+        if self.send_start_stop_var.get():
+            self.send_serial_command(self.stop_command_var.get(), "stop")
         self.capture_active = False
         if self.store is not None and self.current_session_id is not None:
             self.store.finish_session(self.current_session_id)
@@ -434,9 +472,9 @@ class UwbCaptureApp(tk.Tk):
             "ground_truth_m": ground_truth,
             "outlier_threshold_m": threshold,
             "notes": "",
-            "send_start_stop": False,
-            "start_command": "",
-            "stop_command": "",
+            "send_start_stop": self.send_start_stop_var.get(),
+            "start_command": self.start_command_var.get().strip(),
+            "stop_command": self.stop_command_var.get().strip(),
         }
 
     def process_events(self) -> None:
@@ -645,4 +683,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

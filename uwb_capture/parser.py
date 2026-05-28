@@ -87,6 +87,27 @@ def parse_serial_line(line: str) -> list[ParsedRecord]:
                     raw_line=raw_line,
                 )
             )
+        elif tag == "NLOS" and len(parts) >= 3:
+            status = "nlos_invalid" if parts[2].lower() == "invalid" else "nlos"
+            records.append(
+                ParsedRecord(
+                    kind="nlos",
+                    anchor_id=parts[1],
+                    status=status,
+                    error_code=parts[3] if status == "nlos_invalid" and len(parts) > 3 else None,
+                    source="serial_nlos",
+                    raw_line=raw_line,
+                )
+            )
+        elif tag == "PHY" and len(parts) >= 9:
+            records.append(
+                ParsedRecord(
+                    kind="phy",
+                    status="phy",
+                    source="serial_phy",
+                    raw_line=raw_line,
+                )
+            )
         elif tag == "FAIL" and len(parts) >= 2:
             records.append(
                 ParsedRecord(
@@ -125,4 +146,3 @@ def parse_serial_line(line: str) -> list[ParsedRecord]:
         )
 
     return records
-

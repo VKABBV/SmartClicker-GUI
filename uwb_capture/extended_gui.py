@@ -132,8 +132,10 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         ttk.Checkbutton(condition_row, text="LOS", variable=self.los_var).pack(side=tk.LEFT)
         ttk.Checkbutton(condition_row, text="NLOS", variable=self.nlos_var).pack(side=tk.LEFT, padx=(14, 0))
 
+        self._build_serial_control(frame, 3)
+
         action_row = ttk.Frame(frame)
-        action_row.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        action_row.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(10, 0))
         action_row.columnconfigure(0, weight=1)
         action_row.columnconfigure(1, weight=1)
         self.start_button = ttk.Button(
@@ -147,14 +149,14 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self.stop_button.grid(row=0, column=1, sticky="ew", padx=(5, 0))
 
         ttk.Label(frame, textvariable=self.constellation_status_var).grid(
-            row=4,
+            row=5,
             column=0,
             columnspan=3,
             sticky="w",
             pady=(8, 0),
         )
         ttk.Label(frame, textvariable=self.session_status_var, style="Status.TLabel").grid(
-            row=5,
+            row=6,
             column=0,
             columnspan=3,
             sticky="w",
@@ -1433,4 +1435,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
