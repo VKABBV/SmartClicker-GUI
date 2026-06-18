@@ -1,7 +1,7 @@
 # Kenneth GUI
 
-Tkinter GUI for capturing IMEC UWB serial output, storing sessions in SQLite,
-and exporting measurement workbooks.
+Tkinter GUI for capturing IMEC UWB/BLE measurement reports, storing sessions in
+SQLite, and exporting measurement workbooks.
 
 ## Run
 
@@ -24,9 +24,45 @@ After a capture, select each responder ID and save its own LOS/NLOS label before
 exporting; the per-anchor workbooks and measurement-list workbook use those
 independent labels.
 
-## Firmware Serial Protocol
+## Bluetooth Protocol Workflow
 
-The GUI parses these CSV-style firmware rows:
+The GUI now treats Connect and Disconnect as BLE transport actions. Enter or
+scan for the BLE device, provide the notify and write characteristic UUIDs from
+the firmware, then connect. Start Logging and Stop Logging only control the
+local capture session; they do not send text commands such as `START` or `STOP`.
+
+The measurement/export workflow expects these incoming IMEC binary messages:
+
+```text
+0x20 CLICK_REPORT           normal click distance measurements
+0x22 ANCHOR_HEARTBEAT       device health/status telemetry
+0x41 COMMAND_RESULT         result for a GUI command
+0x51 SURVEY_REACH_REPORT    anchor reachability survey output
+0x53 SURVEY_PAIR_RESULT     anchor-to-anchor distance measurements
+0x7F MSG_ERROR              protocol or firmware error
+```
+
+The GUI exposes these outgoing command buttons:
+
+```text
+CMD_GET_STATUS          0x0002
+CMD_START_HEARTBEAT     0x0009
+CMD_STOP_HEARTBEAT      0x000A
+CMD_SURVEY_REACHABILITY 0x0100
+CMD_SURVEY_PREPARE_PAIR 0x0101
+CMD_SURVEY_START_PAIR   0x0102
+CMD_SURVEY_ABORT        0x0103
+```
+
+The command packets use the shared IMEC binary envelope and TLV payloads from
+`UWB+BLE Protocols and Strategies 0.2.48.md`. Device IDs may be entered as
+decimal, `0x` hex, or colon-separated hex. `Target ID` can be `0` for broadcast
+where the firmware allows broadcast handling.
+
+## Legacy Text Parser
+
+For compatibility, BLE notifications that contain text are still parsed with the
+older CSV-style firmware parser:
 
 ```text
 S,node_id,sample_index,distance_m[,source]
@@ -38,23 +74,21 @@ CIR,node_id,start_sample,count,real0,imag0,real1,imag1,...
 PHY,channel,prf_mhz,preamble_code,preamble_symbols,data_rate_kbps,pac_size,ntm_1,ntm_2,smart_tx_power_enabled,tx_power
 ```
 
-Start Logging sends `START` by default. Stop Logging sends `STOP` by default.
-Both commands can be edited or disabled in the Firmware serial control section.
-
 ## Project Layout
 
 ```text
 uwb_capture/common.py       shared helpers and ParsedRecord model
-uwb_capture/parser.py       serial line parser
-uwb_capture/serial_io.py    pyserial background reader and writer
+uwb_capture/protocol.py     IMEC binary packet/TLV codec
+uwb_capture/bluetooth_io.py BLE scanner, connector, and packet writer
+uwb_capture/parser.py       legacy text line parser
 uwb_capture/store.py        SQLite persistence and base workbook export
 uwb_capture/base_gui.py     base capture GUI
 uwb_capture/extended_gui.py extended workflow, per-anchor truth, and exports
 tests/test_parser.py        parser regression tests
 ```
 
-Keep serial I/O, parsing, persistence, export, and GUI widgets separate when
-editing. Commit after each coherent change.
+Keep Bluetooth I/O, protocol parsing, persistence, export, and GUI widgets
+separate when editing. Commit after each coherent change.
 
 ## Validate
 

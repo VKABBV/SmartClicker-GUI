@@ -14,7 +14,6 @@ from tkinter import filedialog, messagebox, ttk
 
 from .common import (
     ALERT_PROMPT_COOLDOWN_SECONDS,
-    DEFAULT_BAUD,
     DEFAULT_DB_NAME,
     INSTABILITY_WINDOW_SIZE,
     MAX_TABLE_ROWS,
@@ -24,8 +23,24 @@ from .common import (
     safe_float,
     safe_int,
 )
+from .bluetooth_io import BluetoothDeviceInfo, BluetoothScanner, BluetoothWorker
 from .parser import parse_serial_line
-from .serial_io import SerialException, SerialWorker, list_ports
+from .protocol import (
+    CommandId,
+    ImecPacket,
+    ProtocolError,
+    build_command_packet,
+    build_command_tlvs,
+    command_result_summary,
+    decode_packet,
+    format_device_id,
+    next_sequence,
+    packet_summary,
+    parse_device_id,
+    records_from_packet,
+    status_report_summary,
+    survey_reach_summary,
+)
 from .store import MeasurementStore
 
 APP_DIR = Path(__file__).resolve().parent.parent
@@ -38,10 +53,11 @@ class UwbCaptureApp(tk.Tk):
         self.geometry("1200x760")
         self.minsize(980, 620)
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
-        self.serial_worker: SerialWorker | None = None
-        self.connected_port: str | None = None
-        self.port_infos: dict[str, Any] = {}
-        self.last_port_devices: tuple[str, ...] = ()
+        self.bluetooth_worker: BluetoothWorker | None = None
+        self.connected_device: str | None = None
+        self.device_infos: dict[str, BluetoothDeviceInfo] = {}
+        self.protocol_sequence = 0
+        self.protocol_session_seed = int(time.time()) & 0xFFFFFFFF
         self.capture_active = False
         self.current_session_id: str | None = None
         self.store: MeasurementStore | None = None
@@ -52,8 +68,6 @@ class UwbCaptureApp(tk.Tk):
         self._build_variables()
         self._build_style()
         self._build_layout()
-        self.refresh_ports()
-        self.after(500, self.auto_port_poll)
         self.after(80, self.process_events)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -61,15 +75,20 @@ class UwbCaptureApp(tk.Tk):
         DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         self.output_dir_var = tk.StringVar(value=str(DEFAULT_OUTPUT_DIR))
         self.db_path_var = tk.StringVar(value=str(DEFAULT_OUTPUT_DIR / DEFAULT_DB_NAME))
-        self.port_var = tk.StringVar()
-        self.baud_var = tk.StringVar(value=str(DEFAULT_BAUD))
-        self.auto_connect_var = tk.BooleanVar(value=True)
+        self.device_var = tk.StringVar()
+        self.notify_uuid_var = tk.StringVar()
+        self.write_uuid_var = tk.StringVar()
+        self.auto_connect_var = tk.BooleanVar(value=False)
+        self.gateway_id_var = tk.StringVar(value="0")
+        self.target_id_var = tk.StringVar(value="0")
+        self.heartbeat_interval_ms_var = tk.StringVar(value="60000")
+        self.survey_id_var = tk.StringVar(value=str(self.protocol_session_seed))
+        self.survey_initiator_id_var = tk.StringVar()
+        self.survey_responder_id_var = tk.StringVar()
+        self.survey_sample_count_var = tk.StringVar(value="10")
         self.constellation_var = tk.StringVar()
         self.los_var = tk.BooleanVar(value=True)
         self.nlos_var = tk.BooleanVar(value=False)
-        self.send_start_stop_var = tk.BooleanVar(value=True)
-        self.start_command_var = tk.StringVar(value="START")
-        self.stop_command_var = tk.StringVar(value="STOP")
         self.ground_truth_var = tk.StringVar()
         self.threshold_var = tk.StringVar(value="0.50")
         self.instability_threshold_var = tk.StringVar(value="0.35")
@@ -111,19 +130,33 @@ class UwbCaptureApp(tk.Tk):
         self._build_log_panel(right)
 
     def _build_connection_panel(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="Serial Connection", padding=8)
+        frame = ttk.LabelFrame(parent, text="Bluetooth Connection", padding=8)
         frame.pack(fill=tk.X, pady=(0, 8))
         frame.columnconfigure(1, weight=1)
 
-        ttk.Label(frame, text="Port").grid(row=0, column=0, sticky="w", pady=2)
-        self.port_combo = ttk.Combobox(frame, textvariable=self.port_var, state="normal")
-        self.port_combo.grid(row=0, column=1, sticky="ew", pady=2)
-        ttk.Button(frame, text="Refresh", command=self.refresh_ports).grid(row=0, column=2, padx=(6, 0), pady=2)
+        ttk.Label(frame, text="Device").grid(row=0, column=0, sticky="w", pady=2)
+        self.device_combo = ttk.Combobox(frame, textvariable=self.device_var, state="normal")
+        self.device_combo.grid(row=0, column=1, sticky="ew", pady=2)
+        ttk.Button(frame, text="Scan", command=self.refresh_devices).grid(row=0, column=2, padx=(6, 0), pady=2)
 
-        ttk.Label(frame, text="Baud").grid(row=1, column=0, sticky="w", pady=2)
-        ttk.Entry(frame, textvariable=self.baud_var, width=12).grid(row=1, column=1, sticky="w", pady=2)
-        ttk.Checkbutton(frame, text="Auto-connect", variable=self.auto_connect_var).grid(
+        ttk.Label(frame, text="Notify UUID").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Entry(frame, textvariable=self.notify_uuid_var).grid(
+            row=1,
+            column=1,
+            columnspan=2,
+            sticky="ew",
+            pady=2,
+        )
+        ttk.Label(frame, text="Write UUID").grid(row=2, column=0, sticky="w", pady=2)
+        ttk.Entry(frame, textvariable=self.write_uuid_var).grid(
             row=2,
+            column=1,
+            columnspan=2,
+            sticky="ew",
+            pady=2,
+        )
+        ttk.Checkbutton(frame, text="Auto-connect", variable=self.auto_connect_var).grid(
+            row=3,
             column=0,
             columnspan=3,
             sticky="w",
@@ -131,12 +164,12 @@ class UwbCaptureApp(tk.Tk):
         )
 
         button_row = ttk.Frame(frame)
-        button_row.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        button_row.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         button_row.columnconfigure(0, weight=1)
         button_row.columnconfigure(1, weight=1)
-        self.connect_button = ttk.Button(button_row, text="Connect", command=self.connect_selected_port)
+        self.connect_button = ttk.Button(button_row, text="Connect", command=self.connect_selected_device)
         self.connect_button.grid(row=0, column=0, sticky="ew", padx=(0, 5))
-        ttk.Button(button_row, text="Disconnect", command=self.disconnect_serial).grid(
+        ttk.Button(button_row, text="Disconnect", command=self.disconnect_transport).grid(
             row=0,
             column=1,
             sticky="ew",
@@ -144,7 +177,7 @@ class UwbCaptureApp(tk.Tk):
         )
 
         ttk.Label(frame, textvariable=self.status_var, style="Status.TLabel").grid(
-            row=4,
+            row=5,
             column=0,
             columnspan=3,
             sticky="w",
@@ -191,32 +224,117 @@ class UwbCaptureApp(tk.Tk):
         )
 
     def _build_serial_control(self, parent: ttk.Frame, row: int) -> None:
-        control = ttk.LabelFrame(parent, text="Firmware serial control", padding=6)
+        control = ttk.LabelFrame(parent, text="Bluetooth protocol commands", padding=6)
         control.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         control.columnconfigure(1, weight=1)
         control.columnconfigure(3, weight=1)
 
-        ttk.Checkbutton(
-            control,
-            text="Send START/STOP",
-            variable=self.send_start_stop_var,
-        ).grid(row=0, column=0, columnspan=4, sticky="w")
-        ttk.Label(control, text="Start").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(control, textvariable=self.start_command_var, width=10).grid(
+        ttk.Label(control, text="Gateway ID").grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Entry(control, textvariable=self.gateway_id_var, width=18).grid(
+            row=0,
+            column=1,
+            columnspan=3,
+            sticky="ew",
+            padx=(6, 0),
+            pady=2,
+        )
+        ttk.Label(control, text="Target ID").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Entry(control, textvariable=self.target_id_var, width=18).grid(
             row=1,
+            column=1,
+            columnspan=3,
+            sticky="ew",
+            padx=(6, 0),
+            pady=2,
+        )
+
+        command_row = ttk.Frame(control)
+        command_row.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        command_row.columnconfigure(0, weight=1)
+        command_row.columnconfigure(1, weight=1)
+        ttk.Button(
+            command_row,
+            text="Get Status",
+            command=lambda: self.send_protocol_command(CommandId.GET_STATUS),
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(
+            command_row,
+            text="Start Heartbeat",
+            command=lambda: self.send_protocol_command(CommandId.START_HEARTBEAT),
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        ttk.Button(
+            command_row,
+            text="Stop Heartbeat",
+            command=lambda: self.send_protocol_command(CommandId.STOP_HEARTBEAT),
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+
+        ttk.Label(control, text="Heartbeat ms").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(control, textvariable=self.heartbeat_interval_ms_var, width=12).grid(
+            row=3,
+            column=1,
+            sticky="ew",
+            padx=(6, 0),
+            pady=(8, 0),
+        )
+
+        ttk.Label(control, text="Survey ID").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(control, textvariable=self.survey_id_var, width=12).grid(
+            row=4,
             column=1,
             sticky="ew",
             padx=(6, 12),
-            pady=(6, 0),
+            pady=(8, 0),
         )
-        ttk.Label(control, text="Stop").grid(row=1, column=2, sticky="w", pady=(6, 0))
-        ttk.Entry(control, textvariable=self.stop_command_var, width=10).grid(
-            row=1,
+        ttk.Label(control, text="Samples").grid(row=4, column=2, sticky="w", pady=(8, 0))
+        ttk.Entry(control, textvariable=self.survey_sample_count_var, width=8).grid(
+            row=4,
             column=3,
             sticky="ew",
             padx=(6, 0),
-            pady=(6, 0),
+            pady=(8, 0),
         )
+
+        ttk.Label(control, text="Initiator").grid(row=5, column=0, sticky="w", pady=2)
+        ttk.Entry(control, textvariable=self.survey_initiator_id_var, width=18).grid(
+            row=5,
+            column=1,
+            sticky="ew",
+            padx=(6, 12),
+            pady=2,
+        )
+        ttk.Label(control, text="Responder").grid(row=5, column=2, sticky="w", pady=2)
+        ttk.Entry(control, textvariable=self.survey_responder_id_var, width=18).grid(
+            row=5,
+            column=3,
+            sticky="ew",
+            padx=(6, 0),
+            pady=2,
+        )
+
+        survey_row = ttk.Frame(control)
+        survey_row.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        for index in range(2):
+            survey_row.columnconfigure(index, weight=1)
+        ttk.Button(
+            survey_row,
+            text="Reachability Survey",
+            command=lambda: self.send_protocol_command(CommandId.SURVEY_REACHABILITY),
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(
+            survey_row,
+            text="Prepare Pair",
+            command=lambda: self.send_protocol_command(CommandId.SURVEY_PREPARE_PAIR),
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        ttk.Button(
+            survey_row,
+            text="Start Pair",
+            command=lambda: self.send_protocol_command(CommandId.SURVEY_START_PAIR),
+        ).grid(row=1, column=0, sticky="ew", padx=(0, 4), pady=(6, 0))
+        ttk.Button(
+            survey_row,
+            text="Abort Survey",
+            command=lambda: self.send_protocol_command(CommandId.SURVEY_ABORT),
+        ).grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=(6, 0))
 
     def _build_storage_panel(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Storage", padding=8)
@@ -313,7 +431,7 @@ class UwbCaptureApp(tk.Tk):
         self.raw_text.configure(yscrollcommand=raw_scroll.set)
         self.raw_text.grid(row=0, column=0, sticky="nsew")
         raw_scroll.grid(row=0, column=1, sticky="ns")
-        notebook.add(raw_frame, text="Raw serial view")
+        notebook.add(raw_frame, text="Raw data view")
 
         alert_frame = ttk.Frame(notebook)
         alert_frame.rowconfigure(0, weight=1)
@@ -332,68 +450,34 @@ class UwbCaptureApp(tk.Tk):
         self.output_dir_var.set(str(path))
         self.db_path_var.set(str(Path(path) / DEFAULT_DB_NAME))
 
-    def refresh_ports(self) -> None:
-        infos = list(list_ports.comports()) if list_ports is not None else []
-        self.port_infos = {info.device: info for info in infos}
-        values = [self.describe_port(info) for info in infos]
-        self.last_port_devices = tuple(self.port_infos)
-        self.port_combo.configure(values=values)
-        selected = self.selected_port_device()
-        if not selected and infos:
-            likely = self.pick_likely_port(infos)
-            if likely is not None:
-                self.port_var.set(self.describe_port(likely))
+    def refresh_devices(self) -> None:
+        self.status_var.set("Scanning for Bluetooth devices...")
+        BluetoothScanner(self.events).start()
 
-    def auto_port_poll(self) -> None:
-        if list_ports is not None:
-            infos = list(list_ports.comports())
-            devices = tuple(info.device for info in infos)
-            if devices != self.last_port_devices:
-                self.refresh_ports()
-            if self.auto_connect_var.get() and self.serial_worker is None and infos:
-                likely = self.pick_likely_port(infos)
-                if likely is not None:
-                    self.port_var.set(self.describe_port(likely))
-                    self.connect_selected_port()
-        self.after(1500, self.auto_port_poll)
+    def selected_device(self) -> str:
+        return self.device_var.get().split(" - ", 1)[0].strip()
 
-    def describe_port(self, info: Any) -> str:
-        description = getattr(info, "description", "") or ""
-        return f"{info.device} - {description}" if description else str(info.device)
-
-    def selected_port_device(self) -> str:
-        value = self.port_var.get().strip()
-        return value.split(" - ", 1)[0].strip()
-
-    def pick_likely_port(self, infos: list[Any]) -> Any | None:
-        if not infos:
-            return None
-        scored = []
-        keywords = ("usb", "serial", "uart", "cp210", "ch340", "wch", "silicon", "arduino")
-        for info in infos:
-            text = " ".join(str(getattr(info, field, "")) for field in ("device", "description", "manufacturer", "hwid")).lower()
-            score = sum(1 for keyword in keywords if keyword in text)
-            scored.append((score, info))
-        scored.sort(key=lambda item: item[0], reverse=True)
-        return scored[0][1]
-
-    def connect_selected_port(self) -> None:
-        if self.serial_worker is not None:
+    def connect_selected_device(self) -> None:
+        if self.bluetooth_worker is not None:
             return
-        port = self.selected_port_device()
-        if not port:
-            messagebox.showwarning("No port selected", "Select a serial port before connecting.", parent=self)
+        device = self.selected_device()
+        if not device:
+            messagebox.showwarning("No device selected", "Select or enter a BLE device before connecting.", parent=self)
             return
-        baud = safe_int(self.baud_var.get(), DEFAULT_BAUD) or DEFAULT_BAUD
-        self.serial_worker = SerialWorker(port, baud, self.events)
-        self.serial_worker.start()
-        self.status_var.set(f"Connecting to {port} @ {baud}...")
+        self.bluetooth_worker = BluetoothWorker(
+            device=device,
+            notify_uuid=self.notify_uuid_var.get(),
+            write_uuid=self.write_uuid_var.get(),
+            events=self.events,
+        )
+        self.bluetooth_worker.start()
+        self.status_var.set(f"Connecting to {device}...")
 
-    def disconnect_serial(self) -> None:
-        if self.serial_worker is not None:
-            self.serial_worker.stop()
-            self.serial_worker = None
-        self.connected_port = None
+    def disconnect_transport(self) -> None:
+        if self.bluetooth_worker is not None:
+            self.bluetooth_worker.stop()
+            self.bluetooth_worker = None
+        self.connected_device = None
         self.status_var.set("Disconnected")
 
     def start_capture(self) -> None:
@@ -427,16 +511,11 @@ class UwbCaptureApp(tk.Tk):
         self.anchor_distance_windows.clear()
         self.session_status_var.set(f"Capturing: {self.current_session_id[:8]}")
         self.log_raw(f"# Started session {self.current_session_id}")
-        if metadata["send_start_stop"]:
-            self.send_serial_command(str(metadata["start_command"] or ""), "start")
-        else:
-            self.log_raw("# Waiting for button-triggered serial readings from the tag.")
+        self.log_raw("# Waiting for BLE click reports and survey results.")
 
     def stop_capture(self) -> None:
         if not self.capture_active:
             return
-        if self.send_start_stop_var.get():
-            self.send_serial_command(self.stop_command_var.get(), "stop")
         self.capture_active = False
         if self.store is not None and self.current_session_id is not None:
             self.store.finish_session(self.current_session_id)
@@ -444,26 +523,124 @@ class UwbCaptureApp(tk.Tk):
             self.session_status_var.set(f"Stopped: {counts['samples']} samples, {counts['alerts']} alerts")
             self.log_raw(f"# Stopped session {self.current_session_id}")
 
-    def send_serial_command(self, command: str, label: str) -> None:
-        if self.serial_worker is None:
-            self.log_raw(f"# Did not send {label} command; serial port is not ready.")
+    def send_protocol_command(self, command_id: CommandId) -> None:
+        if self.bluetooth_worker is None:
+            self.log_raw(f"# Did not send {command_id.name}; Bluetooth is not connected.")
             return
         try:
-            sent = self.serial_worker.send_command(command)
-        except SerialException as exc:
-            self.log_raw(f"# Could not send {label} command: {exc}")
+            extra_tlvs = self.command_extra_tlvs(command_id)
+            self.protocol_sequence = next_sequence(self.protocol_sequence)
+            packet = build_command_packet(
+                command_id=command_id,
+                source_id=parse_device_id(self.gateway_id_var.get(), default=0),
+                destination_id=parse_device_id(self.target_id_var.get(), default=0),
+                session_id=self.command_session_id(command_id),
+                sequence=self.protocol_sequence,
+                extra_tlvs=extra_tlvs,
+            )
+        except ProtocolError as exc:
+            messagebox.showerror("Invalid protocol command", str(exc), parent=self)
             return
+        sent = self.bluetooth_worker.send_packet(packet)
         if sent:
-            self.log_raw(f"# Sent {label} command: {command.strip()}")
+            self.log_raw(f"# Queued {command_id.name} to {self.target_id_var.get().strip() or 'broadcast'}")
         else:
-            self.log_raw(f"# Did not send {label} command; serial port is not ready.")
+            self.log_raw(f"# Did not send {command_id.name}; Bluetooth is not ready.")
+
+    def command_extra_tlvs(self, command_id: CommandId) -> list[tuple[Any, bytes]]:
+        heartbeat_interval = None
+        survey_id = None
+        sample_count = None
+        initiator_id = None
+        responder_id = None
+
+        if command_id == CommandId.START_HEARTBEAT:
+            heartbeat_interval = safe_int(self.heartbeat_interval_ms_var.get())
+            if heartbeat_interval is not None and not (5000 <= heartbeat_interval <= 3600000):
+                raise ProtocolError("Heartbeat interval must be from 5000 ms to 3600000 ms.")
+
+        if command_id in {
+            CommandId.SURVEY_REACHABILITY,
+            CommandId.SURVEY_PREPARE_PAIR,
+            CommandId.SURVEY_START_PAIR,
+            CommandId.SURVEY_ABORT,
+        }:
+            survey_id = self.survey_id()
+
+        if command_id in {CommandId.SURVEY_PREPARE_PAIR, CommandId.SURVEY_START_PAIR}:
+            sample_count = safe_int(self.survey_sample_count_var.get())
+            if sample_count is None or not (1 <= sample_count <= 65535):
+                raise ProtocolError("Survey sample count must be from 1 to 65535.")
+            initiator_id = self.optional_device_id(self.survey_initiator_id_var.get())
+            responder_id = self.optional_device_id(self.survey_responder_id_var.get())
+        return build_command_tlvs(
+            command_id,
+            heartbeat_interval_ms=heartbeat_interval,
+            survey_id=survey_id,
+            initiator_id=initiator_id,
+            responder_id=responder_id,
+            sample_count=sample_count,
+        )
+
+    def command_session_id(self, command_id: CommandId) -> int:
+        if command_id in {
+            CommandId.SURVEY_REACHABILITY,
+            CommandId.SURVEY_PREPARE_PAIR,
+            CommandId.SURVEY_START_PAIR,
+            CommandId.SURVEY_ABORT,
+        }:
+            return self.survey_id()
+        return self.protocol_session_seed
+
+    def survey_id(self) -> int:
+        value = safe_int(self.survey_id_var.get())
+        if value is None or value < 0 or value > 0xFFFFFFFF:
+            raise ProtocolError("Survey ID must be a 32-bit unsigned integer.")
+        return value
+
+    def optional_device_id(self, value: str) -> int | None:
+        if not value.strip():
+            return None
+        return parse_device_id(value)
+
+    def handle_protocol_packet(self, data: bytes) -> None:
+        try:
+            packet = decode_packet(data)
+        except ProtocolError as exc:
+            self.log_alert(f"Protocol packet rejected: {exc}")
+            return
+
+        summary = packet_summary(packet)
+        self.log_raw(f"# RX {summary}")
+        try:
+            self.log_protocol_message(packet)
+            records = records_from_packet(packet)
+        except ProtocolError as exc:
+            self.log_alert(f"Could not parse {summary}: {exc}")
+            records = []
+
+        if self.capture_active and self.store is not None and self.current_session_id is not None:
+            self.store.insert_raw_line(self.current_session_id, f"{summary} {data.hex(' ')}", bool(records))
+        if not self.capture_active:
+            return
+        self.handle_records(records)
+
+    def log_protocol_message(self, packet: ImecPacket) -> None:
+        if packet.msg_type == 0x41:
+            self.log_raw(f"# Command result: {command_result_summary(packet)}")
+        elif packet.msg_type == 0x22:
+            self.log_raw(f"# {status_report_summary(packet)}")
+        elif packet.msg_type == 0x51:
+            self.log_raw(f"# {survey_reach_summary(packet)}")
+        elif packet.msg_type == 0x7F:
+            self.log_alert(f"Protocol error from {format_device_id(packet.source_id)}")
 
     def session_metadata(self) -> dict[str, Any]:
         ground_truth = safe_float(self.ground_truth_var.get())
         threshold = safe_float(self.threshold_var.get())
         return {
-            "port": self.selected_port_device(),
-            "baud": safe_int(self.baud_var.get(), DEFAULT_BAUD),
+            "port": self.selected_device(),
+            "baud": None,
             "tag_id": "",
             "building_label": "",
             "constellation_label": self.constellation_var.get().strip(),
@@ -471,29 +648,43 @@ class UwbCaptureApp(tk.Tk):
             "condition_nlos": self.nlos_var.get(),
             "ground_truth_m": ground_truth,
             "outlier_threshold_m": threshold,
-            "notes": "",
-            "send_start_stop": self.send_start_stop_var.get(),
-            "start_command": self.start_command_var.get().strip(),
-            "stop_command": self.stop_command_var.get().strip(),
+            "notes": "BLE protocol capture",
+            "send_start_stop": False,
+            "start_command": "",
+            "stop_command": "",
         }
 
     def process_events(self) -> None:
         try:
             while True:
                 event, payload = self.events.get_nowait()
-                if event == "connected":
-                    self.connected_port = str(payload)
+                if event == "devices":
+                    infos = list(payload)
+                    self.device_infos = {info.address: info for info in infos}
+                    values = [info.label for info in infos]
+                    self.device_combo.configure(values=values)
+                    if values and not self.device_var.get().strip():
+                        self.device_var.set(values[0])
+                    self.status_var.set(f"Found {len(values)} Bluetooth device(s)")
+                    if self.auto_connect_var.get() and values and self.bluetooth_worker is None:
+                        self.connect_selected_device()
+                elif event == "connected":
+                    self.connected_device = str(payload)
                     self.status_var.set(f"Connected to {payload}")
                     self.log_raw(f"# Connected to {payload}")
                 elif event == "disconnected":
-                    self.serial_worker = None
-                    self.connected_port = None
+                    self.bluetooth_worker = None
+                    self.connected_device = None
                     self.status_var.set("Disconnected")
                     self.log_raw("# Disconnected")
                 elif event == "error":
                     self.status_var.set(str(payload))
                     self.log_alert(str(payload))
-                    self.serial_worker = None
+                    self.bluetooth_worker = None
+                elif event == "command_sent":
+                    self.log_raw(f"# TX {payload}")
+                elif event == "packet":
+                    self.handle_protocol_packet(bytes(payload))
                 elif event == "line":
                     self.handle_serial_line(str(payload))
         except queue.Empty:
@@ -508,6 +699,9 @@ class UwbCaptureApp(tk.Tk):
         if not self.capture_active:
             return
 
+        self.handle_records(records)
+
+    def handle_records(self, records: list[ParsedRecord]) -> None:
         for record in records:
             if self.store is not None and self.current_session_id is not None:
                 if record.kind == "summary":
@@ -670,7 +864,7 @@ class UwbCaptureApp(tk.Tk):
             if not proceed:
                 return
             self.stop_capture()
-        self.disconnect_serial()
+        self.disconnect_transport()
         if self.store is not None:
             self.store.close()
         self.destroy()

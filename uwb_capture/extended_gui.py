@@ -859,6 +859,12 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
                 self._register_detected_anchor(record.anchor_id)
         super().handle_serial_line(line)
 
+    def handle_records(self, records: list[Any]) -> None:
+        for record in records:
+            if record.anchor_id:
+                self._register_detected_anchor(record.anchor_id)
+        super().handle_records(records)
+
     def check_los_alert(self, record: Any) -> float | None:
         distance = record.distance_m if record.distance_m is not None else record.mean_distance_m
         if distance is None:

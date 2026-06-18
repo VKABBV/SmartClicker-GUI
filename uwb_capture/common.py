@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-DEFAULT_BAUD = 115200
 MAX_TABLE_ROWS = 400
 ALERT_PROMPT_COOLDOWN_SECONDS = 15
 INSTABILITY_WINDOW_SIZE = 12
