@@ -169,13 +169,18 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         action_row.columnconfigure(1, weight=1)
         self.start_button = ttk.Button(
             action_row,
-            text="Start Logging",
+            text="Start Recording",
             style="Accent.TButton",
             command=self.start_capture,
         )
         self.start_button.grid(row=0, column=0, sticky="ew", padx=(0, 5))
-        self.stop_button = ttk.Button(action_row, text="Stop Logging", command=self.stop_capture)
+        self.stop_button = ttk.Button(action_row, text="Stop Recording", command=self.stop_capture)
         self.stop_button.grid(row=0, column=1, sticky="ew", padx=(5, 0))
+        ttk.Label(
+            action_row,
+            text="Recording saves incoming ML samples to the database. Start it once, then trigger captures below.",
+            wraplength=320,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         ttk.Label(frame, textvariable=self.constellation_status_var).grid(
             row=5,
