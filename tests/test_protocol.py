@@ -1,12 +1,16 @@
 import unittest
 
 from uwb_capture.protocol import (
+    FLAG_DIAGNOSTIC,
     CommandId,
+    CommandStatus,
     ImecPacket,
     ImecPacketStream,
     MessageType,
     TlvId,
-    build_command_packet,
+    build_ml_start_collection_packet,
+    cobs_decode,
+    cobs_encode,
     command_result_summary,
     decode_packet,
     encode_packet,
@@ -20,124 +24,248 @@ from uwb_capture.protocol import (
 )
 
 
-class ProtocolTests(unittest.TestCase):
-    def test_build_get_status_command_packet(self) -> None:
-        raw = build_command_packet(
-            command_id=CommandId.GET_STATUS,
+class CobsTests(unittest.TestCase):
+    def test_cobs_round_trip_preserves_zero_bytes(self) -> None:
+        payload = bytes([0x11, 0x00, 0x22, 0x00, 0x00, 0x33, 0x00])
+        self.assertEqual(cobs_decode(cobs_encode(payload)), payload)
+
+    def test_cobs_round_trip_random(self) -> None:
+        payload = bytes(range(256)) * 3
+        self.assertEqual(cobs_decode(cobs_encode(payload)), payload)
+
+    def test_cobs_encode_never_emits_interior_zero(self) -> None:
+        payload = bytes([0x00, 0x01, 0x02, 0x00, 0x03])
+        encoded = cobs_encode(payload)
+        self.assertNotIn(0x00, encoded)
+
+
+class HeaderTests(unittest.TestCase):
+    def test_header_includes_message_age(self) -> None:
+        packet = ImecPacket(
+            msg_type=MessageType.COMMAND,
+            flags=0,
             source_id=0x100,
             destination_id=0x200,
             session_id=1234,
             sequence=7,
-            extra_tlvs=[],
+            ttl=1,
+            message_age_ms=0x1234,
+            payload=b"",
         )
+        decoded = decode_packet(encode_packet(packet))
+        self.assertEqual(decoded.message_age_ms, 0x1234)
+        # Message age occupies bytes 28..31 of the decoded packet.
+        raw = encode_packet(packet)
+        import struct
 
+        self.assertEqual(struct.unpack_from("<I", raw, 28)[0], 0x1234)
+
+
+class CommandTests(unittest.TestCase):
+    def test_build_ml_start_collection_packet(self) -> None:
+        raw = build_ml_start_collection_packet(
+            source_id=0x100,
+            destination_id=0,
+            session_id=1234,
+            sequence=7,
+            sample_count=12,
+            discovery_slot_count=20,
+        )
         packet = decode_packet(raw)
 
         self.assertEqual(packet.msg_type, MessageType.COMMAND)
         self.assertEqual(packet.source_id, 0x100)
-        self.assertEqual(packet.destination_id, 0x200)
+        self.assertEqual(packet.destination_id, 0)
         self.assertEqual(packet.session_id, 1234)
         self.assertEqual(packet.sequence, 7)
-        self.assertIn(bytes([TlvId.COMMAND_ID, 2, 0x02, 0x00]), packet.payload)
+        self.assertEqual(packet.ttl, 1)
+        self.assertEqual(packet.message_age_ms, 0)
+        # Required COMMAND_ID TLV.
+        self.assertIn(bytes([TlvId.COMMAND_ID, 2, 0x00, 0x80]), packet.payload)
+        # Sample count and discovery slot count TLVs.
+        self.assertIn(bytes([TlvId.SAMPLE_COUNT, 1, 12]), packet.payload)
+        self.assertIn(bytes([TlvId.DISCOVERY_SLOT_COUNT, 1, 20]), packet.payload)
 
-    def test_packet_stream_reassembles_fragmented_notifications(self) -> None:
-        raw = build_command_packet(
-            command_id=CommandId.STOP_HEARTBEAT,
+    def test_ml_command_uses_cobs_on_the_wire(self) -> None:
+        proto_packet = build_ml_start_collection_packet(
+            source_id=1,
+            destination_id=0,
+            session_id=42,
+            sequence=1,
+        )
+        frame = cobs_encode(proto_packet) + b"\x00"
+        self.assertFalse(0x00 in frame[:-1])
+        self.assertEqual(frame[-1], 0x00)
+        self.assertEqual(cobs_decode(frame[:-1]), proto_packet)
+
+
+class StreamTests(unittest.TestCase):
+    def test_stream_reassembles_cobs_frames_across_notifications(self) -> None:
+        proto_packet = build_ml_start_collection_packet(
             source_id=1,
             destination_id=2,
             session_id=3,
             sequence=4,
-            extra_tlvs=[],
         )
+        frame = cobs_encode(proto_packet) + b"\x00"
         stream = ImecPacketStream()
 
-        self.assertEqual(stream.feed(raw[:10]), [])
-        self.assertEqual(stream.feed(raw[10:]), [raw])
+        self.assertEqual(stream.feed(frame[:5]), [])
+        self.assertEqual(stream.feed(frame[5:]), [proto_packet])
 
-    def test_click_report_distance_samples_become_records(self) -> None:
-        payload = encode_tlvs(
-            [
-                (TlvId.ANCHOR_ID, u64(0xAABBCCDD)),
-                (TlvId.SAMPLE_INDEX, u16(5)),
-                (TlvId.RANGE_STATUS, u8(0)),
-                (TlvId.DISTANCE_SAMPLES_MM, i32(1250) + i32(1300)),
-            ]
+    def test_stream_decodes_multiple_frames_in_one_notification(self) -> None:
+        proto_a = build_ml_start_collection_packet(
+            source_id=1, destination_id=0, session_id=1, sequence=1
         )
-        packet = ImecPacket(
+        proto_b = build_ml_start_collection_packet(
+            source_id=1, destination_id=0, session_id=1, sequence=2
+        )
+        blob = cobs_encode(proto_a) + b"\x00" + cobs_encode(proto_b) + b"\x00"
+        self.assertEqual(ImecPacketStream().feed(blob), [proto_a, proto_b])
+
+
+class MlSampleTests(unittest.TestCase):
+    def _ml_sample_packet(
+        self,
+        *,
+        range_status: int = 0,
+        distance_samples_mm: bytes | None = None,
+        distance_mm: int | None = None,
+    ) -> ImecPacket:
+        tlvs = [
+            (TlvId.CLICKER_ID, u64(0x1111)),
+            (TlvId.ANCHOR_ID, u64(0xAABBCCDD)),
+            (TlvId.EVENT_SEQ, u32(99)),
+            (TlvId.TIMESTAMP_MS, u64(1_000_000)),
+            (TlvId.SAMPLE_INDEX, u16(5)),
+            (TlvId.SAMPLE_COUNT, u16(8)),
+            (TlvId.RANGE_STATUS, u8(range_status)),
+            (TlvId.QUALITY, u8(87)),
+            (TlvId.UWB_RSL_DBM, u8(-75 & 0xFF)),
+            (TlvId.PHY_CONFIG_ID, u8(9)),
+            (TlvId.BURST_ID, u32(0xBEEF)),
+            (TlvId.UWB_CIR_SAMPLE, b"\x01\x02\x03\x04\x05\x06"),
+            (TlvId.REPORT_FRAGMENT_COUNT, u16(1)),
+        ]
+        if distance_samples_mm is not None:
+            tlvs.append((TlvId.DISTANCE_SAMPLES_MM, distance_samples_mm))
+        if distance_mm is not None:
+            tlvs.append((TlvId.DISTANCE_MM, i32(distance_mm)))
+        return ImecPacket(
             msg_type=MessageType.CLICK_REPORT,
-            flags=0,
+            flags=FLAG_DIAGNOSTIC,
             source_id=0xAABBCCDD,
             destination_id=0,
             session_id=99,
             sequence=1,
-            ttl=4,
-            payload=payload,
+            ttl=1,
+            message_age_ms=0,
+            payload=encode_tlvs(tlvs),
         )
 
+    def test_ml_sample_becomes_training_row(self) -> None:
+        packet = self._ml_sample_packet(distance_samples_mm=i32(1250))
         records = records_from_packet(decode_packet(encode_packet(packet)))
 
-        self.assertEqual(len(records), 2)
-        self.assertEqual(records[0].kind, "sample")
-        self.assertEqual(records[0].anchor_id, "0x00000000AABBCCDD")
-        self.assertEqual(records[0].sample_index, 5)
-        self.assertEqual(records[0].distance_m, 1.25)
-        self.assertEqual(records[1].sample_index, 6)
-        self.assertEqual(records[1].distance_m, 1.3)
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record.kind, "sample")
+        self.assertEqual(record.anchor_id, "0x00000000AABBCCDD")
+        self.assertEqual(record.clicker_id, "0x0000000000001111")
+        self.assertEqual(record.sample_index, 5)
+        self.assertEqual(record.scheduled_sample_count, 8)
+        self.assertEqual(record.event_seq, 99)
+        self.assertEqual(record.firmware_timestamp_ms, 1_000_000)
+        self.assertEqual(record.quality, 87)
+        self.assertEqual(record.phy_config_id, 9)
+        self.assertEqual(record.burst_id, 0xBEEF)
+        self.assertEqual(record.distance_m, 1.25)
+        self.assertEqual(record.status, "ok")
+        self.assertEqual(record.cir_raw, "010203040506")
+        self.assertIsNone(record.error_code)
+        self.assertEqual(record.source, "ml_click_report")
+        self.assertIsNotNone(record.tlv_json)
 
-    def test_command_result_summary_includes_status_fields(self) -> None:
+    def test_ml_sample_falls_back_to_distance_mm_tlv(self) -> None:
+        packet = self._ml_sample_packet(distance_mm=2750)
+        record = records_from_packet(decode_packet(encode_packet(packet)))[0]
+        self.assertEqual(record.distance_m, 2.75)
+
+    def test_failed_range_status_stored_as_failure_row(self) -> None:
+        packet = self._ml_sample_packet(range_status=1, distance_samples_mm=i32(-1))
+        record = records_from_packet(decode_packet(encode_packet(packet)))[0]
+        self.assertEqual(record.kind, "failure")
+        self.assertIsNone(record.distance_m)
+        self.assertEqual(record.error_code, "1")
+        self.assertEqual(record.status, "range_rx_timeout")
+
+    def test_tlv_json_preserves_unknown_tlvs(self) -> None:
+        packet = self._ml_sample_packet(distance_samples_mm=i32(1000))
+        # Append an unknown TLV (id 0xAA) directly into the payload.
+        packet = ImecPacket(
+            msg_type=packet.msg_type,
+            flags=packet.flags,
+            source_id=packet.source_id,
+            destination_id=packet.destination_id,
+            session_id=packet.session_id,
+            sequence=packet.sequence,
+            ttl=packet.ttl,
+            message_age_ms=packet.message_age_ms,
+            payload=packet.payload + bytes([0xAA, 2, 0xDE, 0xAD]),
+        )
+        record = records_from_packet(decode_packet(encode_packet(packet)))[0]
+        self.assertIn("0xAA", record.tlv_json)
+        self.assertIn("dead", record.tlv_json)
+
+
+class CommandResultTests(unittest.TestCase):
+    def test_command_result_summary_includes_ml_status(self) -> None:
         payload = encode_tlvs(
             [
-                (TlvId.COMMAND_ID, u16(CommandId.GET_STATUS)),
-                (TlvId.COMMAND_STATUS, u8(0)),
-                (TlvId.DEVICE_ROLE, u8(2)),
-                (TlvId.BATTERY_MV, u16(3010)),
-                (TlvId.UPTIME_MS, u32(45000)),
-                (TlvId.STATUS_BITS, u32(0x81)),
+                (TlvId.COMMAND_ID, u16(CommandId.ML_START_COLLECTION)),
+                (TlvId.COMMAND_STATUS, u8(CommandStatus.COMMAND_OK)),
+                (TlvId.REASON, u8(0)),
+                (TlvId.EVENT_SEQ, u32(7)),
+                (TlvId.SAMPLE_COUNT, u16(32)),
             ]
         )
         packet = ImecPacket(
             msg_type=MessageType.COMMAND_RESULT,
-            flags=0,
-            source_id=1,
+            flags=FLAG_DIAGNOSTIC,
+            source_id=0xAABBCCDD,
             destination_id=0,
-            session_id=1,
-            sequence=1,
-            ttl=4,
+            session_id=1234,
+            sequence=7,
+            ttl=1,
+            message_age_ms=0,
             payload=payload,
         )
-
         summary = command_result_summary(packet)
+        self.assertIn("ML_START_COLLECTION", summary)
+        self.assertIn("COMMAND_OK", summary)
+        self.assertIn("event_seq=7", summary)
+        self.assertIn("samples=32", summary)
 
-        self.assertIn("GET_STATUS", summary)
-        self.assertIn("battery=3010mV", summary)
-        self.assertIn("status=0x00000081", summary)
-
-    def test_survey_pair_result_becomes_record(self) -> None:
+    def test_command_result_summary_flags_error(self) -> None:
         payload = encode_tlvs(
             [
-                (TlvId.RESPONDER_ID, u64(0x44)),
-                (TlvId.SAMPLE_INDEX, u16(2)),
-                (TlvId.RANGE_STATUS, u8(0)),
-                (TlvId.DISTANCE_MM, i32(2750)),
+                (TlvId.COMMAND_ID, u16(CommandId.ML_START_COLLECTION)),
+                (TlvId.COMMAND_STATUS, u8(CommandStatus.COMMAND_BUSY)),
+                (TlvId.REASON, u8(0)),
             ]
         )
         packet = ImecPacket(
-            msg_type=MessageType.SURVEY_PAIR_RESULT,
-            flags=0,
-            source_id=0x33,
+            msg_type=MessageType.COMMAND_RESULT,
+            flags=FLAG_DIAGNOSTIC | 0x40,
+            source_id=0xAABBCCDD,
             destination_id=0,
-            session_id=101,
-            sequence=1,
-            ttl=4,
+            session_id=1234,
+            sequence=7,
+            ttl=1,
+            message_age_ms=0,
             payload=payload,
         )
-
-        record = records_from_packet(decode_packet(encode_packet(packet)))[0]
-
-        self.assertEqual(record.anchor_id, "0x0000000000000044")
-        self.assertEqual(record.sample_index, 2)
-        self.assertEqual(record.distance_m, 2.75)
-        self.assertEqual(record.source, "ble_survey_pair_result")
+        self.assertIn("FLAG_ERROR", command_result_summary(packet))
 
 
 if __name__ == "__main__":

@@ -1205,7 +1205,10 @@ def write_anchor_session_workbook(
     columns = [
         "timestamp",
         "anchor_id",
+        "clicker_id",
         "sample_index",
+        "event_seq",
+        "scheduled_sample_count",
         "measured_uwb_distance_m",
         "true_ground_truth_distance_m",
         "true_distance_source",
@@ -1215,10 +1218,15 @@ def write_anchor_session_workbook(
         "rx_dbm",
         "fp_dbm",
         "cir_power",
+        "quality",
+        "firmware_timestamp_ms",
+        "phy_config_id",
+        "burst_id",
         "alert_metric_m",
         "status",
         "source",
         "cir_raw",
+        "tlv_json",
         "raw_line",
     ]
     ws.append(columns)
@@ -1234,7 +1242,10 @@ def write_anchor_session_workbook(
             excel_row([
                 row["timestamp"],
                 row["anchor_id"],
+                row["clicker_id"],
                 row["sample_index"],
+                row["event_seq"],
+                row["scheduled_sample_count"],
                 measured,
                 true_distance,
                 true_source,
@@ -1244,10 +1255,15 @@ def write_anchor_session_workbook(
                 row["rx_power_dbm"],
                 row["fp_power_dbm"],
                 row["cir_power"],
+                row["quality"],
+                row["firmware_timestamp_ms"],
+                row["phy_config_id"],
+                row["burst_id"],
                 alert_metric,
                 row["status"],
                 row["source"],
                 row["cir_raw"],
+                row["tlv_json"],
                 row["raw_line"],
             ])
         )

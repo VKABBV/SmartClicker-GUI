@@ -1,21 +1,34 @@
-"""IMEC UWB/BLE packet codec and report conversion helpers."""
+"""IMEC ML Clicker BLE packet codec and report conversion helpers.
+
+The ML clicker exposes a byte-stream BLE GATT characteristic.  Each protocol
+frame is COBS encoded and terminated with a single 0x00 byte.  This module
+deals with the decoded ``proto_packet`` (header + TLV payload + CRC); the COBS
+framing itself is owned by :class:`ImecPacketStream` and the BLE transport.
+"""
 
 from __future__ import annotations
 
+import json
+import struct
 from dataclasses import dataclass
 from enum import IntEnum
-import struct
 from typing import Any, Iterable
 
 from .common import ParsedRecord
 
 MAGIC = 0xC1
 VERSION = 0x01
-HEADER_SIZE = 28
+HEADER_SIZE = 32
 CRC_SIZE = 2
 MAX_PAYLOAD_SIZE = 255
 BROADCAST_ID = 0
-DEFAULT_TTL = 4
+DEFAULT_TTL = 1
+
+FLAG_DIAGNOSTIC = 0x10
+FLAG_ERROR = 0x40
+
+MASK32 = 0xFFFFFFFF
+MASK64 = 0xFFFFFFFFFFFFFFFF
 
 
 class ProtocolError(ValueError):
@@ -24,31 +37,19 @@ class ProtocolError(ValueError):
 
 class MessageType(IntEnum):
     CLICK_REPORT = 0x20
-    SELF_TEST_REPORT = 0x21
-    ANCHOR_HEARTBEAT = 0x22
     COMMAND = 0x40
     COMMAND_RESULT = 0x41
-    SURVEY_REACH_REQ = 0x50
-    SURVEY_REACH_REPORT = 0x51
-    SURVEY_PAIR_PREPARE = 0x52
-    SURVEY_PAIR_RESULT = 0x53
     MSG_ERROR = 0x7F
 
 
 class CommandId(IntEnum):
-    GET_STATUS = 0x0002
-    START_HEARTBEAT = 0x0009
-    STOP_HEARTBEAT = 0x000A
-    SURVEY_REACHABILITY = 0x0100
-    SURVEY_PREPARE_PAIR = 0x0101
-    SURVEY_START_PAIR = 0x0102
-    SURVEY_ABORT = 0x0103
+    ML_START_COLLECTION = 0x8000
 
 
 class CommandStatus(IntEnum):
     COMMAND_OK = 0
-    COMMAND_UNSUPPORTED_COMMAND = 1
-    COMMAND_MALFORMED_PAYLOAD = 2
+    COMMAND_UNSUPPORTED = 1
+    COMMAND_MALFORMED = 2
     COMMAND_BUSY = 3
     COMMAND_DENIED = 4
     COMMAND_TIMEOUT = 5
@@ -70,15 +71,8 @@ class RangeStatus(IntEnum):
 
 
 class TlvId(IntEnum):
-    DEVICE_ROLE = 0x01
-    BATTERY_MV = 0x02
-    STATUS_BITS = 0x03
-    ERROR_CODE = 0x04
-    ERROR_DETAIL = 0x05
     EVENT_SEQ = 0x06
     TIMESTAMP_MS = 0x07
-    RSSI_DBM = 0x08
-    UWB_SHORT_ADDR = 0x09
     ANCHOR_ID = 0x0A
     CLICKER_ID = 0x0B
     DISTANCE_MM = 0x0C
@@ -87,30 +81,25 @@ class TlvId(IntEnum):
     SAMPLE_COUNT = 0x0F
     COMMAND_ID = 0x10
     COMMAND_STATUS = 0x11
-    REQUESTED_MSG_SEQ = 0x12
-    NEXT_HOP_ID = 0x13
-    GATEWAY_ID = 0x14
-    SURVEY_ID = 0x15
-    PEER_ID_LIST = 0x16
-    REACHABILITY_ENTRY = 0x17
-    RANGE_FLAGS = 0x18
-    LED_PATTERN_ID = 0x19
-    DURATION_MS = 0x1A
-    RETRY_COUNT = 0x1B
-    FW_VERSION = 0x1C
-    UPTIME_MS = 0x1D
     REASON = 0x1E
-    INITIATOR_ID = 0x1F
-    RESPONDER_ID = 0x20
     RANGE_STATUS = 0x21
-    ROUTE_EPOCH = 0x22
-    HOP_COUNT = 0x23
     UWB_RSL_DBM = 0x24
     DISTANCE_SAMPLES_MM = 0x25
-    TIME_SYNC_AGE_MS = 0x27
+    UWB_CIR_SAMPLE = 0x26
     RANGE_ROUND_INDICES = 0x28
     SEQUENCE_START_TIMESTAMPS_MS = 0x29
+    DIAG_STATUS_FLAGS = 0x33
     BURST_ID = 0x34
+    EXCHANGE_STRIDE_US = 0x35
+    BURST_DURATION_MS = 0x36
+    DIAG_BYTES_CAPTURED = 0x39
+    DIAG_BYTES_TRANSMITTED = 0x3A
+    REPORT_FRAGMENT_COUNT = 0x3D
+    CLICKER_DIAG_BYTES = 0x40
+    PHY_CONFIG_ID = 0x42
+    DISCOVERY_SLOT_COUNT = 0x4C
+    UWB_CLOCK_OFFSET_RAW = 0x4D
+    UWB_CARRIER_INTEGRATOR = 0x4E
 
 
 @dataclass(frozen=True)
@@ -122,11 +111,18 @@ class ImecPacket:
     session_id: int
     sequence: int
     ttl: int
+    message_age_ms: int
     payload: bytes
 
 
 class ImecPacketStream:
-    """Accumulates notification fragments and extracts complete packets."""
+    """Accumulates BLE notification fragments and extracts COBS-delimited frames.
+
+    The firmware treats the BLE characteristic as a byte stream: a complete
+    protocol frame is COBS encoded and terminated with a zero byte.  This class
+    buffers incoming bytes until it sees ``0x00``, then decodes one COBS frame
+    into the raw ``proto_packet`` bytes (header + TLV payload + CRC).
+    """
 
     def __init__(self) -> None:
         self._buffer = bytearray()
@@ -135,22 +131,60 @@ class ImecPacketStream:
         self._buffer.extend(data)
         packets: list[bytes] = []
         while True:
-            if not self._buffer:
+            zero = self._buffer.find(0x00)
+            if zero < 0:
                 return packets
-            magic_index = self._buffer.find(bytes([MAGIC]))
-            if magic_index < 0:
-                self._buffer.clear()
-                return packets
-            if magic_index:
-                del self._buffer[:magic_index]
-            if len(self._buffer) < HEADER_SIZE + CRC_SIZE:
-                return packets
-            payload_len = self._buffer[27]
-            total_len = HEADER_SIZE + payload_len + CRC_SIZE
-            if len(self._buffer) < total_len:
-                return packets
-            packets.append(bytes(self._buffer[:total_len]))
-            del self._buffer[:total_len]
+            frame = bytes(self._buffer[:zero])
+            del self._buffer[: zero + 1]
+            if not frame:
+                continue
+            try:
+                decoded = cobs_decode(frame)
+            except ProtocolError:
+                continue
+            packets.append(decoded)
+
+
+def cobs_encode(data: bytes) -> bytes:
+    """COBS-encode ``data`` (no trailing zero byte)."""
+    output = bytearray()
+    output.append(1)
+    code_index = 0
+    code = 1
+    for byte in data:
+        if byte:
+            output.append(byte)
+            code += 1
+            if code == 0xFF:
+                output[code_index] = code
+                code = 1
+                code_index = len(output)
+                output.append(1)
+        else:
+            output[code_index] = code
+            code = 1
+            code_index = len(output)
+            output.append(1)
+    output[code_index] = code
+    return bytes(output)
+
+
+def cobs_decode(data: bytes) -> bytes:
+    if not data:
+        raise ProtocolError("Empty COBS frame")
+    output = bytearray()
+    index = 0
+    while index < len(data):
+        code = data[index]
+        if code == 0 or index + code > len(data):
+            raise ProtocolError("Invalid COBS frame")
+        index += 1
+        chunk = data[index : index + code - 1]
+        output.extend(chunk)
+        index += code - 1
+        if code < 0xFF and index < len(data):
+            output.append(0)
+    return bytes(output)
 
 
 def crc16_ccitt_false(data: bytes) -> int:
@@ -195,17 +229,19 @@ def encode_packet(packet: ImecPacket) -> bytes:
     if len(packet.payload) > MAX_PAYLOAD_SIZE:
         raise ProtocolError("Packet payload is longer than 255 bytes")
     header = struct.pack(
-        "<BBBBQQIHB",
+        "<BBBBQQIHBBI",
         MAGIC,
         VERSION,
         int(packet.msg_type) & 0xFF,
         int(packet.flags) & 0xFF,
-        packet.source_id & 0xFFFFFFFFFFFFFFFF,
-        packet.destination_id & 0xFFFFFFFFFFFFFFFF,
-        packet.session_id & 0xFFFFFFFF,
+        packet.source_id & MASK64,
+        packet.destination_id & MASK64,
+        packet.session_id & MASK32,
         packet.sequence & 0xFFFF,
         packet.ttl & 0xFF,
-    ) + bytes([len(packet.payload)])
+        len(packet.payload),
+        packet.message_age_ms & MASK32,
+    )
     body = header + packet.payload
     return body + struct.pack("<H", crc16_ccitt_false(body))
 
@@ -225,7 +261,7 @@ def decode_packet(data: bytes) -> ImecPacket:
     expected_crc = crc16_ccitt_false(data[: expected_len - CRC_SIZE])
     if actual_crc != expected_crc:
         raise ProtocolError("Packet CRC mismatch")
-    fields = struct.unpack("<BBBBQQIHB", data[: HEADER_SIZE - 1])
+    fields = struct.unpack("<BBBBQQIHBBI", data[:HEADER_SIZE])
     return ImecPacket(
         msg_type=fields[2],
         flags=fields[3],
@@ -234,6 +270,7 @@ def decode_packet(data: bytes) -> ImecPacket:
         session_id=fields[6],
         sequence=fields[7],
         ttl=fields[8],
+        message_age_ms=fields[10],
         payload=data[HEADER_SIZE : HEADER_SIZE + payload_len],
     )
 
@@ -247,11 +284,11 @@ def u16(value: int) -> bytes:
 
 
 def u32(value: int) -> bytes:
-    return struct.pack("<I", value & 0xFFFFFFFF)
+    return struct.pack("<I", value & MASK32)
 
 
 def u64(value: int) -> bytes:
-    return struct.pack("<Q", value & 0xFFFFFFFFFFFFFFFF)
+    return struct.pack("<Q", value & MASK64)
 
 
 def i32(value: int) -> bytes:
@@ -316,7 +353,7 @@ def parse_device_id(value: str, *, default: int | None = None, bits: int = 64) -
 def format_device_id(value: int | None) -> str:
     if value is None:
         return ""
-    return f"0x{int(value) & 0xFFFFFFFFFFFFFFFF:016X}"
+    return f"0x{int(value) & MASK64:016X}"
 
 
 def next_sequence(sequence: int) -> int:
@@ -331,6 +368,8 @@ def build_command_packet(
     session_id: int,
     sequence: int,
     extra_tlvs: Iterable[tuple[int | TlvId, bytes]] = (),
+    ttl: int = DEFAULT_TTL,
+    message_age_ms: int = 0,
 ) -> bytes:
     payload = encode_tlvs(
         [(TlvId.COMMAND_ID, u16(int(command_id))), *list(extra_tlvs)]
@@ -342,39 +381,40 @@ def build_command_packet(
         destination_id=destination_id,
         session_id=session_id,
         sequence=sequence,
-        ttl=DEFAULT_TTL,
+        ttl=ttl,
+        message_age_ms=message_age_ms,
         payload=payload,
     )
     return encode_packet(packet)
 
 
-def build_command_tlvs(
-    command_id: CommandId,
+def build_ml_start_collection_packet(
     *,
-    heartbeat_interval_ms: int | None = None,
-    survey_id: int | None = None,
-    initiator_id: int | None = None,
-    responder_id: int | None = None,
+    source_id: int,
+    destination_id: int,
+    session_id: int,
+    sequence: int,
     sample_count: int | None = None,
-) -> list[tuple[TlvId, bytes]]:
-    tlvs: list[tuple[TlvId, bytes]] = []
-    if command_id == CommandId.START_HEARTBEAT and heartbeat_interval_ms:
-        tlvs.append((TlvId.DURATION_MS, u32(heartbeat_interval_ms)))
-    if command_id in {
-        CommandId.SURVEY_REACHABILITY,
-        CommandId.SURVEY_PREPARE_PAIR,
-        CommandId.SURVEY_START_PAIR,
-        CommandId.SURVEY_ABORT,
-    } and survey_id is not None:
-        tlvs.append((TlvId.SURVEY_ID, u32(survey_id)))
-    if command_id in {CommandId.SURVEY_PREPARE_PAIR, CommandId.SURVEY_START_PAIR}:
-        if initiator_id is not None:
-            tlvs.append((TlvId.INITIATOR_ID, u64(initiator_id)))
-        if responder_id is not None:
-            tlvs.append((TlvId.RESPONDER_ID, u64(responder_id)))
-        if sample_count is not None:
-            tlvs.append((TlvId.SAMPLE_COUNT, u16(sample_count)))
-    return tlvs
+    discovery_slot_count: int | None = None,
+) -> bytes:
+    """Build a ``CMD_ML_START_COLLECTION`` command proto_packet."""
+    extra: list[tuple[int | TlvId, bytes]] = []
+    if sample_count is not None:
+        if not (1 <= sample_count <= 15):
+            raise ProtocolError("Sample count must be from 1 to 15.")
+        extra.append((TlvId.SAMPLE_COUNT, u8(sample_count)))
+    if discovery_slot_count is not None:
+        if not (1 <= discovery_slot_count <= 50):
+            raise ProtocolError("Discovery slot count must be from 1 to 50.")
+        extra.append((TlvId.DISCOVERY_SLOT_COUNT, u8(discovery_slot_count)))
+    return build_command_packet(
+        command_id=CommandId.ML_START_COLLECTION,
+        source_id=source_id,
+        destination_id=destination_id,
+        session_id=session_id,
+        sequence=sequence,
+        extra_tlvs=extra,
+    )
 
 
 def packet_summary(packet: ImecPacket) -> str:
@@ -382,10 +422,11 @@ def packet_summary(packet: ImecPacket) -> str:
         name = MessageType(packet.msg_type).name
     except ValueError:
         name = f"0x{packet.msg_type:02X}"
+    flags = f" flags=0x{packet.flags:02X}" if packet.flags else ""
     return (
         f"{name} src={format_device_id(packet.source_id)} "
         f"dst={format_device_id(packet.destination_id)} "
-        f"session={packet.session_id} seq={packet.sequence}"
+        f"session={packet.session_id} seq={packet.sequence}{flags}"
     )
 
 
@@ -393,130 +434,102 @@ def command_result_summary(packet: ImecPacket) -> str:
     tlvs = decode_tlvs(packet.payload)
     command_id = read_uint(first_tlv(tlvs, TlvId.COMMAND_ID))
     status = read_uint(first_tlv(tlvs, TlvId.COMMAND_STATUS))
+    reason = read_uint(first_tlv(tlvs, TlvId.REASON))
+    event_seq = read_uint(first_tlv(tlvs, TlvId.EVENT_SEQ))
+    sample_count = read_uint(first_tlv(tlvs, TlvId.SAMPLE_COUNT))
     command_name = _enum_name(CommandId, command_id, "CMD")
     status_name = _enum_name(CommandStatus, status, "COMMAND_STATUS")
     parts = [f"{command_name}: {status_name}"]
-    role = read_uint(first_tlv(tlvs, TlvId.DEVICE_ROLE))
-    battery = read_uint(first_tlv(tlvs, TlvId.BATTERY_MV))
-    uptime = read_uint(first_tlv(tlvs, TlvId.UPTIME_MS))
-    status_bits = read_uint(first_tlv(tlvs, TlvId.STATUS_BITS))
-    if role is not None:
-        parts.append(f"role={role}")
-    if battery is not None:
-        parts.append(f"battery={battery}mV")
-    if uptime is not None:
-        parts.append(f"uptime={uptime}ms")
-    if status_bits is not None:
-        parts.append(f"status=0x{status_bits:08X}")
+    if reason is not None:
+        parts.append(f"reason={reason}")
+    if event_seq is not None:
+        parts.append(f"event_seq={event_seq}")
+    if sample_count is not None:
+        parts.append(f"samples={sample_count}")
+    if packet.flags & FLAG_ERROR:
+        parts.append("FLAG_ERROR")
     return ", ".join(parts)
 
 
-def status_report_summary(packet: ImecPacket) -> str:
+def command_status_from_packet(packet: ImecPacket) -> int | None:
+    if packet.msg_type != MessageType.COMMAND_RESULT:
+        return None
     tlvs = decode_tlvs(packet.payload)
-    role = read_uint(first_tlv(tlvs, TlvId.DEVICE_ROLE))
-    battery = read_uint(first_tlv(tlvs, TlvId.BATTERY_MV))
-    uptime = read_uint(first_tlv(tlvs, TlvId.UPTIME_MS))
-    status_bits = read_uint(first_tlv(tlvs, TlvId.STATUS_BITS))
-    parts = [f"Heartbeat from {format_device_id(packet.source_id)}"]
-    if role is not None:
-        parts.append(f"role={role}")
-    if battery is not None:
-        parts.append(f"battery={battery}mV")
-    if uptime is not None:
-        parts.append(f"uptime={uptime}ms")
-    if status_bits is not None:
-        parts.append(f"status=0x{status_bits:08X}")
-    return ", ".join(parts)
-
-
-def survey_reach_summary(packet: ImecPacket) -> str:
-    tlvs = decode_tlvs(packet.payload)
-    peer_list = first_tlv(tlvs, TlvId.PEER_ID_LIST)
-    if not peer_list:
-        return f"Reachability report from {format_device_id(packet.source_id)}"
-    peers = [
-        format_device_id(struct.unpack_from("<Q", peer_list, index)[0])
-        for index in range(0, len(peer_list) - 7, 8)
-    ]
-    return f"Reachability report from {format_device_id(packet.source_id)}: {', '.join(peers)}"
+    return read_uint(first_tlv(tlvs, TlvId.COMMAND_STATUS))
 
 
 def records_from_packet(packet: ImecPacket) -> list[ParsedRecord]:
     if packet.msg_type == MessageType.CLICK_REPORT:
-        return _click_report_records(packet)
-    if packet.msg_type == MessageType.SURVEY_PAIR_RESULT:
-        return _survey_pair_records(packet)
+        return _ml_sample_records(packet)
     return []
 
 
-def _click_report_records(packet: ImecPacket) -> list[ParsedRecord]:
+def _ml_sample_records(packet: ImecPacket) -> list[ParsedRecord]:
     tlvs = decode_tlvs(packet.payload)
-    anchor_id = read_uint(first_tlv(tlvs, TlvId.ANCHOR_ID)) or packet.source_id
+    anchor_id = read_uint(first_tlv(tlvs, TlvId.ANCHOR_ID))
+    clicker_id = read_uint(first_tlv(tlvs, TlvId.CLICKER_ID))
     sample_index = read_uint(first_tlv(tlvs, TlvId.SAMPLE_INDEX)) or 0
+    scheduled_count = read_uint(first_tlv(tlvs, TlvId.SAMPLE_COUNT))
+    event_seq = read_uint(first_tlv(tlvs, TlvId.EVENT_SEQ))
+    timestamp_ms = read_uint(first_tlv(tlvs, TlvId.TIMESTAMP_MS))
+    quality = read_uint(first_tlv(tlvs, TlvId.QUALITY))
     range_status = read_uint(first_tlv(tlvs, TlvId.RANGE_STATUS))
-    status = _range_status_text(range_status)
-    rx_power_dbm = read_int(first_tlv(tlvs, TlvId.UWB_RSL_DBM))
-    if rx_power_dbm == 0:
-        rx_power_dbm = None
-    sample_bytes = first_tlv(tlvs, TlvId.DISTANCE_SAMPLES_MM)
-    records: list[ParsedRecord] = []
-    if sample_bytes:
-        for offset in range(0, len(sample_bytes) - 3, 4):
-            distance_mm = struct.unpack_from("<i", sample_bytes, offset)[0]
-            records.append(
-                ParsedRecord(
-                    kind="sample" if distance_mm >= 0 and range_status in (None, 0) else "failure",
-                    anchor_id=format_device_id(anchor_id),
-                    sample_index=sample_index + (offset // 4),
-                    distance_m=None if distance_mm < 0 else distance_mm / 1000.0,
-                    rx_power_dbm=float(rx_power_dbm) if rx_power_dbm is not None else None,
-                    status=status,
-                    error_code=None if range_status in (None, 0) else str(range_status),
-                    source="ble_click_report",
-                    raw_line=packet_summary(packet),
-                )
-            )
-        return records
+    rx_power = read_int(first_tlv(tlvs, TlvId.UWB_RSL_DBM))
+    phy_config_id = read_uint(first_tlv(tlvs, TlvId.PHY_CONFIG_ID))
+    burst_id = read_uint(first_tlv(tlvs, TlvId.BURST_ID))
+    cir = first_tlv(tlvs, TlvId.UWB_CIR_SAMPLE)
 
-    distance_mm = read_int(first_tlv(tlvs, TlvId.DISTANCE_MM))
-    if distance_mm is None:
-        return []
-    records.append(
-        ParsedRecord(
-            kind="sample" if distance_mm >= 0 and range_status in (None, 0) else "failure",
-            anchor_id=format_device_id(anchor_id),
-            sample_index=sample_index,
-            distance_m=None if distance_mm < 0 else distance_mm / 1000.0,
-            rx_power_dbm=float(rx_power_dbm) if rx_power_dbm is not None else None,
-            status=status,
-            error_code=None if range_status in (None, 0) else str(range_status),
-            source="ble_click_report",
-            raw_line=packet_summary(packet),
-        )
-    )
-    return records
+    distance_mm: int | None = None
+    sample_array = first_tlv(tlvs, TlvId.DISTANCE_SAMPLES_MM)
+    if sample_array and len(sample_array) >= 4:
+        distance_mm = struct.unpack_from("<i", sample_array, 0)[0]
+    else:
+        distance_mm = read_int(first_tlv(tlvs, TlvId.DISTANCE_MM))
 
+    ok = range_status in (None, 0)
+    if distance_mm is None or distance_mm < 0 or not ok:
+        distance_m = None
+    else:
+        distance_m = distance_mm / 1000.0
 
-def _survey_pair_records(packet: ImecPacket) -> list[ParsedRecord]:
-    tlvs = decode_tlvs(packet.payload)
-    responder_id = read_uint(first_tlv(tlvs, TlvId.RESPONDER_ID)) or packet.source_id
-    sample_index = read_uint(first_tlv(tlvs, TlvId.SAMPLE_INDEX))
-    distance_mm = read_int(first_tlv(tlvs, TlvId.DISTANCE_MM))
-    range_status = read_uint(first_tlv(tlvs, TlvId.RANGE_STATUS))
-    if distance_mm is None:
-        return []
+    anchor_text = format_device_id(anchor_id) if anchor_id is not None else format_device_id(packet.source_id)
+
     return [
         ParsedRecord(
-            kind="sample" if distance_mm >= 0 and range_status in (None, 0) else "failure",
-            anchor_id=format_device_id(responder_id),
+            kind="sample" if ok else "failure",
+            anchor_id=anchor_text,
+            clicker_id=format_device_id(clicker_id) if clicker_id is not None else None,
             sample_index=sample_index,
-            distance_m=None if distance_mm < 0 else distance_mm / 1000.0,
-            status=f"survey_{_range_status_text(range_status)}",
-            error_code=None if range_status in (None, 0) else str(range_status),
-            source="ble_survey_pair_result",
+            scheduled_sample_count=scheduled_count,
+            event_seq=event_seq,
+            firmware_timestamp_ms=timestamp_ms,
+            quality=quality,
+            phy_config_id=phy_config_id,
+            burst_id=burst_id,
+            distance_m=distance_m,
+            rx_power_dbm=float(rx_power) if rx_power is not None else None,
+            cir_raw=cir.hex() if cir else None,
+            status=_range_status_text(range_status),
+            error_code=None if ok else str(range_status),
+            source="ml_click_report",
             raw_line=packet_summary(packet),
+            tlv_json=_tlvs_to_json(tlvs),
         )
     ]
+
+
+def _tlvs_to_json(tlvs: dict[int, list[bytes]]) -> str:
+    obj: dict[str, list[str]] = {}
+    for tlv_id, values in tlvs.items():
+        obj[_tlv_name(tlv_id)] = [value.hex() for value in values]
+    return json.dumps(obj, separators=(",", ":"), sort_keys=True)
+
+
+def _tlv_name(tlv_id: int) -> str:
+    try:
+        return TlvId(tlv_id).name
+    except ValueError:
+        return f"0x{tlv_id:02X}"
 
 
 def _range_status_text(status: int | None) -> str:

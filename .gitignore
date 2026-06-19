@@ -8,3 +8,5 @@ Measurements/
 *.xlsx
 *:Zone.Identifier
 .DS_Store
+*.egg-info/
+.uv-cache/

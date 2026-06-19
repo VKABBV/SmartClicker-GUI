@@ -48,6 +48,7 @@ def safe_filename(value: str) -> str:
 class ParsedRecord:
     kind: str
     anchor_id: str | None = None
+    clicker_id: str | None = None
     sample_index: int | None = None
     distance_m: float | None = None
     mean_distance_m: float | None = None
@@ -60,3 +61,11 @@ class ParsedRecord:
     error_code: str | None = None
     source: str | None = None
     raw_line: str | None = None
+    # ML clicker diagnostic fields.
+    event_seq: int | None = None
+    scheduled_sample_count: int | None = None
+    quality: int | None = None
+    firmware_timestamp_ms: int | None = None
+    phy_config_id: int | None = None
+    burst_id: int | None = None
+    tlv_json: str | None = None

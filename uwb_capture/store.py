@@ -56,6 +56,7 @@ class MeasurementStore:
                 session_id TEXT NOT NULL,
                 timestamp TEXT NOT NULL,
                 anchor_id TEXT,
+                clicker_id TEXT,
                 sample_index INTEGER,
                 distance_m REAL,
                 rx_power_dbm REAL,
@@ -66,6 +67,13 @@ class MeasurementStore:
                 error_code TEXT,
                 source TEXT,
                 raw_line TEXT,
+                event_seq INTEGER,
+                scheduled_sample_count INTEGER,
+                quality INTEGER,
+                firmware_timestamp_ms INTEGER,
+                phy_config_id INTEGER,
+                burst_id INTEGER,
+                tlv_json TEXT,
                 FOREIGN KEY(session_id) REFERENCES sessions(id)
             );
 
@@ -151,16 +159,18 @@ class MeasurementStore:
         cur = self.conn.execute(
             """
             INSERT INTO samples (
-                session_id, timestamp, anchor_id, sample_index, distance_m,
+                session_id, timestamp, anchor_id, clicker_id, sample_index, distance_m,
                 rx_power_dbm, fp_power_dbm, cir_power, cir_raw, status,
-                error_code, source, raw_line
+                error_code, source, raw_line, event_seq, scheduled_sample_count,
+                quality, firmware_timestamp_ms, phy_config_id, burst_id, tlv_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
                 now_local_iso(),
                 record.anchor_id,
+                record.clicker_id,
                 record.sample_index,
                 record.distance_m,
                 record.rx_power_dbm,
@@ -171,6 +181,13 @@ class MeasurementStore:
                 record.error_code,
                 record.source,
                 record.raw_line,
+                record.event_seq,
+                record.scheduled_sample_count,
+                record.quality,
+                record.firmware_timestamp_ms,
+                record.phy_config_id,
+                record.burst_id,
+                record.tlv_json,
             ),
         )
         self.conn.commit()

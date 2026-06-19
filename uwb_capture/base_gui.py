@@ -23,23 +23,30 @@ from .common import (
     safe_float,
     safe_int,
 )
-from .bluetooth_io import BluetoothDeviceInfo, BluetoothScanner, BluetoothWorker
+from .bluetooth_io import (
+    DEFAULT_DEVICE_NAME,
+    DEFAULT_LOG_TX_UUID,
+    DEFAULT_PACKET_RX_UUID,
+    DEFAULT_PACKET_TX_UUID,
+    BluetoothDeviceInfo,
+    BluetoothScanner,
+    BluetoothWorker,
+)
 from .parser import parse_serial_line
 from .protocol import (
-    CommandId,
+    FLAG_DIAGNOSTIC,
     ImecPacket,
+    MessageType,
     ProtocolError,
-    build_command_packet,
-    build_command_tlvs,
+    build_ml_start_collection_packet,
     command_result_summary,
+    command_status_from_packet,
     decode_packet,
     format_device_id,
     next_sequence,
     packet_summary,
     parse_device_id,
     records_from_packet,
-    status_report_summary,
-    survey_reach_summary,
 )
 from .store import MeasurementStore
 
@@ -58,6 +65,9 @@ class UwbCaptureApp(tk.Tk):
         self.device_infos: dict[str, BluetoothDeviceInfo] = {}
         self.protocol_sequence = 0
         self.protocol_session_seed = int(time.time()) & 0xFFFFFFFF
+        self.ml_command_in_flight = False
+        self.ml_pending_session: int | None = None
+        self.ml_pending_seq: int | None = None
         self.capture_active = False
         self.current_session_id: str | None = None
         self.store: MeasurementStore | None = None
@@ -76,16 +86,16 @@ class UwbCaptureApp(tk.Tk):
         self.output_dir_var = tk.StringVar(value=str(DEFAULT_OUTPUT_DIR))
         self.db_path_var = tk.StringVar(value=str(DEFAULT_OUTPUT_DIR / DEFAULT_DB_NAME))
         self.device_var = tk.StringVar()
-        self.notify_uuid_var = tk.StringVar()
-        self.write_uuid_var = tk.StringVar()
+        self.device_filter_var = tk.StringVar(value=DEFAULT_DEVICE_NAME)
+        self.notify_uuid_var = tk.StringVar(value=DEFAULT_PACKET_TX_UUID)
+        self.write_uuid_var = tk.StringVar(value=DEFAULT_PACKET_RX_UUID)
+        self.log_uuid_var = tk.StringVar(value=DEFAULT_LOG_TX_UUID)
         self.auto_connect_var = tk.BooleanVar(value=False)
-        self.gateway_id_var = tk.StringVar(value="0")
-        self.target_id_var = tk.StringVar(value="0")
-        self.heartbeat_interval_ms_var = tk.StringVar(value="60000")
-        self.survey_id_var = tk.StringVar(value=str(self.protocol_session_seed))
-        self.survey_initiator_id_var = tk.StringVar()
-        self.survey_responder_id_var = tk.StringVar()
-        self.survey_sample_count_var = tk.StringVar(value="10")
+        self.host_id_var = tk.StringVar(value="1")
+        self.clicker_id_var = tk.StringVar(value="0")
+        self.ml_session_id_var = tk.StringVar(value=str(self.protocol_session_seed))
+        self.ml_sample_count_var = tk.StringVar(value="8")
+        self.ml_discovery_slot_count_var = tk.StringVar(value="8")
         self.constellation_var = tk.StringVar()
         self.los_var = tk.BooleanVar(value=True)
         self.nlos_var = tk.BooleanVar(value=False)
@@ -139,24 +149,40 @@ class UwbCaptureApp(tk.Tk):
         self.device_combo.grid(row=0, column=1, sticky="ew", pady=2)
         ttk.Button(frame, text="Scan", command=self.refresh_devices).grid(row=0, column=2, padx=(6, 0), pady=2)
 
-        ttk.Label(frame, text="Notify UUID").grid(row=1, column=0, sticky="w", pady=2)
-        ttk.Entry(frame, textvariable=self.notify_uuid_var).grid(
+        ttk.Label(frame, text="Name filter").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Entry(frame, textvariable=self.device_filter_var).grid(
             row=1,
             column=1,
             columnspan=2,
             sticky="ew",
             pady=2,
         )
-        ttk.Label(frame, text="Write UUID").grid(row=2, column=0, sticky="w", pady=2)
-        ttk.Entry(frame, textvariable=self.write_uuid_var).grid(
+        ttk.Label(frame, text="Packet TX").grid(row=2, column=0, sticky="w", pady=2)
+        ttk.Entry(frame, textvariable=self.notify_uuid_var).grid(
             row=2,
             column=1,
             columnspan=2,
             sticky="ew",
             pady=2,
         )
-        ttk.Checkbutton(frame, text="Auto-connect", variable=self.auto_connect_var).grid(
+        ttk.Label(frame, text="Packet RX").grid(row=3, column=0, sticky="w", pady=2)
+        ttk.Entry(frame, textvariable=self.write_uuid_var).grid(
             row=3,
+            column=1,
+            columnspan=2,
+            sticky="ew",
+            pady=2,
+        )
+        ttk.Label(frame, text="Log TX").grid(row=4, column=0, sticky="w", pady=2)
+        ttk.Entry(frame, textvariable=self.log_uuid_var).grid(
+            row=4,
+            column=1,
+            columnspan=2,
+            sticky="ew",
+            pady=2,
+        )
+        ttk.Checkbutton(frame, text="Auto-connect", variable=self.auto_connect_var).grid(
+            row=5,
             column=0,
             columnspan=3,
             sticky="w",
@@ -164,7 +190,7 @@ class UwbCaptureApp(tk.Tk):
         )
 
         button_row = ttk.Frame(frame)
-        button_row.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        button_row.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         button_row.columnconfigure(0, weight=1)
         button_row.columnconfigure(1, weight=1)
         self.connect_button = ttk.Button(button_row, text="Connect", command=self.connect_selected_device)
@@ -177,7 +203,7 @@ class UwbCaptureApp(tk.Tk):
         )
 
         ttk.Label(frame, textvariable=self.status_var, style="Status.TLabel").grid(
-            row=5,
+            row=7,
             column=0,
             columnspan=3,
             sticky="w",
@@ -224,13 +250,13 @@ class UwbCaptureApp(tk.Tk):
         )
 
     def _build_serial_control(self, parent: ttk.Frame, row: int) -> None:
-        control = ttk.LabelFrame(parent, text="Bluetooth protocol commands", padding=6)
+        control = ttk.LabelFrame(parent, text="ML Collection", padding=6)
         control.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         control.columnconfigure(1, weight=1)
         control.columnconfigure(3, weight=1)
 
-        ttk.Label(control, text="Gateway ID").grid(row=0, column=0, sticky="w", pady=2)
-        ttk.Entry(control, textvariable=self.gateway_id_var, width=18).grid(
+        ttk.Label(control, text="Host ID").grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Entry(control, textvariable=self.host_id_var, width=18).grid(
             row=0,
             column=1,
             columnspan=3,
@@ -238,8 +264,8 @@ class UwbCaptureApp(tk.Tk):
             padx=(6, 0),
             pady=2,
         )
-        ttk.Label(control, text="Target ID").grid(row=1, column=0, sticky="w", pady=2)
-        ttk.Entry(control, textvariable=self.target_id_var, width=18).grid(
+        ttk.Label(control, text="Clicker ID").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Entry(control, textvariable=self.clicker_id_var, width=18).grid(
             row=1,
             column=1,
             columnspan=3,
@@ -248,93 +274,47 @@ class UwbCaptureApp(tk.Tk):
             pady=2,
         )
 
-        command_row = ttk.Frame(control)
-        command_row.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(6, 0))
-        command_row.columnconfigure(0, weight=1)
-        command_row.columnconfigure(1, weight=1)
-        ttk.Button(
-            command_row,
-            text="Get Status",
-            command=lambda: self.send_protocol_command(CommandId.GET_STATUS),
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        ttk.Button(
-            command_row,
-            text="Start Heartbeat",
-            command=lambda: self.send_protocol_command(CommandId.START_HEARTBEAT),
-        ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
-        ttk.Button(
-            command_row,
-            text="Stop Heartbeat",
-            command=lambda: self.send_protocol_command(CommandId.STOP_HEARTBEAT),
-        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Label(control, text="Session ID").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(control, textvariable=self.ml_session_id_var, width=12).grid(
+            row=2,
+            column=1,
+            sticky="ew",
+            padx=(6, 12),
+            pady=(8, 0),
+        )
+        ttk.Label(control, text="Samples / anchor").grid(row=2, column=2, sticky="w", pady=(8, 0))
+        ttk.Entry(control, textvariable=self.ml_sample_count_var, width=8).grid(
+            row=2,
+            column=3,
+            sticky="ew",
+            padx=(6, 0),
+            pady=(8, 0),
+        )
 
-        ttk.Label(control, text="Heartbeat ms").grid(row=3, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(control, textvariable=self.heartbeat_interval_ms_var, width=12).grid(
+        ttk.Label(control, text="Discovery slots").grid(row=3, column=0, sticky="w", pady=2)
+        ttk.Entry(control, textvariable=self.ml_discovery_slot_count_var, width=8).grid(
             row=3,
             column=1,
             sticky="ew",
             padx=(6, 0),
-            pady=(8, 0),
-        )
-
-        ttk.Label(control, text="Survey ID").grid(row=4, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(control, textvariable=self.survey_id_var, width=12).grid(
-            row=4,
-            column=1,
-            sticky="ew",
-            padx=(6, 12),
-            pady=(8, 0),
-        )
-        ttk.Label(control, text="Samples").grid(row=4, column=2, sticky="w", pady=(8, 0))
-        ttk.Entry(control, textvariable=self.survey_sample_count_var, width=8).grid(
-            row=4,
-            column=3,
-            sticky="ew",
-            padx=(6, 0),
-            pady=(8, 0),
-        )
-
-        ttk.Label(control, text="Initiator").grid(row=5, column=0, sticky="w", pady=2)
-        ttk.Entry(control, textvariable=self.survey_initiator_id_var, width=18).grid(
-            row=5,
-            column=1,
-            sticky="ew",
-            padx=(6, 12),
-            pady=2,
-        )
-        ttk.Label(control, text="Responder").grid(row=5, column=2, sticky="w", pady=2)
-        ttk.Entry(control, textvariable=self.survey_responder_id_var, width=18).grid(
-            row=5,
-            column=3,
-            sticky="ew",
-            padx=(6, 0),
             pady=2,
         )
 
-        survey_row = ttk.Frame(control)
-        survey_row.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(6, 0))
-        for index in range(2):
-            survey_row.columnconfigure(index, weight=1)
-        ttk.Button(
-            survey_row,
-            text="Reachability Survey",
-            command=lambda: self.send_protocol_command(CommandId.SURVEY_REACHABILITY),
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        ttk.Button(
-            survey_row,
-            text="Prepare Pair",
-            command=lambda: self.send_protocol_command(CommandId.SURVEY_PREPARE_PAIR),
-        ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
-        ttk.Button(
-            survey_row,
-            text="Start Pair",
-            command=lambda: self.send_protocol_command(CommandId.SURVEY_START_PAIR),
-        ).grid(row=1, column=0, sticky="ew", padx=(0, 4), pady=(6, 0))
-        ttk.Button(
-            survey_row,
-            text="Abort Survey",
-            command=lambda: self.send_protocol_command(CommandId.SURVEY_ABORT),
-        ).grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=(6, 0))
+        self.ml_collect_button = ttk.Button(
+            control,
+            text="Start ML Collection",
+            style="Accent.TButton",
+            command=self.send_ml_start_collection,
+        )
+        self.ml_collect_button.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self.ml_status_var = tk.StringVar(value="No collection command sent")
+        ttk.Label(control, textvariable=self.ml_status_var, style="Status.TLabel").grid(
+            row=5,
+            column=0,
+            columnspan=4,
+            sticky="w",
+            pady=(6, 0),
+        )
 
     def _build_storage_panel(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Storage", padding=8)
@@ -452,7 +432,7 @@ class UwbCaptureApp(tk.Tk):
 
     def refresh_devices(self) -> None:
         self.status_var.set("Scanning for Bluetooth devices...")
-        BluetoothScanner(self.events).start()
+        BluetoothScanner(self.events, name_filter=self.device_filter_var.get()).start()
 
     def selected_device(self) -> str:
         return self.device_var.get().split(" - ", 1)[0].strip()
@@ -469,6 +449,7 @@ class UwbCaptureApp(tk.Tk):
             notify_uuid=self.notify_uuid_var.get(),
             write_uuid=self.write_uuid_var.get(),
             events=self.events,
+            log_uuid=self.log_uuid_var.get(),
         )
         self.bluetooth_worker.start()
         self.status_var.set(f"Connecting to {device}...")
@@ -511,7 +492,7 @@ class UwbCaptureApp(tk.Tk):
         self.anchor_distance_windows.clear()
         self.session_status_var.set(f"Capturing: {self.current_session_id[:8]}")
         self.log_raw(f"# Started session {self.current_session_id}")
-        self.log_raw("# Waiting for BLE click reports and survey results.")
+        self.log_raw("# Waiting for ML click reports. Send an ML collection command to begin streaming samples.")
 
     def stop_capture(self) -> None:
         if not self.capture_active:
@@ -523,85 +504,77 @@ class UwbCaptureApp(tk.Tk):
             self.session_status_var.set(f"Stopped: {counts['samples']} samples, {counts['alerts']} alerts")
             self.log_raw(f"# Stopped session {self.current_session_id}")
 
-    def send_protocol_command(self, command_id: CommandId) -> None:
+    def send_ml_start_collection(self) -> None:
         if self.bluetooth_worker is None:
-            self.log_raw(f"# Did not send {command_id.name}; Bluetooth is not connected.")
+            self.log_raw("# Did not send ML collection; Bluetooth is not connected.")
+            return
+        if self.ml_command_in_flight:
+            self.log_raw("# ML collection already in flight; wait for the command result before retrying.")
             return
         try:
-            extra_tlvs = self.command_extra_tlvs(command_id)
+            sample_count = self._ml_sample_count()
+            discovery_slots = self._ml_discovery_slot_count()
+            session_id = self._ml_session_id()
+            source_id = parse_device_id(self.host_id_var.get(), default=0)
+            if source_id == 0:
+                raise ProtocolError("Host ID must be a stable non-zero device ID.")
+            destination_id = parse_device_id(self.clicker_id_var.get(), default=0)
             self.protocol_sequence = next_sequence(self.protocol_sequence)
-            packet = build_command_packet(
-                command_id=command_id,
-                source_id=parse_device_id(self.gateway_id_var.get(), default=0),
-                destination_id=parse_device_id(self.target_id_var.get(), default=0),
-                session_id=self.command_session_id(command_id),
+            packet = build_ml_start_collection_packet(
+                source_id=source_id,
+                destination_id=destination_id,
+                session_id=session_id,
                 sequence=self.protocol_sequence,
-                extra_tlvs=extra_tlvs,
+                sample_count=sample_count,
+                discovery_slot_count=discovery_slots,
             )
         except ProtocolError as exc:
-            messagebox.showerror("Invalid protocol command", str(exc), parent=self)
+            messagebox.showerror("Invalid ML collection command", str(exc), parent=self)
             return
         sent = self.bluetooth_worker.send_packet(packet)
-        if sent:
-            self.log_raw(f"# Queued {command_id.name} to {self.target_id_var.get().strip() or 'broadcast'}")
-        else:
-            self.log_raw(f"# Did not send {command_id.name}; Bluetooth is not ready.")
-
-    def command_extra_tlvs(self, command_id: CommandId) -> list[tuple[Any, bytes]]:
-        heartbeat_interval = None
-        survey_id = None
-        sample_count = None
-        initiator_id = None
-        responder_id = None
-
-        if command_id == CommandId.START_HEARTBEAT:
-            heartbeat_interval = safe_int(self.heartbeat_interval_ms_var.get())
-            if heartbeat_interval is not None and not (5000 <= heartbeat_interval <= 3600000):
-                raise ProtocolError("Heartbeat interval must be from 5000 ms to 3600000 ms.")
-
-        if command_id in {
-            CommandId.SURVEY_REACHABILITY,
-            CommandId.SURVEY_PREPARE_PAIR,
-            CommandId.SURVEY_START_PAIR,
-            CommandId.SURVEY_ABORT,
-        }:
-            survey_id = self.survey_id()
-
-        if command_id in {CommandId.SURVEY_PREPARE_PAIR, CommandId.SURVEY_START_PAIR}:
-            sample_count = safe_int(self.survey_sample_count_var.get())
-            if sample_count is None or not (1 <= sample_count <= 65535):
-                raise ProtocolError("Survey sample count must be from 1 to 65535.")
-            initiator_id = self.optional_device_id(self.survey_initiator_id_var.get())
-            responder_id = self.optional_device_id(self.survey_responder_id_var.get())
-        return build_command_tlvs(
-            command_id,
-            heartbeat_interval_ms=heartbeat_interval,
-            survey_id=survey_id,
-            initiator_id=initiator_id,
-            responder_id=responder_id,
-            sample_count=sample_count,
+        if not sent:
+            self.log_raw("# Did not send ML collection; Bluetooth is not ready.")
+            return
+        self.ml_command_in_flight = True
+        self.ml_pending_session = session_id
+        self.ml_pending_seq = self.protocol_sequence
+        self._set_ml_collect_state(True)
+        self.log_raw(
+            f"# Queued ML_START_COLLECTION to {self.clicker_id_var.get().strip() or 'broadcast'} "
+            f"(session={session_id} seq={self.protocol_sequence})"
         )
 
-    def command_session_id(self, command_id: CommandId) -> int:
-        if command_id in {
-            CommandId.SURVEY_REACHABILITY,
-            CommandId.SURVEY_PREPARE_PAIR,
-            CommandId.SURVEY_START_PAIR,
-            CommandId.SURVEY_ABORT,
-        }:
-            return self.survey_id()
-        return self.protocol_session_seed
-
-    def survey_id(self) -> int:
-        value = safe_int(self.survey_id_var.get())
-        if value is None or value < 0 or value > 0xFFFFFFFF:
-            raise ProtocolError("Survey ID must be a 32-bit unsigned integer.")
+    def _ml_sample_count(self) -> int | None:
+        text = self.ml_sample_count_var.get().strip()
+        if not text:
+            return None
+        value = safe_int(text)
+        if value is None or not (1 <= value <= 15):
+            raise ProtocolError("Samples per anchor must be from 1 to 15 (blank uses firmware default 8).")
         return value
 
-    def optional_device_id(self, value: str) -> int | None:
-        if not value.strip():
+    def _ml_discovery_slot_count(self) -> int | None:
+        text = self.ml_discovery_slot_count_var.get().strip()
+        if not text:
             return None
-        return parse_device_id(value)
+        value = safe_int(text)
+        if value is None or not (1 <= value <= 50):
+            raise ProtocolError("Discovery slots must be from 1 to 50 (blank uses firmware default 8).")
+        return value
+
+    def _ml_session_id(self) -> int:
+        value = safe_int(self.ml_session_id_var.get())
+        if value is None or value < 0 or value > 0xFFFFFFFF:
+            raise ProtocolError("Session ID must be a 32-bit unsigned integer.")
+        return value
+
+    def _set_ml_collect_state(self, in_flight: bool) -> None:
+        if hasattr(self, "ml_collect_button"):
+            self.ml_collect_button.configure(state="disabled" if in_flight else "normal")
+        if hasattr(self, "ml_status_var"):
+            self.ml_status_var.set(
+                "Collection in flight..." if in_flight else "Ready to collect"
+            )
 
     def handle_protocol_packet(self, data: bytes) -> None:
         try:
@@ -614,10 +587,16 @@ class UwbCaptureApp(tk.Tk):
         self.log_raw(f"# RX {summary}")
         try:
             self.log_protocol_message(packet)
-            records = records_from_packet(packet)
+            if packet.msg_type == MessageType.CLICK_REPORT and not (packet.flags & FLAG_DIAGNOSTIC):
+                records = []
+            else:
+                records = records_from_packet(packet)
         except ProtocolError as exc:
             self.log_alert(f"Could not parse {summary}: {exc}")
             records = []
+
+        if packet.msg_type == MessageType.COMMAND_RESULT:
+            self._handle_command_result(packet)
 
         if self.capture_active and self.store is not None and self.current_session_id is not None:
             self.store.insert_raw_line(self.current_session_id, f"{summary} {data.hex(' ')}", bool(records))
@@ -625,14 +604,35 @@ class UwbCaptureApp(tk.Tk):
             return
         self.handle_records(records)
 
+    def _handle_command_result(self, packet: ImecPacket) -> None:
+        matches = (
+            self.ml_pending_session == packet.session_id
+            and self.ml_pending_seq == packet.sequence
+        )
+        if not matches:
+            return
+        status = command_status_from_packet(packet)
+        self.ml_command_in_flight = False
+        self.ml_pending_session = None
+        self.ml_pending_seq = None
+        self._set_ml_collect_state(False)
+        if status == 3:  # COMMAND_BUSY
+            self.log_raw("# ML collection rejected as BUSY; wait for the prior collection to finish, then retry.")
+            if hasattr(self, "ml_status_var"):
+                self.ml_status_var.set("Busy - retry after prior collection finishes")
+        elif status is None or status == 0:
+            self.log_raw("# ML collection command result: OK")
+            if hasattr(self, "ml_status_var"):
+                self.ml_status_var.set("Collection complete")
+        else:
+            self.log_raw(f"# ML collection command result status={status}")
+            if hasattr(self, "ml_status_var"):
+                self.ml_status_var.set(f"Result status {status}")
+
     def log_protocol_message(self, packet: ImecPacket) -> None:
-        if packet.msg_type == 0x41:
+        if packet.msg_type == MessageType.COMMAND_RESULT:
             self.log_raw(f"# Command result: {command_result_summary(packet)}")
-        elif packet.msg_type == 0x22:
-            self.log_raw(f"# {status_report_summary(packet)}")
-        elif packet.msg_type == 0x51:
-            self.log_raw(f"# {survey_reach_summary(packet)}")
-        elif packet.msg_type == 0x7F:
+        elif packet.msg_type == MessageType.MSG_ERROR:
             self.log_alert(f"Protocol error from {format_device_id(packet.source_id)}")
 
     def session_metadata(self) -> dict[str, Any]:
