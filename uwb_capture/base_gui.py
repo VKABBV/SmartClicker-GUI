@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import queue
 import re
+import struct
 import time
 from datetime import datetime
 from pathlib import Path
@@ -96,7 +97,12 @@ def _decode_cir_bytes(cir_hex: str | None) -> list[int]:
         raw = bytes.fromhex(cir_hex)
     except ValueError:
         return []
-    return list(raw)
+    if len(raw) <= 8:
+        return list(raw)
+    samples = []
+    for i in range(0, len(raw) - 1, 2):
+        samples.append(struct.unpack_from("<h", raw, i)[0])
+    return samples
 
 
 class UwbCaptureApp(tk.Tk):
@@ -122,6 +128,11 @@ class UwbCaptureApp(tk.Tk):
         self.last_instability_prompt: dict[str, float] = {}
         self.anchor_distance_windows: dict[str, list[float]] = {}
         self.last_sample_row_by_anchor: dict[str, int] = {}
+        self.collection_sample_rows: list[int] = []
+        self.collection_event_seq: int | None = None
+        self.pending_diagnostics: list[ParsedRecord] = []
+        self.cir_reassembly: bytearray = bytearray()
+        self.cir_reassembly_total: int = 0
         self.cir_history: list[ParsedRecord] = []
         self._build_variables()
         self._build_style()
@@ -701,6 +712,11 @@ class UwbCaptureApp(tk.Tk):
         self.last_instability_prompt.clear()
         self.anchor_distance_windows.clear()
         self.last_sample_row_by_anchor.clear()
+        self.collection_sample_rows.clear()
+        self.collection_event_seq = None
+        self.pending_diagnostics.clear()
+        self.cir_reassembly.clear()
+        self.cir_reassembly_total = 0
         self.session_status_var.set(f"Capturing: {self.current_session_id[:8]}")
         self.log_raw(f"# Started session {self.current_session_id}")
         self.log_raw("# Waiting for ML click reports. Send an ML collection command to begin streaming samples.")
@@ -828,6 +844,9 @@ class UwbCaptureApp(tk.Tk):
         self.ml_pending_session = None
         self.ml_pending_seq = None
         self._set_ml_collect_state(False)
+        self._flush_diagnostics_to_all_samples()
+        self.collection_sample_rows.clear()
+        self.collection_event_seq = None
         samples_text = f" ({sample_count} sample notifications)" if sample_count is not None else ""
         if status == CommandStatus.COMMAND_BUSY:
             self.log_raw("# ML collection rejected as BUSY; wait for the prior collection to finish, then retry.")
@@ -924,7 +943,7 @@ class UwbCaptureApp(tk.Tk):
     def handle_records(self, records: list[ParsedRecord]) -> None:
         for record in records:
             if record.kind == "diagnostic_fragment":
-                self._merge_diagnostic_fragment(record)
+                self._buffer_diagnostic_fragment(record)
                 continue
             if self.store is not None and self.current_session_id is not None:
                 if record.kind == "summary":
@@ -933,6 +952,9 @@ class UwbCaptureApp(tk.Tk):
                     self.add_record_to_table(record, alert_error)
                 else:
                     row_id = self.store.insert_sample(self.current_session_id, record)
+                    if record.event_seq is not None:
+                        self.collection_event_seq = record.event_seq
+                    self.collection_sample_rows.append(row_id)
                     if record.anchor_id:
                         self.last_sample_row_by_anchor[record.anchor_id] = row_id
                     alert_error = self.check_los_alert(record)
@@ -944,15 +966,72 @@ class UwbCaptureApp(tk.Tk):
                 self._add_cir_sample(record)
         self.update_counts()
 
-    def _merge_diagnostic_fragment(self, record: ParsedRecord) -> None:
-        anchor = record.anchor_id
-        if not anchor:
+    def _buffer_diagnostic_fragment(self, record: ParsedRecord) -> None:
+        self.pending_diagnostics.append(record)
+        if record.tlv_json:
+            self._reassemble_cir_from_fragment(record)
+
+    def _reassemble_cir_from_fragment(self, record: ParsedRecord) -> None:
+        import json as _json
+        try:
+            tlvs = _json.loads(record.tlv_json)
+        except (ValueError, TypeError):
             return
-        row_id = self.last_sample_row_by_anchor.get(anchor)
-        if row_id is not None and self.store is not None:
-            self.store.merge_diagnostic_into_sample(row_id, record)
-        if record.cir_raw:
-            self._add_cir_sample(record)
+        cir_chunk_hex = tlvs.get("DIAG_CIR_CHUNK", [])
+        cir_offset_hex = tlvs.get("DIAG_CIR_OFFSET", [])
+        cir_total_hex = tlvs.get("DIAG_CIR_TOTAL", [])
+        if not cir_chunk_hex:
+            return
+        for chunk_hex in cir_chunk_hex:
+            chunk = bytes.fromhex(chunk_hex)
+            offset = 0
+            if cir_offset_hex:
+                offset = int.from_bytes(bytes.fromhex(cir_offset_hex[0]), "little")
+            if cir_total_hex:
+                self.cir_reassembly_total = int.from_bytes(bytes.fromhex(cir_total_hex[0]), "little")
+            end = offset + len(chunk)
+            if end > len(self.cir_reassembly):
+                self.cir_reassembly.extend(bytearray(end - len(self.cir_reassembly)))
+            self.cir_reassembly[offset:end] = chunk
+
+    def _flush_diagnostics_to_all_samples(self) -> None:
+        if not self.pending_diagnostics or not self.collection_sample_rows:
+            self.pending_diagnostics.clear()
+            return
+        reassembled_cir = bytes(self.cir_reassembly) if self.cir_reassembly else None
+        for diag in self.pending_diagnostics:
+            for row_id in self.collection_sample_rows:
+                merged = self._merge_diag_record(diag, reassembled_cir)
+                if self.store is not None:
+                    self.store.merge_diagnostic_into_sample(row_id, merged)
+        if reassembled_cir:
+            for row_id in self.collection_sample_rows:
+                if self.store is not None:
+                    self.store.update_sample_cir_full(row_id, reassembled_cir.hex())
+        self.pending_diagnostics.clear()
+        self.cir_reassembly.clear()
+        self.cir_reassembly_total = 0
+
+    @staticmethod
+    def _merge_diag_record(diag: ParsedRecord, reassembled_cir: bytes | None) -> ParsedRecord:
+        return ParsedRecord(
+            kind="diagnostic_merge",
+            anchor_id=diag.anchor_id,
+            rx_power_dbm=diag.rx_power_dbm,
+            phy_config_id=diag.phy_config_id,
+            burst_id=diag.burst_id,
+            exchange_stride_us=diag.exchange_stride_us,
+            burst_duration_ms=diag.burst_duration_ms,
+            diag_status_flags=diag.diag_status_flags,
+            diag_bytes_captured=diag.diag_bytes_captured,
+            diag_bytes_transmitted=diag.diag_bytes_transmitted,
+            report_fragment_count=diag.report_fragment_count,
+            uwb_clock_offset_raw=diag.uwb_clock_offset_raw,
+            uwb_carrier_integrator=diag.uwb_carrier_integrator,
+            clicker_diag_bytes=diag.clicker_diag_bytes,
+            cir_raw=reassembled_cir.hex() if reassembled_cir else diag.cir_raw,
+            tlv_json=diag.tlv_json,
+        )
 
     def check_los_alert(self, record: ParsedRecord) -> float | None:
         if not self.los_var.get() or self.nlos_var.get():

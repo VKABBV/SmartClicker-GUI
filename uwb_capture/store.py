@@ -266,6 +266,13 @@ class MeasurementStore:
         )
         self.conn.commit()
 
+    def update_sample_cir_full(self, sample_row_id: int, cir_full_hex: str) -> None:
+        self.conn.execute(
+            "UPDATE samples SET cir_raw = ? WHERE id = ?",
+            (cir_full_hex, sample_row_id),
+        )
+        self.conn.commit()
+
     def insert_summary(self, session_id: str, record: ParsedRecord) -> int:
         cur = self.conn.execute(
             """
