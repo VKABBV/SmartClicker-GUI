@@ -18,6 +18,7 @@ from openpyxl.styles import Font, PatternFill
 from openpyxl.worksheet.datavalidation import DataValidation
 
 from . import base_gui as original
+from .common import export_timestamp
 
 tk = original.tk
 ttk = original.ttk
@@ -95,6 +96,11 @@ def next_constellation_label(current: str) -> str:
         return f"{current.strip() or 'constellation'}_2"
     prefix, number = match.groups()
     return f"{prefix}{int(number) + 1}"
+
+
+def measurement_list_default_filename(db_path: Path, timestamp: str | None = None) -> str:
+    stamp = timestamp or export_timestamp()
+    return f"{safe_filename(db_path.stem)}_ground_truth_measurement_list_{stamp}.xlsx"
 
 
 def normalize_los_nlos(value: Any) -> str:
@@ -987,7 +993,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             )
             return
 
-        default_name = f"{safe_filename(db_path.stem)}_ground_truth_measurement_list.xlsx"
+        default_name = measurement_list_default_filename(db_path)
         output_path = filedialog.asksaveasfilename(
             initialdir=self.output_dir_var.get(),
             initialfile=default_name,
@@ -1090,6 +1096,8 @@ def export_session_per_anchor(
     con: sqlite3.Connection,
     session_id: str,
     output_dir: Path,
+    *,
+    timestamp: str | None = None,
 ) -> list[Path]:
     session = con.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
     if session is None:
@@ -1098,7 +1106,7 @@ def export_session_per_anchor(
     truths = fetch_anchor_truths(con, session_id)
     los_nlos_by_anchor = fetch_anchor_los_nlos(con, session_id)
     output_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = timestamp or export_timestamp()
     constellation = safe_filename(session["constellation_label"] or "constellation")
 
     paths: list[Path] = []

@@ -18,6 +18,11 @@ def now_local_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="milliseconds")
 
 
+def export_timestamp(now: datetime | None = None) -> str:
+    stamp = now or datetime.now().astimezone()
+    return stamp.strftime("%Y%m%d_%H%M%S")
+
+
 def safe_float(value: Any) -> float | None:
     try:
         if value in (None, ""):

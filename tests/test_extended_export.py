@@ -10,6 +10,7 @@ from uwb_capture.extended_gui import (
     ensure_responder_label_schema,
     export_session_per_anchor,
     build_measurement_rows,
+    measurement_list_default_filename,
 )
 from uwb_capture.store import MeasurementStore
 
@@ -88,6 +89,38 @@ class ExtendedExportTests(unittest.TestCase):
             self.assertIn("_NLOS_", by_anchor["8"].name)
             self.assertEqual(self._first_sample_los_nlos(by_anchor["7"]), "LOS")
             self.assertEqual(self._first_sample_los_nlos(by_anchor["8"]), "NLOS")
+
+    def test_per_anchor_export_filenames_include_export_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MeasurementStore(Path(tmp) / "measurements.sqlite")
+            session_id = store.create_session(
+                {
+                    "condition_los": True,
+                    "condition_nlos": False,
+                    "constellation_label": "bench",
+                    "send_start_stop": False,
+                }
+            )
+            self._insert_sample(store, session_id, "7", 1.25)
+            paths = export_session_per_anchor(
+                store.conn,
+                session_id,
+                Path(tmp) / "exports",
+                timestamp="20260619_143015",
+            )
+            store.close()
+
+        self.assertEqual(len(paths), 1)
+        self.assertTrue(paths[0].name.endswith("_20260619_143015.xlsx"))
+
+    def test_measurement_list_default_filename_includes_export_timestamp(self) -> None:
+        self.assertEqual(
+            measurement_list_default_filename(
+                Path("My Capture.sqlite"),
+                timestamp="20260619_143015",
+            ),
+            "My_Capture_ground_truth_measurement_list_20260619_143015.xlsx",
+        )
 
     def _insert_sample(
         self,

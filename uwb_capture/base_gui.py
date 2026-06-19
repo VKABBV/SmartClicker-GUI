@@ -20,6 +20,7 @@ from .common import (
     INSTABILITY_WINDOW_SIZE,
     MAX_TABLE_ROWS,
     ParsedRecord,
+    export_timestamp,
     now_local_iso,
     safe_filename,
     safe_float,
@@ -1365,8 +1366,7 @@ class UwbCaptureApp(tk.Tk):
             condition_bits.append("NLOS")
         condition = "-".join(condition_bits) or "unlabeled"
         constellation = safe_filename(session["constellation_label"] or "constellation")
-        started = str(session["started_at"]).replace(":", "_")
-        default_name = f"{constellation}_{condition}_{started}.xlsx"
+        default_name = f"{constellation}_{condition}_{export_timestamp()}.xlsx"
         output_path = filedialog.asksaveasfilename(
             initialdir=self.output_dir_var.get(),
             initialfile=default_name,
