@@ -86,7 +86,7 @@ Subscribe to `Packet TX` and parse complete COBS-delimited frames. During a coll
 | `MSG_CLICK_REPORT = 0x20` with `FLAG_DIAGNOSTIC = 0x10` | One ML range sample notification. Store these as training rows. |
 | `MSG_COMMAND_RESULT = 0x41` with `FLAG_DIAGNOSTIC = 0x10` | Final command result for the trigger. `FLAG_ERROR = 0x40` is set when status is not OK. |
 
-The GUI should not wait for the command result before collecting samples. Sample packets are streamed as each DS-TWR exchange finishes; the command result comes at the end.
+The GUI should not wait for the command result before collecting samples. The ML clicker keeps BLE packet and log notifications quiet while the UWB collection is active, buffers sample packets in firmware, then emits the buffered `MSG_CLICK_REPORT` frames in schedule order before the final command result. Samples may therefore arrive as a post-UWB burst rather than one-by-one during ranging; buffer and decode every `Packet TX` notification as it arrives and store each diagnostic click report immediately.
 
 ## ML Sample TLVs
 
