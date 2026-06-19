@@ -36,11 +36,13 @@ from .bluetooth_io import (
 from .parser import parse_serial_line
 from .protocol import (
     FLAG_DIAGNOSTIC,
+    CommandStatus,
     ImecPacket,
     MessageType,
     ProtocolError,
     build_ml_start_collection_packet,
     command_result_summary,
+    command_sample_count_from_packet,
     command_status_from_packet,
     decode_packet,
     format_device_id,
@@ -55,10 +57,10 @@ APP_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT_DIR = APP_DIR / "Measurements" / "GUI_Captures"
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-_BT_DEBUG_RE = re.compile(
-    r"bt_hci_core|bt_sdc_hci_driver|bt_tx_irq_raise|hci_driver_send|messages dropped",
-    re.IGNORECASE,
-)
+_BT_DEBUG_RE = re.compile(r"<(?:dbg|err|wrn|inf)> bt_|bt_\w+:", re.IGNORECASE)
+_BT_DROPPED_BANNER_RE = re.compile(r"^-+\s*\d*\s*$")
+_BT_DROPPED_COUNT_RE = re.compile(r"^\d{1,6}$")
+_MESSAGES_DROPPED_RE = re.compile(r"messages\s+dropped", re.IGNORECASE)
 
 
 def _clean_log_line(line: str) -> str:
@@ -66,7 +68,26 @@ def _clean_log_line(line: str) -> str:
 
 
 def _is_bt_debug_noise(line: str) -> bool:
-    return bool(_BT_DEBUG_RE.search(line))
+    if not line:
+        return False
+    if _BT_DEBUG_RE.search(line):
+        return True
+    if _MESSAGES_DROPPED_RE.search(line):
+        return True
+    if _BT_DROPPED_BANNER_RE.match(line):
+        return True
+    if _BT_DROPPED_COUNT_RE.match(line):
+        return True
+    return False
+
+
+def _command_status_name(status: int | None) -> str:
+    if status is None:
+        return "UNKNOWN"
+    try:
+        return CommandStatus(status).name
+    except ValueError:
+        return f"STATUS_{status}"
 
 
 class UwbCaptureApp(tk.Tk):
@@ -91,7 +112,6 @@ class UwbCaptureApp(tk.Tk):
         self.last_alert_prompt: dict[str, float] = {}
         self.last_instability_prompt: dict[str, float] = {}
         self.anchor_distance_windows: dict[str, list[float]] = {}
-        self.suppressed_log_count = 0
         self._build_variables()
         self._build_style()
         self._build_layout()
@@ -139,9 +159,8 @@ class UwbCaptureApp(tk.Tk):
         root.columnconfigure(1, weight=1)
         root.rowconfigure(0, weight=1)
 
-        left = ttk.Frame(root, width=360)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        left.grid_propagate(False)
+        left = self._build_scrollable_frame(root, width=360)
+        self._scrollable_container.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
 
         right = ttk.Frame(root)
         right.grid(row=0, column=1, sticky="nsew")
@@ -155,6 +174,42 @@ class UwbCaptureApp(tk.Tk):
         self._build_stats_panel(left)
         self._build_live_panel(right)
         self._build_log_panel(right)
+
+    def _build_scrollable_frame(self, parent: Any, *, width: int) -> ttk.Frame:
+        container = ttk.Frame(parent)
+        container.rowconfigure(0, weight=1)
+        container.columnconfigure(0, weight=1)
+
+        canvas = tk.Canvas(container, width=width, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(container, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+        inner = ttk.Frame(canvas)
+        inner_id = canvas.create_window(0, 0, window=inner, anchor="nw")
+        inner.bind(
+            "<Configure>",
+            lambda _event: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.bind(
+            "<Configure>",
+            lambda event: canvas.itemconfigure(inner_id, width=event.width),
+        )
+        self._bind_scroll_wheel(canvas)
+        self._scrollable_container = container
+        return inner
+
+    def _bind_scroll_wheel(self, canvas: Any) -> None:
+        def scroll(event: Any) -> None:
+            if hasattr(event, "delta") and event.delta:
+                canvas.yview_scroll(int(-event.delta / 120), "units")
+            elif hasattr(event, "num"):
+                canvas.yview_scroll(-1 if event.num == 4 else 1, "units")
+
+        canvas.bind_all("<MouseWheel>", scroll)
+        canvas.bind_all("<Button-4>", scroll)
+        canvas.bind_all("<Button-5>", scroll)
 
     def _build_connection_panel(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Bluetooth Connection", padding=8)
@@ -253,10 +308,15 @@ class UwbCaptureApp(tk.Tk):
         action_row.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(10, 0))
         action_row.columnconfigure(0, weight=1)
         action_row.columnconfigure(1, weight=1)
-        self.start_button = ttk.Button(action_row, text="Start Logging", style="Accent.TButton", command=self.start_capture)
+        self.start_button = ttk.Button(action_row, text="Start Recording", style="Accent.TButton", command=self.start_capture)
         self.start_button.grid(row=0, column=0, sticky="ew", padx=(0, 5))
-        self.stop_button = ttk.Button(action_row, text="Stop Logging", command=self.stop_capture)
+        self.stop_button = ttk.Button(action_row, text="Stop Recording", command=self.stop_capture)
         self.stop_button.grid(row=0, column=1, sticky="ew", padx=(5, 0))
+        ttk.Label(
+            action_row,
+            text="Recording saves incoming ML samples to the database. Start it once, then trigger captures below.",
+            wraplength=320,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         ttk.Label(frame, textvariable=self.session_status_var, style="Status.TLabel").grid(
             row=7,
@@ -319,14 +379,19 @@ class UwbCaptureApp(tk.Tk):
 
         self.ml_collect_button = ttk.Button(
             control,
-            text="Start ML Collection",
+            text="Trigger ML Collection",
             style="Accent.TButton",
             command=self.send_ml_start_collection,
         )
         self.ml_collect_button.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        ttk.Label(
+            control,
+            text="Sends one CMD_ML_START_COLLECTION. The clicker runs fresh UWB discovery and streams range samples. Repeat for each capture.",
+            wraplength=320,
+        ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(4, 0))
         self.ml_status_var = tk.StringVar(value="No collection command sent")
         ttk.Label(control, textvariable=self.ml_status_var, style="Status.TLabel").grid(
-            row=5,
+            row=6,
             column=0,
             columnspan=4,
             sticky="w",
@@ -476,7 +541,6 @@ class UwbCaptureApp(tk.Tk):
             self.bluetooth_worker.stop()
             self.bluetooth_worker = None
         self.connected_device = None
-        self._flush_suppressed_log_summary()
         self.status_var.set("Disconnected")
 
     def start_capture(self) -> None:
@@ -516,7 +580,6 @@ class UwbCaptureApp(tk.Tk):
         if not self.capture_active:
             return
         self.capture_active = False
-        self._flush_suppressed_log_summary()
         if self.store is not None and self.current_session_id is not None:
             self.store.finish_session(self.current_session_id)
             counts = self.store.counts(self.current_session_id)
@@ -631,22 +694,32 @@ class UwbCaptureApp(tk.Tk):
         if not matches:
             return
         status = command_status_from_packet(packet)
+        sample_count = command_sample_count_from_packet(packet)
         self.ml_command_in_flight = False
         self.ml_pending_session = None
         self.ml_pending_seq = None
         self._set_ml_collect_state(False)
-        if status == 3:  # COMMAND_BUSY
+        samples_text = f" ({sample_count} sample notifications)" if sample_count is not None else ""
+        if status == CommandStatus.COMMAND_BUSY:
             self.log_raw("# ML collection rejected as BUSY; wait for the prior collection to finish, then retry.")
             if hasattr(self, "ml_status_var"):
                 self.ml_status_var.set("Busy - retry after prior collection finishes")
-        elif status is None or status == 0:
-            self.log_raw("# ML collection command result: OK")
+        elif status == CommandStatus.COMMAND_TIMEOUT:
+            self.log_raw(
+                f"# ML collection timed out with no anchor replies{samples_text}. "
+                "Check anchor placement/power and retry."
+            )
             if hasattr(self, "ml_status_var"):
-                self.ml_status_var.set("Collection complete")
+                self.ml_status_var.set("Timeout - no anchors replied")
+        elif status is None or status == CommandStatus.COMMAND_OK:
+            self.log_raw(f"# ML collection command result: OK{samples_text}")
+            if hasattr(self, "ml_status_var"):
+                self.ml_status_var.set(f"Collection complete{samples_text}")
         else:
-            self.log_raw(f"# ML collection command result status={status}")
+            name = _command_status_name(status)
+            self.log_raw(f"# ML collection command result: {name}{samples_text}")
             if hasattr(self, "ml_status_var"):
-                self.ml_status_var.set(f"Result status {status}")
+                self.ml_status_var.set(f"Result: {name}{samples_text}")
 
     def log_protocol_message(self, packet: ImecPacket) -> None:
         if packet.msg_type == MessageType.COMMAND_RESULT:
@@ -713,9 +786,7 @@ class UwbCaptureApp(tk.Tk):
     def handle_serial_line(self, line: str) -> None:
         cleaned = _clean_log_line(line)
         if _is_bt_debug_noise(cleaned):
-            self.suppressed_log_count += 1
             return
-        self._flush_suppressed_log_summary()
         self.log_raw(cleaned)
         records = parse_serial_line(cleaned)
         if self.capture_active and self.store is not None and self.current_session_id is not None:
@@ -725,10 +796,6 @@ class UwbCaptureApp(tk.Tk):
 
         self.handle_records(records)
 
-    def _flush_suppressed_log_summary(self) -> None:
-        if self.suppressed_log_count:
-            self.log_raw(f"# ({self.suppressed_log_count} BT debug line(s) suppressed)")
-            self.suppressed_log_count = 0
 
     def handle_records(self, records: list[ParsedRecord]) -> None:
         for record in records:
