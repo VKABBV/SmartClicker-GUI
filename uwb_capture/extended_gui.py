@@ -18,6 +18,7 @@ from openpyxl.styles import Font, PatternFill
 from openpyxl.worksheet.datavalidation import DataValidation
 
 from . import base_gui as original
+from .localization import LocalizationReading, LocalizationResult, solve_position
 
 tk = original.tk
 ttk = original.ttk
@@ -126,14 +127,50 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
     """Original GUI plus targeted measurement workflow extensions."""
 
     def __init__(self) -> None:
-        super().__init__()
         self.anchor_true_distances: dict[str, dict[str, Any]] = {}
         self.anchor_los_nlos: dict[str, str] = {}
         self.anchor_measured_distances: dict[str, float] = {}
         self.anchor_distance_history: dict[str, list[float]] = {}
         self.detected_anchor_ids: set[str] = set()
+        self.localization_rows: dict[str, dict[str, Any]] = {}
+        self.localization_row_order: list[str] = []
+        self.localization_anchor_positions: dict[str, tuple[str, str]] = {}
+        self.localization_result: LocalizationResult | None = None
         self._pyth_updating = False
+        super().__init__()
         self._install_extensions()
+
+    def _build_layout(self) -> None:
+        root = ttk.Frame(self, padding=10)
+        root.pack(fill=tk.BOTH, expand=True)
+        root.columnconfigure(0, weight=0)
+        root.columnconfigure(1, weight=1)
+        root.rowconfigure(0, weight=1)
+
+        left = self._build_scrollable_frame(root, width=480)
+        self._scrollable_container.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+
+        right_notebook = ttk.Notebook(root)
+        right_notebook.grid(row=0, column=1, sticky="nsew")
+        self.capture_tab = ttk.Frame(right_notebook)
+        self.capture_tab.columnconfigure(0, weight=1)
+        self.capture_tab.rowconfigure(0, weight=1)
+        self.capture_tab.rowconfigure(1, weight=1)
+        self.localization_tab = ttk.Frame(right_notebook, padding=8)
+        self.localization_tab.columnconfigure(0, weight=1)
+        self.localization_tab.rowconfigure(1, weight=1)
+        self.localization_tab.rowconfigure(2, weight=1)
+        right_notebook.add(self.capture_tab, text="Capture Data")
+        right_notebook.add(self.localization_tab, text="Localization")
+        self.right_notebook = right_notebook
+
+        self._build_connection_panel(left)
+        self._build_session_panel(left)
+        self._build_storage_panel(left)
+        self._build_stats_panel(left)
+        self._build_live_panel(self.capture_tab)
+        self._build_log_panel(self.capture_tab)
+        self._build_localization_panel(self.localization_tab)
 
     def _build_session_panel(self, parent: Any) -> None:
         frame = ttk.LabelFrame(parent, text="Measurement Session", padding=8)
@@ -196,6 +233,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
 
     def _install_extensions(self) -> None:
         self._add_constellation_button()
+        self._add_solve_position_button()
         self._add_anchor_true_distance_controls()
         self._add_measurement_list_button()
 
@@ -216,6 +254,457 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             column=2,
             sticky="ew",
             padx=(5, 0),
+        )
+
+    def _add_solve_position_button(self) -> None:
+        if getattr(self, "start_button", None) is None:
+            return
+
+        parent = self.start_button.master
+        parent.columnconfigure(3, weight=1)
+        self.solve_position_button = ttk.Button(
+            parent,
+            text="Solve for Position",
+            command=self.solve_latest_position,
+        )
+        self.solve_position_button.grid(
+            row=0,
+            column=3,
+            sticky="ew",
+            padx=(5, 0),
+        )
+
+    def _build_localization_panel(self, parent: Any) -> None:
+        header = ttk.LabelFrame(parent, text="Position Solver", padding=8)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        header.columnconfigure(0, weight=1)
+        header.columnconfigure(1, weight=1)
+        header.columnconfigure(2, weight=1)
+
+        self.localization_status_var = tk.StringVar(
+            value="Capture anchor ranges, enter anchor X/Y positions, then solve."
+        )
+        ttk.Button(
+            header,
+            text="Use Latest Capture",
+            command=self.populate_localization_from_latest_capture,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        ttk.Button(
+            header,
+            text="Solve",
+            style="Accent.TButton",
+            command=self.solve_localization_from_form,
+        ).grid(row=0, column=1, sticky="ew", padx=5)
+        ttk.Button(
+            header,
+            text="Clear",
+            command=self.clear_localization_inputs,
+        ).grid(row=0, column=2, sticky="ew", padx=(5, 0))
+        ttk.Label(header, textvariable=self.localization_status_var, style="Status.TLabel").grid(
+            row=1,
+            column=0,
+            columnspan=3,
+            sticky="w",
+            pady=(8, 0),
+        )
+
+        input_frame = ttk.LabelFrame(parent, text="Anchor Inputs", padding=8)
+        input_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+        input_frame.columnconfigure(2, weight=1)
+        input_frame.columnconfigure(3, weight=1)
+        input_frame.columnconfigure(4, weight=1)
+        self.localization_rows_frame = input_frame
+
+        headings = ("Use", "Anchor", "X m", "Y m", "Range m", "Offset m", "Sigma m")
+        for column, heading in enumerate(headings):
+            ttk.Label(input_frame, text=heading, style="Status.TLabel").grid(
+                row=0,
+                column=column,
+                sticky="w",
+                padx=3,
+                pady=(0, 4),
+            )
+
+        output_frame = ttk.Frame(parent)
+        output_frame.grid(row=2, column=0, sticky="nsew")
+        output_frame.columnconfigure(0, weight=1)
+        output_frame.columnconfigure(1, weight=1)
+        output_frame.rowconfigure(0, weight=1)
+
+        result_frame = ttk.LabelFrame(output_frame, text="Result", padding=8)
+        result_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        result_frame.columnconfigure(0, weight=1)
+        result_frame.rowconfigure(0, weight=1)
+        self.localization_result_text = tk.Text(result_frame, height=10, wrap=tk.WORD)
+        self.localization_result_text.grid(row=0, column=0, sticky="nsew")
+        self.localization_result_text.configure(state=tk.DISABLED)
+
+        plot_frame = ttk.LabelFrame(output_frame, text="Layout Preview", padding=8)
+        plot_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        plot_frame.columnconfigure(0, weight=1)
+        plot_frame.rowconfigure(0, weight=1)
+        self.localization_canvas = tk.Canvas(
+            plot_frame,
+            height=280,
+            background="white",
+            highlightthickness=1,
+            highlightbackground="#d0d7de",
+        )
+        self.localization_canvas.grid(row=0, column=0, sticky="nsew")
+        self._draw_empty_localization_plot()
+
+    def _ensure_localization_row(self, anchor_id: str) -> dict[str, Any]:
+        anchor_key = anchor_id.strip()
+        if not anchor_key:
+            anchor_key = f"anchor_{len(self.localization_row_order) + 1}"
+        if anchor_key in self.localization_rows:
+            return self.localization_rows[anchor_key]
+
+        row_index = len(self.localization_row_order) + 1
+        saved_x, saved_y = self.localization_anchor_positions.get(anchor_key, ("", ""))
+        enabled_var = tk.BooleanVar(value=True)
+        anchor_var = tk.StringVar(value=anchor_key)
+        x_var = tk.StringVar(value=saved_x)
+        y_var = tk.StringVar(value=saved_y)
+        range_var = tk.StringVar(value="")
+        offset_var = tk.StringVar(value="0")
+        sigma_var = tk.StringVar(value="0.05")
+
+        row = {
+            "enabled_var": enabled_var,
+            "anchor_var": anchor_var,
+            "x_var": x_var,
+            "y_var": y_var,
+            "range_var": range_var,
+            "offset_var": offset_var,
+            "sigma_var": sigma_var,
+        }
+        self.localization_rows[anchor_key] = row
+        self.localization_row_order.append(anchor_key)
+
+        ttk.Checkbutton(self.localization_rows_frame, variable=enabled_var).grid(
+            row=row_index,
+            column=0,
+            sticky="w",
+            padx=3,
+            pady=2,
+        )
+        ttk.Entry(self.localization_rows_frame, textvariable=anchor_var, width=20).grid(
+            row=row_index,
+            column=1,
+            sticky="ew",
+            padx=3,
+            pady=2,
+        )
+        ttk.Entry(self.localization_rows_frame, textvariable=x_var, width=10).grid(
+            row=row_index,
+            column=2,
+            sticky="ew",
+            padx=3,
+            pady=2,
+        )
+        ttk.Entry(self.localization_rows_frame, textvariable=y_var, width=10).grid(
+            row=row_index,
+            column=3,
+            sticky="ew",
+            padx=3,
+            pady=2,
+        )
+        ttk.Entry(self.localization_rows_frame, textvariable=range_var, width=10).grid(
+            row=row_index,
+            column=4,
+            sticky="ew",
+            padx=3,
+            pady=2,
+        )
+        ttk.Entry(self.localization_rows_frame, textvariable=offset_var, width=10).grid(
+            row=row_index,
+            column=5,
+            sticky="ew",
+            padx=3,
+            pady=2,
+        )
+        ttk.Entry(self.localization_rows_frame, textvariable=sigma_var, width=10).grid(
+            row=row_index,
+            column=6,
+            sticky="ew",
+            padx=3,
+            pady=2,
+        )
+        return row
+
+    def _remember_localization_positions(self) -> None:
+        for key in list(self.localization_row_order):
+            row = self.localization_rows.get(key)
+            if not row:
+                continue
+            anchor_id = row["anchor_var"].get().strip()
+            if not anchor_id:
+                continue
+            self.localization_anchor_positions[anchor_id] = (
+                row["x_var"].get().strip(),
+                row["y_var"].get().strip(),
+            )
+
+    def _latest_anchor_distances(self) -> dict[str, float]:
+        distances: dict[str, float] = {}
+        store = getattr(self, "store", None)
+        session_id = getattr(self, "current_session_id", None)
+        if store is not None and session_id:
+            for row in store.conn.execute(
+                """
+                SELECT anchor_id, distance_m
+                FROM samples
+                WHERE session_id = ?
+                  AND anchor_id IS NOT NULL
+                  AND distance_m IS NOT NULL
+                ORDER BY id
+                """,
+                (session_id,),
+            ):
+                anchor_id = str(row["anchor_id"]).strip()
+                if anchor_id:
+                    distances[anchor_id] = float(row["distance_m"])
+            for row in store.conn.execute(
+                """
+                SELECT anchor_id, mean_distance_m
+                FROM summaries
+                WHERE session_id = ?
+                  AND anchor_id IS NOT NULL
+                  AND mean_distance_m IS NOT NULL
+                ORDER BY id
+                """,
+                (session_id,),
+            ):
+                anchor_id = str(row["anchor_id"]).strip()
+                if anchor_id:
+                    distances[anchor_id] = float(row["mean_distance_m"])
+
+        for anchor_id, distance in self.anchor_measured_distances.items():
+            distances[str(anchor_id).strip()] = float(distance)
+        return {anchor: value for anchor, value in distances.items() if anchor}
+
+    def _update_localization_range(self, anchor_id: str, distance_m: float) -> None:
+        if not hasattr(self, "localization_rows_frame"):
+            return
+        row = self._ensure_localization_row(anchor_id)
+        row["range_var"].set(format_meter(distance_m, ""))
+
+    def populate_localization_from_latest_capture(self) -> bool:
+        distances = self._latest_anchor_distances()
+        if not distances:
+            self.localization_status_var.set("No captured anchor ranges are available yet.")
+            messagebox.showwarning(
+                "No anchor ranges",
+                "Capture anchor ranges first, then solve for position.",
+                parent=self,
+            )
+            return False
+
+        self._remember_localization_positions()
+        for anchor_id, distance in sorted(distances.items(), key=lambda item: item[0]):
+            row = self._ensure_localization_row(anchor_id)
+            saved_x, saved_y = self.localization_anchor_positions.get(anchor_id, ("", ""))
+            if saved_x and not row["x_var"].get().strip():
+                row["x_var"].set(saved_x)
+            if saved_y and not row["y_var"].get().strip():
+                row["y_var"].set(saved_y)
+            row["range_var"].set(format_meter(distance, ""))
+            row["enabled_var"].set(True)
+
+        self.localization_status_var.set(
+            f"Loaded {len(distances)} latest anchor range(s) from capture data."
+        )
+        return True
+
+    def solve_latest_position(self) -> None:
+        if not self.populate_localization_from_latest_capture():
+            return
+        if hasattr(self, "right_notebook") and hasattr(self, "localization_tab"):
+            self.right_notebook.select(self.localization_tab)
+        self.solve_localization_from_form()
+
+    def solve_localization_from_form(self) -> None:
+        try:
+            readings = self._read_localization_form()
+            result = solve_position(readings)
+        except ValueError as exc:
+            self.localization_status_var.set(str(exc))
+            self._write_localization_result(str(exc))
+            messagebox.showerror("Cannot solve position", str(exc), parent=self)
+            return
+
+        self.localization_result = result
+        self._remember_localization_positions()
+        self._show_localization_result(result)
+        self._draw_localization_plot(result)
+
+    def _read_localization_form(self) -> list[LocalizationReading]:
+        readings: list[LocalizationReading] = []
+        missing: list[str] = []
+        for key in self.localization_row_order:
+            row = self.localization_rows.get(key)
+            if not row or not row["enabled_var"].get():
+                continue
+            anchor_id = row["anchor_var"].get().strip() or key
+            x_m = safe_float(row["x_var"].get())
+            y_m = safe_float(row["y_var"].get())
+            range_m = safe_float(row["range_var"].get())
+            offset_m = safe_float(row["offset_var"].get()) or 0.0
+            sigma_m = safe_float(row["sigma_var"].get()) or 0.05
+            if x_m is None or y_m is None or range_m is None:
+                missing.append(anchor_id)
+                continue
+            readings.append(
+                LocalizationReading(
+                    anchor_id=anchor_id,
+                    x_m=x_m,
+                    y_m=y_m,
+                    range_m=range_m,
+                    sigma_m=sigma_m,
+                    offset_m=offset_m,
+                )
+            )
+
+        if missing:
+            raise ValueError(
+                "Enter X, Y, and range values for these enabled anchors: "
+                + ", ".join(missing)
+            )
+        if len(readings) < 3:
+            raise ValueError("At least three enabled anchors with X/Y/range values are required.")
+        return readings
+
+    def _show_localization_result(self, result: LocalizationResult) -> None:
+        lines = [
+            f"Estimated position: x={result.x_m:.3f} m, y={result.y_m:.3f} m",
+            f"Seed position: x={result.seed_x_m:.3f} m, y={result.seed_y_m:.3f} m",
+            f"RMSE: {result.rmse_m:.3f} m",
+            f"Confidence: {result.confidence}",
+            "",
+            "Per-anchor residuals:",
+        ]
+        for reading in result.processed_readings:
+            residual = result.residuals_m.get(reading.anchor_id, 0.0)
+            lines.append(
+                f"- {reading.anchor_id}: measured={reading.measured_range_m:.3f} m, "
+                f"corrected={reading.corrected_range_m:.3f} m, residual={residual:.3f} m"
+            )
+        if result.warnings:
+            lines.append("")
+            lines.append("Warnings:")
+            lines.extend(f"- {warning}" for warning in result.warnings)
+        self._write_localization_result("\n".join(lines))
+        self.localization_status_var.set(
+            f"Solved position x={result.x_m:.3f} m, y={result.y_m:.3f} m "
+            f"({result.confidence} confidence)."
+        )
+
+    def _write_localization_result(self, text: str) -> None:
+        if not hasattr(self, "localization_result_text"):
+            return
+        self.localization_result_text.configure(state=tk.NORMAL)
+        self.localization_result_text.delete("1.0", tk.END)
+        self.localization_result_text.insert("1.0", text)
+        self.localization_result_text.configure(state=tk.DISABLED)
+
+    def clear_localization_inputs(self) -> None:
+        self.localization_result = None
+        for key in self.localization_row_order:
+            row = self.localization_rows.get(key)
+            if not row:
+                continue
+            row["range_var"].set("")
+            row["enabled_var"].set(True)
+        self.localization_status_var.set("Cleared captured ranges. Anchor positions were kept.")
+        self._write_localization_result("")
+        self._draw_empty_localization_plot()
+
+    def _draw_empty_localization_plot(self) -> None:
+        if not hasattr(self, "localization_canvas"):
+            return
+        canvas = self.localization_canvas
+        canvas.delete("all")
+        canvas.create_text(
+            18,
+            18,
+            text="Position plot appears after solving.",
+            anchor="nw",
+            fill="#57606a",
+        )
+
+    def _draw_localization_plot(self, result: LocalizationResult) -> None:
+        canvas = self.localization_canvas
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), 420)
+        height = max(canvas.winfo_height(), 260)
+        points = [(reading.x_m, reading.y_m) for reading in result.processed_readings]
+        points.append((result.x_m, result.y_m))
+        min_x = min(x for x, _ in points)
+        max_x = max(x for x, _ in points)
+        min_y = min(y for _, y in points)
+        max_y = max(y for _, y in points)
+        if math.isclose(min_x, max_x):
+            min_x -= 1.0
+            max_x += 1.0
+        if math.isclose(min_y, max_y):
+            min_y -= 1.0
+            max_y += 1.0
+        pad_x = max((max_x - min_x) * 0.15, 0.5)
+        pad_y = max((max_y - min_y) * 0.15, 0.5)
+        min_x -= pad_x
+        max_x += pad_x
+        min_y -= pad_y
+        max_y += pad_y
+        margin = 32
+
+        def project(x_m: float, y_m: float) -> tuple[float, float]:
+            x = margin + ((x_m - min_x) / (max_x - min_x)) * (width - 2 * margin)
+            y = height - margin - ((y_m - min_y) / (max_y - min_y)) * (height - 2 * margin)
+            return x, y
+
+        canvas.create_rectangle(
+            margin,
+            margin,
+            width - margin,
+            height - margin,
+            outline="#d0d7de",
+        )
+        tag_x, tag_y = project(result.x_m, result.y_m)
+        for reading in result.processed_readings:
+            anchor_x, anchor_y = project(reading.x_m, reading.y_m)
+            canvas.create_line(anchor_x, anchor_y, tag_x, tag_y, fill="#d0d7de")
+            canvas.create_oval(
+                anchor_x - 6,
+                anchor_y - 6,
+                anchor_x + 6,
+                anchor_y + 6,
+                fill="#0969da",
+                outline="",
+            )
+            residual = result.residuals_m.get(reading.anchor_id, 0.0)
+            canvas.create_text(
+                anchor_x + 8,
+                anchor_y - 8,
+                text=f"{reading.anchor_id}\n{reading.measured_range_m:.2f} m\nr={residual:+.2f}",
+                anchor="sw",
+                fill="#24292f",
+            )
+
+        canvas.create_oval(
+            tag_x - 8,
+            tag_y - 8,
+            tag_x + 8,
+            tag_y + 8,
+            fill="#cf222e",
+            outline="",
+        )
+        canvas.create_text(
+            tag_x + 10,
+            tag_y,
+            text=f"Position\n({result.x_m:.2f}, {result.y_m:.2f})",
+            anchor="w",
+            fill="#cf222e",
         )
 
     def _add_anchor_true_distance_controls(self) -> None:
@@ -577,6 +1066,8 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         if hasattr(self, "anchor_id_combo"):
             self.anchor_id_combo.configure(values=sorted(self.detected_anchor_ids, key=str))
         if was_new:
+            if hasattr(self, "localization_rows_frame"):
+                self._ensure_localization_row(anchor_text)
             self._refresh_anchor_truth_table()
 
     def mark_constellation_changed(self) -> None:
@@ -830,6 +1321,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
                     history.append(float(record.distance_m))
                     if len(history) > 200:
                         del history[: len(history) - 200]
+                    self._update_localization_range(anchor_key, float(record.distance_m))
         self._refresh_anchor_truth_table()
         super().handle_records(records)
 
