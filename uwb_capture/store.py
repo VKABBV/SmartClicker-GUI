@@ -118,7 +118,37 @@ class MeasurementStore:
             CREATE INDEX IF NOT EXISTS idx_alerts_session ON alerts(session_id);
             """
         )
+        self._migrate_samples_columns()
         self.conn.commit()
+
+    _SAMPLES_COLUMNS: dict[str, str] = {
+        "clicker_id": "TEXT",
+        "event_seq": "INTEGER",
+        "scheduled_sample_count": "INTEGER",
+        "quality": "INTEGER",
+        "firmware_timestamp_ms": "INTEGER",
+        "phy_config_id": "INTEGER",
+        "burst_id": "INTEGER",
+        "tlv_json": "TEXT",
+        "exchange_stride_us": "INTEGER",
+        "burst_duration_ms": "INTEGER",
+        "diag_status_flags": "INTEGER",
+        "diag_bytes_captured": "INTEGER",
+        "diag_bytes_transmitted": "INTEGER",
+        "report_fragment_count": "INTEGER",
+        "uwb_clock_offset_raw": "INTEGER",
+        "uwb_carrier_integrator": "INTEGER",
+        "clicker_diag_bytes": "TEXT",
+    }
+
+    def _migrate_samples_columns(self) -> None:
+        existing = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(samples)").fetchall()
+        }
+        for col, col_type in self._SAMPLES_COLUMNS.items():
+            if col not in existing:
+                self.conn.execute(f"ALTER TABLE samples ADD COLUMN {col} {col_type}")
 
     def create_session(self, metadata: dict[str, Any]) -> str:
         session_id = str(uuid.uuid4())
