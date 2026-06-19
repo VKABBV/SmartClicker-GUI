@@ -130,6 +130,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self.anchor_true_distances: dict[str, dict[str, Any]] = {}
         self.anchor_los_nlos: dict[str, str] = {}
         self.anchor_measured_distances: dict[str, float] = {}
+        self.anchor_distance_history: dict[str, list[float]] = {}
         self.detected_anchor_ids: set[str] = set()
         self._pyth_updating = False
         self._install_extensions()
@@ -332,19 +333,21 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
 
         self.anchor_truth_table = ttk.Treeview(
             container,
-            columns=("anchor_id", "measured_m", "true_distance_m", "diff_m", "los_nlos"),
+            columns=("anchor_id", "measured_m", "std_m", "true_distance_m", "diff_m", "los_nlos"),
             show="headings",
             height=6,
         )
         self.anchor_truth_table.heading("anchor_id", text="Responder ID")
         self.anchor_truth_table.heading("measured_m", text="Measured m")
+        self.anchor_truth_table.heading("std_m", text="Std m")
         self.anchor_truth_table.heading("true_distance_m", text="True distance m")
         self.anchor_truth_table.heading("diff_m", text="Diff m")
         self.anchor_truth_table.heading("los_nlos", text="LOS/NLOS")
         self.anchor_truth_table.column("anchor_id", width=100, anchor="center")
-        self.anchor_truth_table.column("measured_m", width=90, anchor="center")
-        self.anchor_truth_table.column("true_distance_m", width=110, anchor="center")
-        self.anchor_truth_table.column("diff_m", width=80, anchor="center")
+        self.anchor_truth_table.column("measured_m", width=80, anchor="center")
+        self.anchor_truth_table.column("std_m", width=70, anchor="center")
+        self.anchor_truth_table.column("true_distance_m", width=100, anchor="center")
+        self.anchor_truth_table.column("diff_m", width=70, anchor="center")
         self.anchor_truth_table.column("los_nlos", width=80, anchor="center")
         self.anchor_truth_table.grid(row=3, column=0, columnspan=5, sticky="ew", pady=(8, 0))
         self.anchor_truth_table.tag_configure("mismatch", background="#f8d7da")
@@ -543,6 +546,8 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             data = self.anchor_true_distances.get(anchor_id)
             true_distance = data["true_distance_m"] if data else None
             measured = self.anchor_measured_distances.get(anchor_id)
+            history = self.anchor_distance_history.get(anchor_id, [])
+            std = statistics.stdev(history) if len(history) > 1 else None
             diff = abs(measured - true_distance) if measured is not None and true_distance is not None else None
             tags = ()
             if diff is not None and diff > threshold and true_distance is not None:
@@ -553,6 +558,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
                 values=(
                     anchor_id,
                     format_meter(measured, "") if measured is not None else "",
+                    format_meter(std, "") if std is not None else "",
                     format_meter(true_distance, "") if true_distance is not None else "",
                     format_meter(diff, "") if diff is not None else "",
                     self._anchor_los_nlos_for(anchor_id),
@@ -611,15 +617,26 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             column=0,
             columnspan=2,
             sticky="w",
+        )
+        ttk.Radiobutton(
+            tab,
+            text="New label, same distances (only LOS/NLOS changes)",
+            variable=mode_var,
+            value="same_distances",
+        ).grid(
+            row=3,
+            column=0,
+            columnspan=2,
+            sticky="w",
             pady=(0, 8),
         )
-        ttk.Label(tab, text="Constellation label").grid(row=3, column=0, sticky="w", pady=2)
+        ttk.Label(tab, text="Constellation label").grid(row=4, column=0, sticky="w", pady=2)
         label_entry = ttk.Entry(tab, textvariable=label_var, width=34)
-        label_entry.grid(row=3, column=1, sticky="ew", pady=2)
+        label_entry.grid(row=4, column=1, sticky="ew", pady=2)
         label_entry.focus_set()
 
         button_row = ttk.Frame(tab)
-        button_row.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        button_row.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         button_row.columnconfigure(0, weight=1)
         ttk.Button(
             button_row,
@@ -650,18 +667,39 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
 
         was_capturing = bool(getattr(self, "capture_active", False))
         if was_capturing:
+            if mode == "same_distances":
+                question = (
+                    "Stop the current session and start a new one with this label? "
+                    "True distances are kept; only LOS/NLOS and measured data reset."
+                )
+            else:
+                question = (
+                    "Stop the current logging session and start a new one "
+                    "with this constellation label?"
+                )
             proceed = messagebox.askyesno(
                 "New constellation",
-                "Stop the current logging session and start a new one with this constellation label?",
+                question,
                 parent=window,
             )
             if not proceed:
                 return
             self.stop_capture()
 
+        if mode == "same_distances":
+            self.anchor_measured_distances.clear()
+            self.anchor_distance_history.clear()
+            self.anchor_los_nlos.clear()
+            self._refresh_anchor_truth_table()
+            self.log_raw(
+                f"# New constellation label: {label} (true distances kept, "
+                "LOS/NLOS and measured data reset)"
+            )
+        else:
+            self.log_raw(f"# New constellation label: {label}")
+
         self.constellation_var.set(label)
         self._set_constellation_status(label)
-        self.log_raw(f"# New constellation label: {label}")
         window.destroy()
 
         if was_capturing:
@@ -784,9 +822,14 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
     def handle_records(self, records: list[Any]) -> None:
         for record in records:
             if record.anchor_id:
+                anchor_key = str(record.anchor_id).strip()
                 self._register_detected_anchor(record.anchor_id)
                 if record.distance_m is not None:
-                    self.anchor_measured_distances[str(record.anchor_id).strip()] = float(record.distance_m)
+                    self.anchor_measured_distances[anchor_key] = float(record.distance_m)
+                    history = self.anchor_distance_history.setdefault(anchor_key, [])
+                    history.append(float(record.distance_m))
+                    if len(history) > 200:
+                        del history[: len(history) - 200]
         self._refresh_anchor_truth_table()
         super().handle_records(records)
 
