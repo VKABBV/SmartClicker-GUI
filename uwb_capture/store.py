@@ -74,6 +74,15 @@ class MeasurementStore:
                 phy_config_id INTEGER,
                 burst_id INTEGER,
                 tlv_json TEXT,
+                exchange_stride_us INTEGER,
+                burst_duration_ms INTEGER,
+                diag_status_flags INTEGER,
+                diag_bytes_captured INTEGER,
+                diag_bytes_transmitted INTEGER,
+                report_fragment_count INTEGER,
+                uwb_clock_offset_raw INTEGER,
+                uwb_carrier_integrator INTEGER,
+                clicker_diag_bytes TEXT,
                 FOREIGN KEY(session_id) REFERENCES sessions(id)
             );
 
@@ -162,9 +171,12 @@ class MeasurementStore:
                 session_id, timestamp, anchor_id, clicker_id, sample_index, distance_m,
                 rx_power_dbm, fp_power_dbm, cir_power, cir_raw, status,
                 error_code, source, raw_line, event_seq, scheduled_sample_count,
-                quality, firmware_timestamp_ms, phy_config_id, burst_id, tlv_json
+                quality, firmware_timestamp_ms, phy_config_id, burst_id, tlv_json,
+                exchange_stride_us, burst_duration_ms, diag_status_flags,
+                diag_bytes_captured, diag_bytes_transmitted, report_fragment_count,
+                uwb_clock_offset_raw, uwb_carrier_integrator, clicker_diag_bytes
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -188,6 +200,15 @@ class MeasurementStore:
                 record.phy_config_id,
                 record.burst_id,
                 record.tlv_json,
+                record.exchange_stride_us,
+                record.burst_duration_ms,
+                record.diag_status_flags,
+                record.diag_bytes_captured,
+                record.diag_bytes_transmitted,
+                record.report_fragment_count,
+                record.uwb_clock_offset_raw,
+                record.uwb_carrier_integrator,
+                record.clicker_diag_bytes,
             ),
         )
         self.conn.commit()

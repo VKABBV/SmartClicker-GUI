@@ -92,14 +92,31 @@ class TlvId(IntEnum):
     BURST_ID = 0x34
     EXCHANGE_STRIDE_US = 0x35
     BURST_DURATION_MS = 0x36
+    DIAG_RX_FRAME_INFO = 0x37
+    DIAG_TX_FRAME_INFO = 0x38
     DIAG_BYTES_CAPTURED = 0x39
     DIAG_BYTES_TRANSMITTED = 0x3A
+    DIAG_RX_DIAG_INFO = 0x3B
+    DIAG_TX_DIAG_INFO = 0x3C
     REPORT_FRAGMENT_COUNT = 0x3D
+    DIAG_TX_FRAME_INFO_2 = 0x3E
+    DIAG_RX_DIAG_INFO_2 = 0x3F
     CLICKER_DIAG_BYTES = 0x40
+    DIAG_RAW_CIR = 0x41
     PHY_CONFIG_ID = 0x42
     DISCOVERY_SLOT_COUNT = 0x4C
     UWB_CLOCK_OFFSET_RAW = 0x4D
     UWB_CARRIER_INTEGRATOR = 0x4E
+    DIAG_FLAGS = 0x53
+    DIAG_ACCUMULATOR = 0x54
+    DIAG_RX_TUNE = 0x55
+    DIAG_TX_TUNE = 0x56
+    DIAG_SLOT_INFO = 0x57
+    DIAG_CIR_CHUNK = 0x4F
+    DIAG_CIR_OFFSET = 0x50
+    DIAG_CIR_TOTAL = 0x51
+    DIAG_CIR_SIZE = 0x52
+    DIAG_CIR_TIMESTAMP = 0x58
 
 
 @dataclass(frozen=True)
@@ -476,7 +493,8 @@ def _ml_sample_records(packet: ImecPacket) -> list[ParsedRecord]:
     tlvs = decode_tlvs(packet.payload)
     anchor_id = read_uint(first_tlv(tlvs, TlvId.ANCHOR_ID))
     clicker_id = read_uint(first_tlv(tlvs, TlvId.CLICKER_ID))
-    sample_index = read_uint(first_tlv(tlvs, TlvId.SAMPLE_INDEX)) or 0
+    sample_index_raw = first_tlv(tlvs, TlvId.SAMPLE_INDEX)
+    sample_index = read_uint(sample_index_raw)
     scheduled_count = read_uint(first_tlv(tlvs, TlvId.SAMPLE_COUNT))
     event_seq = read_uint(first_tlv(tlvs, TlvId.EVENT_SEQ))
     timestamp_ms = read_uint(first_tlv(tlvs, TlvId.TIMESTAMP_MS))
@@ -486,6 +504,21 @@ def _ml_sample_records(packet: ImecPacket) -> list[ParsedRecord]:
     phy_config_id = read_uint(first_tlv(tlvs, TlvId.PHY_CONFIG_ID))
     burst_id = read_uint(first_tlv(tlvs, TlvId.BURST_ID))
     cir = first_tlv(tlvs, TlvId.UWB_CIR_SAMPLE)
+    exchange_stride_us = read_uint(first_tlv(tlvs, TlvId.EXCHANGE_STRIDE_US))
+    burst_duration_ms = read_uint(first_tlv(tlvs, TlvId.BURST_DURATION_MS))
+    diag_status_flags = read_uint(first_tlv(tlvs, TlvId.DIAG_STATUS_FLAGS))
+    diag_bytes_captured = read_uint(first_tlv(tlvs, TlvId.DIAG_BYTES_CAPTURED))
+    diag_bytes_transmitted = read_uint(first_tlv(tlvs, TlvId.DIAG_BYTES_TRANSMITTED))
+    report_fragment_count = read_uint(first_tlv(tlvs, TlvId.REPORT_FRAGMENT_COUNT))
+    uwb_clock_offset_raw = read_int(first_tlv(tlvs, TlvId.UWB_CLOCK_OFFSET_RAW))
+    uwb_carrier_integrator = read_int(first_tlv(tlvs, TlvId.UWB_CARRIER_INTEGRATOR))
+    clicker_diag = first_tlv(tlvs, TlvId.CLICKER_DIAG_BYTES)
+
+    # Ghost samples: diagnostic-only reports from failed timeout exchanges have
+    # no SAMPLE_INDEX and no DISTANCE_SAMPLES_MM. Skip them — they are not
+    # scheduled ML training rows.
+    if sample_index is None and first_tlv(tlvs, TlvId.DISTANCE_SAMPLES_MM) is None:
+        return []
 
     distance_mm: int | None = None
     sample_array = first_tlv(tlvs, TlvId.DISTANCE_SAMPLES_MM)
@@ -507,7 +540,7 @@ def _ml_sample_records(packet: ImecPacket) -> list[ParsedRecord]:
             kind="sample" if ok else "failure",
             anchor_id=anchor_text,
             clicker_id=format_device_id(clicker_id) if clicker_id is not None else None,
-            sample_index=sample_index,
+            sample_index=sample_index or 0,
             scheduled_sample_count=scheduled_count,
             event_seq=event_seq,
             firmware_timestamp_ms=timestamp_ms,
@@ -517,11 +550,20 @@ def _ml_sample_records(packet: ImecPacket) -> list[ParsedRecord]:
             distance_m=distance_m,
             rx_power_dbm=float(rx_power) if rx_power is not None else None,
             cir_raw=cir.hex() if cir else None,
+            clicker_diag_bytes=clicker_diag.hex() if clicker_diag else None,
             status=_range_status_text(range_status),
             error_code=None if ok else str(range_status),
             source="ml_click_report",
             raw_line=packet_summary(packet),
             tlv_json=_tlvs_to_json(tlvs),
+            exchange_stride_us=exchange_stride_us,
+            burst_duration_ms=burst_duration_ms,
+            diag_status_flags=diag_status_flags,
+            diag_bytes_captured=diag_bytes_captured,
+            diag_bytes_transmitted=diag_bytes_transmitted,
+            report_fragment_count=report_fragment_count,
+            uwb_clock_offset_raw=uwb_clock_offset_raw,
+            uwb_carrier_integrator=uwb_carrier_integrator,
         )
     ]
 

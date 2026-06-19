@@ -69,3 +69,12 @@ class ParsedRecord:
     phy_config_id: int | None = None
     burst_id: int | None = None
     tlv_json: str | None = None
+    exchange_stride_us: int | None = None
+    burst_duration_ms: int | None = None
+    diag_status_flags: int | None = None
+    diag_bytes_captured: int | None = None
+    diag_bytes_transmitted: int | None = None
+    report_fragment_count: int | None = None
+    uwb_clock_offset_raw: int | None = None
+    uwb_carrier_integrator: int | None = None
+    clicker_diag_bytes: str | None = None

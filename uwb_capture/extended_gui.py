@@ -333,19 +333,19 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
 
         self.anchor_truth_table = ttk.Treeview(
             container,
-            columns=("anchor_id", "measured_m", "std_m", "true_distance_m", "diff_m", "los_nlos"),
+            columns=("anchor_id", "measured_m", "std_cm", "true_distance_m", "diff_m", "los_nlos"),
             show="headings",
             height=6,
         )
         self.anchor_truth_table.heading("anchor_id", text="Responder ID")
         self.anchor_truth_table.heading("measured_m", text="Measured m")
-        self.anchor_truth_table.heading("std_m", text="Std m")
+        self.anchor_truth_table.heading("std_cm", text="Std cm")
         self.anchor_truth_table.heading("true_distance_m", text="True distance m")
         self.anchor_truth_table.heading("diff_m", text="Diff m")
         self.anchor_truth_table.heading("los_nlos", text="LOS/NLOS")
         self.anchor_truth_table.column("anchor_id", width=100, anchor="center")
         self.anchor_truth_table.column("measured_m", width=80, anchor="center")
-        self.anchor_truth_table.column("std_m", width=70, anchor="center")
+        self.anchor_truth_table.column("std_cm", width=70, anchor="center")
         self.anchor_truth_table.column("true_distance_m", width=100, anchor="center")
         self.anchor_truth_table.column("diff_m", width=70, anchor="center")
         self.anchor_truth_table.column("los_nlos", width=80, anchor="center")
@@ -547,7 +547,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             true_distance = data["true_distance_m"] if data else None
             measured = self.anchor_measured_distances.get(anchor_id)
             history = self.anchor_distance_history.get(anchor_id, [])
-            std = statistics.stdev(history) if len(history) > 1 else None
+            std_cm = (statistics.stdev(history) * 100) if len(history) > 1 else None
             diff = abs(measured - true_distance) if measured is not None and true_distance is not None else None
             tags = ()
             if diff is not None and diff > threshold and true_distance is not None:
@@ -558,7 +558,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
                 values=(
                     anchor_id,
                     format_meter(measured, "") if measured is not None else "",
-                    format_meter(std, "") if std is not None else "",
+                    format_meter(std_cm, "") if std_cm is not None else "",
                     format_meter(true_distance, "") if true_distance is not None else "",
                     format_meter(diff, "") if diff is not None else "",
                     self._anchor_los_nlos_for(anchor_id),
