@@ -779,12 +779,6 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self._persist_all_anchor_los_nlos()
 
     def handle_serial_line(self, line: str) -> None:
-        for record in original.parse_serial_line(line):
-            if record.anchor_id:
-                self._register_detected_anchor(record.anchor_id)
-                if record.distance_m is not None:
-                    self.anchor_measured_distances[str(record.anchor_id).strip()] = float(record.distance_m)
-        self._refresh_anchor_truth_table()
         super().handle_serial_line(line)
 
     def handle_records(self, records: list[Any]) -> None:

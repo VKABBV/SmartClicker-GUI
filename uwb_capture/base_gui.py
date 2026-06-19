@@ -33,7 +33,6 @@ from .bluetooth_io import (
     BluetoothScanner,
     BluetoothWorker,
 )
-from .parser import parse_serial_line
 from .protocol import (
     FLAG_DIAGNOSTIC,
     CommandStatus,
@@ -916,13 +915,8 @@ class UwbCaptureApp(tk.Tk):
         if _is_bt_debug_noise(cleaned):
             return
         self.log_raw(cleaned)
-        records = parse_serial_line(cleaned)
         if self.capture_active and self.store is not None and self.current_session_id is not None:
-            self.store.insert_raw_line(self.current_session_id, cleaned, bool(records))
-        if not self.capture_active:
-            return
-
-        self.handle_records(records)
+            self.store.insert_raw_line(self.current_session_id, cleaned, False)
 
 
     def handle_records(self, records: list[ParsedRecord]) -> None:
