@@ -244,6 +244,28 @@ class MeasurementStore:
         self.conn.commit()
         return int(cur.lastrowid)
 
+    def merge_diagnostic_into_sample(self, sample_row_id: int, record: ParsedRecord) -> None:
+        updates: list[str] = []
+        params: list[Any] = []
+        for field in (
+            "exchange_stride_us", "burst_duration_ms", "diag_status_flags",
+            "diag_bytes_captured", "diag_bytes_transmitted", "report_fragment_count",
+            "uwb_clock_offset_raw", "uwb_carrier_integrator", "clicker_diag_bytes",
+            "cir_raw", "rx_power_dbm", "phy_config_id", "burst_id", "tlv_json",
+        ):
+            value = getattr(record, field, None)
+            if value is not None:
+                updates.append(f"{field} = ?")
+                params.append(value)
+        if not updates:
+            return
+        params.append(sample_row_id)
+        self.conn.execute(
+            f"UPDATE samples SET {', '.join(updates)} WHERE id = ?",
+            params,
+        )
+        self.conn.commit()
+
     def insert_summary(self, session_id: str, record: ParsedRecord) -> int:
         cur = self.conn.execute(
             """

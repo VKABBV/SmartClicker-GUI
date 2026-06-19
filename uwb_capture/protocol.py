@@ -514,11 +514,39 @@ def _ml_sample_records(packet: ImecPacket) -> list[ParsedRecord]:
     uwb_carrier_integrator = read_int(first_tlv(tlvs, TlvId.UWB_CARRIER_INTEGRATOR))
     clicker_diag = first_tlv(tlvs, TlvId.CLICKER_DIAG_BYTES)
 
-    # Ghost samples: diagnostic-only reports from failed timeout exchanges have
-    # no SAMPLE_INDEX and no DISTANCE_SAMPLES_MM. Skip them — they are not
-    # scheduled ML training rows.
-    if sample_index is None and first_tlv(tlvs, TlvId.DISTANCE_SAMPLES_MM) is None:
-        return []
+    # Diagnostic-only fragments: packets without SAMPLE_INDEX and
+    # DISTANCE_SAMPLES_MM carry CIR chunks, tune info, clock offset, etc.
+    # for the last real sample. Return them as diagnostic_fragment records
+    # so the GUI can merge their data into the corresponding sample.
+    is_diagnostic_fragment = sample_index is None and first_tlv(tlvs, TlvId.DISTANCE_SAMPLES_MM) is None
+    if is_diagnostic_fragment:
+        return [
+            ParsedRecord(
+                kind="diagnostic_fragment",
+                anchor_id=format_device_id(anchor_id) if anchor_id is not None else format_device_id(packet.source_id),
+                clicker_id=format_device_id(clicker_id) if clicker_id is not None else None,
+                event_seq=event_seq,
+                firmware_timestamp_ms=timestamp_ms,
+                quality=quality,
+                phy_config_id=phy_config_id,
+                burst_id=burst_id,
+                rx_power_dbm=float(rx_power) if rx_power is not None else None,
+                cir_raw=cir.hex() if cir else None,
+                clicker_diag_bytes=clicker_diag.hex() if clicker_diag else None,
+                status=_range_status_text(range_status),
+                source="ml_diagnostic_fragment",
+                raw_line=packet_summary(packet),
+                tlv_json=_tlvs_to_json(tlvs),
+                exchange_stride_us=exchange_stride_us,
+                burst_duration_ms=burst_duration_ms,
+                diag_status_flags=diag_status_flags,
+                diag_bytes_captured=diag_bytes_captured,
+                diag_bytes_transmitted=diag_bytes_transmitted,
+                report_fragment_count=report_fragment_count,
+                uwb_clock_offset_raw=uwb_clock_offset_raw,
+                uwb_carrier_integrator=uwb_carrier_integrator,
+            )
+        ]
 
     distance_mm: int | None = None
     sample_array = first_tlv(tlvs, TlvId.DISTANCE_SAMPLES_MM)

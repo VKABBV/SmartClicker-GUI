@@ -121,6 +121,7 @@ class UwbCaptureApp(tk.Tk):
         self.last_alert_prompt: dict[str, float] = {}
         self.last_instability_prompt: dict[str, float] = {}
         self.anchor_distance_windows: dict[str, list[float]] = {}
+        self.last_sample_row_by_anchor: dict[str, int] = {}
         self.cir_history: list[ParsedRecord] = []
         self._build_variables()
         self._build_style()
@@ -699,6 +700,7 @@ class UwbCaptureApp(tk.Tk):
         self.last_alert_prompt.clear()
         self.last_instability_prompt.clear()
         self.anchor_distance_windows.clear()
+        self.last_sample_row_by_anchor.clear()
         self.session_status_var.set(f"Capturing: {self.current_session_id[:8]}")
         self.log_raw(f"# Started session {self.current_session_id}")
         self.log_raw("# Waiting for ML click reports. Send an ML collection command to begin streaming samples.")
@@ -921,13 +923,18 @@ class UwbCaptureApp(tk.Tk):
 
     def handle_records(self, records: list[ParsedRecord]) -> None:
         for record in records:
+            if record.kind == "diagnostic_fragment":
+                self._merge_diagnostic_fragment(record)
+                continue
             if self.store is not None and self.current_session_id is not None:
                 if record.kind == "summary":
                     self.store.insert_summary(self.current_session_id, record)
                     alert_error = self.check_los_alert(record)
                     self.add_record_to_table(record, alert_error)
                 else:
-                    self.store.insert_sample(self.current_session_id, record)
+                    row_id = self.store.insert_sample(self.current_session_id, record)
+                    if record.anchor_id:
+                        self.last_sample_row_by_anchor[record.anchor_id] = row_id
                     alert_error = self.check_los_alert(record)
                     self.check_instability_alert(record)
                     self.add_record_to_table(record, alert_error)
@@ -936,6 +943,16 @@ class UwbCaptureApp(tk.Tk):
                 self.add_record_to_table(record)
                 self._add_cir_sample(record)
         self.update_counts()
+
+    def _merge_diagnostic_fragment(self, record: ParsedRecord) -> None:
+        anchor = record.anchor_id
+        if not anchor:
+            return
+        row_id = self.last_sample_row_by_anchor.get(anchor)
+        if row_id is not None and self.store is not None:
+            self.store.merge_diagnostic_into_sample(row_id, record)
+        if record.cir_raw:
+            self._add_cir_sample(record)
 
     def check_los_alert(self, record: ParsedRecord) -> float | None:
         if not self.los_var.get() or self.nlos_var.get():
