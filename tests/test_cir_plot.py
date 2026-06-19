@@ -1,10 +1,19 @@
 import unittest
 
-from uwb_capture.base_gui import _cir_first_path_local_index, _cir_record_matches_diag
+from uwb_capture.base_gui import (
+    _cir_first_path_local_index,
+    _cir_record_matches_diag,
+    _decode_cir_bytes,
+)
 from uwb_capture.common import ParsedRecord
 
 
 class CirPlotTests(unittest.TestCase):
+    def test_decode_current_full_cir_window_has_192_samples(self) -> None:
+        raw = b"\x01\x00\x00\x00\x00\x00" * 192
+
+        self.assertEqual(len(_decode_cir_bytes(raw.hex())), 192)
+
     def test_first_path_absolute_index_maps_into_visible_window(self) -> None:
         record = ParsedRecord(
             kind="sample",
@@ -12,7 +21,7 @@ class CirPlotTests(unittest.TestCase):
             cir_start_index=640,
         )
 
-        self.assertEqual(_cir_first_path_local_index(record, 256), 60)
+        self.assertEqual(_cir_first_path_local_index(record, 192), 60)
 
     def test_first_path_without_start_index_is_already_local(self) -> None:
         record = ParsedRecord(kind="sample", cir_first_path_index=4)

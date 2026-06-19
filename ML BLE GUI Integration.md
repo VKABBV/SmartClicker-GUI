@@ -167,14 +167,14 @@ The first post-burst packet for an anchor is the diagnostic summary. It may incl
 
 Raw RX diagnostic blocks use `TLV_DIAG_SOURCE = 1` for the clicker response RX and `TLV_DIAG_SOURCE = 2` for the anchor final RX. The raw block is carried in `TLV_UWB_RX_DIAG_BYTES = 0x54` and is currently 108 bytes when present. The fixed byte order is the firmware's packed `dwt_rxdiag_t`: `ipatovRxTime`, `ipatovRxStatus`, `ipatovPOA`, `stsRxTime`, `stsRxStatus`, `stsPOA`, `sts2RxTime`, `sts2RxStatus`, `sts2POA`, `tdoa`, `pdoa`, `xtalOffset`, `ciaDiag1`, `ipatovPeak`, `ipatovPower`, `ipatovF1`, `ipatovF2`, `ipatovF3`, `ipatovFpIndex`, `ipatovAccumCount`, `stsPeak`, `stsPower`, `stsF1`, `stsF2`, `stsF3`, `stsFpIndex`, `stsAccumCount`, `sts2Peak`, `sts2Power`, `sts2F1`, `sts2F2`, `sts2F3`, `sts2FpIndex`, `sts2AccumCount`.
 
-CIR is sent as one or more packets with `TLV_DIAG_SOURCE = 3`. The firmware captures a first-path-centered window, not the complete 2048-sample accumulator: 256 complex samples, currently 64 samples before the integer first-path index and 192 samples after it, clamped to the DWM3000 accumulator edges. This is 1536 bytes per anchor because each complex sample is 6 bytes: signed 24-bit real followed by signed 24-bit imaginary. Eight anchor windows therefore fit in 12288 bytes, the size of one complete accumulator dump. Each packet carries:
+CIR is sent as one or more packets with `TLV_DIAG_SOURCE = 3`. The firmware captures a first-path-centered window, not the complete 2048-sample accumulator: 192 complex samples, currently 64 samples before the integer first-path index and 128 samples after it, clamped to the DWM3000 accumulator edges. This is 1152 bytes per anchor because each complex sample is 6 bytes: signed 24-bit real followed by signed 24-bit imaginary. Eight anchor windows therefore fit in 9216 bytes. Each packet carries:
 
 | TLV | Type | Width | Notes |
 | --- | ---: | ---: | --- |
 | `TLV_DIAG_FRAGMENT_INDEX` | `0x55` | 2 | Zero-based fragment index |
 | `TLV_DIAG_FRAGMENT_COUNT` | `0x56` | 2 | Number of fragments for this CIR block |
 | `TLV_UWB_CIR_BYTE_OFFSET` | `0x50` | 2 | Byte offset of this chunk in the CIR byte array |
-| `TLV_UWB_CIR_TOTAL_BYTES` | `0x51` | 2 | Total CIR window bytes captured by the anchor, currently `1536` |
+| `TLV_UWB_CIR_TOTAL_BYTES` | `0x51` | 2 | Total CIR window bytes captured by the anchor, currently `1152` |
 | `TLV_UWB_CIR_FIRST_PATH_INDEX` | `0x52` | 2 | First-path index from DWM3000 diagnostics |
 | `TLV_UWB_CIR_START_INDEX` | `0x58` | 2 | Absolute accumulator sample index of the first sample in this CIR window |
 | `TLV_UWB_CIR_FULL_CHUNK` | `0x4F` | variable | Raw CIR chunk bytes |

@@ -93,7 +93,7 @@ def _command_status_name(status: int | None) -> str:
 def _decode_cir_bytes(cir_hex: str | None) -> list[float]:
     """Decode CIR data into magnitude values.
 
-    The reassembled CIR is 1536 bytes: 256 complex samples, each 6 bytes
+    The current full CIR window is 1152 bytes: 192 complex samples, each 6 bytes
     (signed 24-bit little-endian real + signed 24-bit little-endian imaginary).
     Returns the magnitude sqrt(re^2 + im^2) per point.
     """
