@@ -129,6 +129,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         super().__init__()
         self.anchor_true_distances: dict[str, dict[str, Any]] = {}
         self.anchor_los_nlos: dict[str, str] = {}
+        self.anchor_measured_distances: dict[str, float] = {}
         self.detected_anchor_ids: set[str] = set()
         self._pyth_updating = False
         self._install_extensions()
@@ -156,15 +157,10 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             value=f"Constellation: {self.constellation_var.get().strip() or 'not set'}"
         )
 
-        condition_row = ttk.Frame(frame)
-        condition_row.grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
-        ttk.Checkbutton(condition_row, text="Session hint LOS", variable=self.los_var).pack(side=tk.LEFT)
-        ttk.Checkbutton(condition_row, text="Session hint NLOS", variable=self.nlos_var).pack(side=tk.LEFT, padx=(14, 0))
-
-        self._build_serial_control(frame, 3)
+        self._build_serial_control(frame, 2)
 
         action_row = ttk.Frame(frame)
-        action_row.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        action_row.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 0))
         action_row.columnconfigure(0, weight=1)
         action_row.columnconfigure(1, weight=1)
         self.start_button = ttk.Button(
@@ -183,14 +179,14 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         ttk.Label(frame, textvariable=self.constellation_status_var).grid(
-            row=5,
+            row=4,
             column=0,
             columnspan=3,
             sticky="w",
             pady=(8, 0),
         )
         ttk.Label(frame, textvariable=self.session_status_var, style="Status.TLabel").grid(
-            row=6,
+            row=5,
             column=0,
             columnspan=3,
             sticky="w",
@@ -336,19 +332,22 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
 
         self.anchor_truth_table = ttk.Treeview(
             container,
-            columns=("anchor_id", "true_distance_m", "distance_source", "los_nlos"),
+            columns=("anchor_id", "measured_m", "true_distance_m", "diff_m", "los_nlos"),
             show="headings",
-            height=4,
+            height=6,
         )
         self.anchor_truth_table.heading("anchor_id", text="Responder ID")
+        self.anchor_truth_table.heading("measured_m", text="Measured m")
         self.anchor_truth_table.heading("true_distance_m", text="True distance m")
-        self.anchor_truth_table.heading("distance_source", text="True distance source")
+        self.anchor_truth_table.heading("diff_m", text="Diff m")
         self.anchor_truth_table.heading("los_nlos", text="LOS/NLOS")
-        self.anchor_truth_table.column("anchor_id", width=90, anchor="center")
-        self.anchor_truth_table.column("true_distance_m", width=130, anchor="center")
-        self.anchor_truth_table.column("distance_source", width=190, anchor="w")
-        self.anchor_truth_table.column("los_nlos", width=90, anchor="center")
+        self.anchor_truth_table.column("anchor_id", width=100, anchor="center")
+        self.anchor_truth_table.column("measured_m", width=90, anchor="center")
+        self.anchor_truth_table.column("true_distance_m", width=110, anchor="center")
+        self.anchor_truth_table.column("diff_m", width=80, anchor="center")
+        self.anchor_truth_table.column("los_nlos", width=80, anchor="center")
         self.anchor_truth_table.grid(row=3, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+        self.anchor_truth_table.tag_configure("mismatch", background="#f8d7da")
         self.anchor_truth_table.bind("<<TreeviewSelect>>", self.on_anchor_truth_selected)
 
         self.pyth_side_a_var.trace_add("write", self._on_pythagorean_sides_changed)
@@ -535,21 +534,30 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             return
         for item in self.anchor_truth_table.get_children():
             self.anchor_truth_table.delete(item)
+        threshold = safe_float(self.threshold_var.get()) or 0.0
         anchor_ids = sorted(
             set(self.detected_anchor_ids) | set(self.anchor_true_distances) | set(self.anchor_los_nlos),
             key=str,
         )
         for anchor_id in anchor_ids:
             data = self.anchor_true_distances.get(anchor_id)
+            true_distance = data["true_distance_m"] if data else None
+            measured = self.anchor_measured_distances.get(anchor_id)
+            diff = abs(measured - true_distance) if measured is not None and true_distance is not None else None
+            tags = ()
+            if diff is not None and diff > threshold and true_distance is not None:
+                tags = ("mismatch",)
             self.anchor_truth_table.insert(
                 "",
                 tk.END,
                 values=(
                     anchor_id,
-                    format_meter(data["true_distance_m"], "") if data else "",
-                    data["distance_source"] if data else "",
+                    format_meter(measured, "") if measured is not None else "",
+                    format_meter(true_distance, "") if true_distance is not None else "",
+                    format_meter(diff, "") if diff is not None else "",
                     self._anchor_los_nlos_for(anchor_id),
                 ),
+                tags=tags,
             )
 
     def _register_detected_anchor(self, anchor_id: Any) -> None:
@@ -774,12 +782,18 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         for record in original.parse_serial_line(line):
             if record.anchor_id:
                 self._register_detected_anchor(record.anchor_id)
+                if record.distance_m is not None:
+                    self.anchor_measured_distances[str(record.anchor_id).strip()] = float(record.distance_m)
+        self._refresh_anchor_truth_table()
         super().handle_serial_line(line)
 
     def handle_records(self, records: list[Any]) -> None:
         for record in records:
             if record.anchor_id:
                 self._register_detected_anchor(record.anchor_id)
+                if record.distance_m is not None:
+                    self.anchor_measured_distances[str(record.anchor_id).strip()] = float(record.distance_m)
+        self._refresh_anchor_truth_table()
         super().handle_records(records)
 
     def check_los_alert(self, record: Any) -> float | None:
