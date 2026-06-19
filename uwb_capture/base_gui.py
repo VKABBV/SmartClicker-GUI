@@ -69,7 +69,7 @@ def _clean_log_line(line: str) -> str:
 
 def _is_bt_debug_noise(line: str) -> bool:
     if not line:
-        return False
+        return True
     if _BT_DEBUG_RE.search(line):
         return True
     if _MESSAGES_DROPPED_RE.search(line):
