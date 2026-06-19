@@ -78,3 +78,6 @@ class ParsedRecord:
     uwb_clock_offset_raw: int | None = None
     uwb_carrier_integrator: int | None = None
     clicker_diag_bytes: str | None = None
+    cir_first_path_index: int | None = None
+    cir_start_index: int | None = None
+    diag_source: int | None = None

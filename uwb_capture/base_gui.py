@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import queue
 import re
-import struct
+import json
 import time
 from datetime import datetime
 from pathlib import Path
@@ -90,19 +90,36 @@ def _command_status_name(status: int | None) -> str:
         return f"STATUS_{status}"
 
 
-def _decode_cir_bytes(cir_hex: str | None) -> list[int]:
+def _decode_cir_bytes(cir_hex: str | None) -> list[float]:
+    """Decode CIR data into magnitude values.
+
+    The reassembled CIR is 1536 bytes: 256 complex samples, each 6 bytes
+    (signed 24-bit little-endian real + signed 24-bit little-endian imaginary).
+    Returns the magnitude sqrt(re^2 + im^2) per point.
+    """
     if not cir_hex:
         return []
     try:
         raw = bytes.fromhex(cir_hex)
     except ValueError:
         return []
-    if len(raw) <= 8:
-        return list(raw)
-    samples = []
-    for i in range(0, len(raw) - 1, 2):
-        samples.append(struct.unpack_from("<h", raw, i)[0])
-    return samples
+    mags: list[float] = []
+    for i in range(0, len(raw) - 5, 6):
+        re = int.from_bytes(raw[i:i + 3], "little", signed=True)
+        im = int.from_bytes(raw[i + 3:i + 6], "little", signed=True)
+        mags.append(math.sqrt(re * re + im * im))
+    return mags or [float(b) for b in raw]
+
+
+def _cir_first_path_local_index(record: ParsedRecord, point_count: int) -> int | None:
+    fp_index = record.cir_first_path_index
+    if fp_index is None:
+        return None
+    start_index = record.cir_start_index
+    local_index = fp_index - start_index if start_index is not None else fp_index
+    if 0 <= local_index < point_count:
+        return local_index
+    return None
 
 
 class UwbCaptureApp(tk.Tk):
@@ -129,11 +146,12 @@ class UwbCaptureApp(tk.Tk):
         self.anchor_distance_windows: dict[str, list[float]] = {}
         self.last_sample_row_by_anchor: dict[str, int] = {}
         self.collection_sample_rows: list[int] = []
+        self.collection_sample_rows_by_anchor: dict[str, list[int]] = {}
         self.collection_table_items: list[str] = []
+        self.collection_table_items_by_anchor: dict[str, list[str]] = {}
         self.collection_event_seq: int | None = None
         self.pending_diagnostics: list[ParsedRecord] = []
-        self.cir_reassembly: bytearray = bytearray()
-        self.cir_reassembly_total: int = 0
+        self.cir_reassembly_groups: dict[tuple[Any, ...], dict[str, Any]] = {}
         self.cir_history: list[ParsedRecord] = []
         self._build_variables()
         self._build_style()
@@ -409,7 +427,7 @@ class UwbCaptureApp(tk.Tk):
         self.ml_collect_button.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         ttk.Label(
             control,
-            text="Sends one CMD_ML_START_COLLECTION. The clicker runs fresh UWB discovery and streams range samples. Repeat for each capture.",
+            text="Sends one CMD_ML_START_COLLECTION. The clicker runs fresh UWB discovery, buffers scheduled samples, then sends post-burst notifications.",
             wraplength=320,
         ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(4, 0))
         self.ml_status_var = tk.StringVar(value="No collection command sent")
@@ -585,42 +603,62 @@ class UwbCaptureApp(tk.Tk):
             canvas.create_text(
                 canvas.winfo_width() // 2 or 100,
                 canvas.winfo_height() // 2 or 50,
-                text="No CIR bytes in this sample",
+                text="No CIR data in this sample",
                 fill="#666666",
             )
             return
 
-        width = max(canvas.winfo_width(), 200)
-        height = max(canvas.winfo_height(), 120)
-        left, top, right, bottom = 36, 18, width - 12, height - 28
+        width = max(canvas.winfo_width(), 300)
+        height = max(canvas.winfo_height(), 150)
+        left, top, right, bottom = 40, 24, width - 16, height - 32
         plot_w = max(right - left, 1)
         plot_h = max(bottom - top, 1)
-        max_val = max(values) if values else 1
-        min_val = min(values) if values else 0
+        max_val = max(values)
+        min_val = 0
         span = max(max_val - min_val, 1)
         n = len(values)
-        bar_w = max(plot_w / n - 2, 2)
 
+        # Draw axes
         canvas.create_line(left, bottom, right, bottom, fill="#cccccc")
         canvas.create_line(left, top, left, bottom, fill="#cccccc")
-        canvas.create_text(left - 6, top - 6, text=str(max_val), anchor="e", fill="#666666")
-        canvas.create_text(left - 6, bottom + 6, text=str(min_val), anchor="e", fill="#666666")
+        canvas.create_text(left - 6, top - 6, text=f"{max_val:.0f}", anchor="e", fill="#666666")
+        canvas.create_text(left - 6, bottom + 6, text="0", anchor="e", fill="#666666")
 
+        # Draw magnitude as a filled line graph
+        points = []
         for i, value in enumerate(values):
-            x = left + (plot_w * i / n) + 1
-            bar_h = (value - min_val) / span * plot_h
-            y_top = bottom - bar_h
-            canvas.create_rectangle(x, y_top, x + bar_w, bottom, fill="#1f77b4", outline="")
-            canvas.create_text(x + bar_w / 2, bottom + 12, text=str(i), anchor="n", fill="#666666")
+            x = left + (plot_w * i / max(n - 1, 1))
+            y = bottom - (value - min_val) / span * plot_h
+            points.extend([x, y])
+        if len(points) >= 4:
+            canvas.create_line(points, fill="#1f77b4", width=1, smooth=False)
 
+        # Draw first path marker. The firmware reports an absolute accumulator
+        # index; the plot window starts at cir_start_index when available.
+        fp_index = record.cir_first_path_index
+        fp_local_index = _cir_first_path_local_index(record, n)
+        if fp_index is not None and fp_local_index is not None:
+            fp_x = left + (plot_w * fp_local_index / max(n - 1, 1))
+            canvas.create_line(fp_x, top, fp_x, bottom, fill="#d62728", width=2, dash=(4, 2))
+            canvas.create_text(fp_x, top - 8, text=f"FP={fp_index}", anchor="s", fill="#d62728")
+
+        # X-axis labels (start, middle, end)
+        start_idx = getattr(record, "cir_start_index", None) or 0
+        for frac, label in [(0, str(start_idx)), (0.5, str(start_idx + n // 2)), (1, str(start_idx + n - 1))]:
+            x = left + plot_w * frac
+            canvas.create_text(x, bottom + 12, text=label, anchor="n", fill="#666666")
+
+        # Info text
         anchor = record.anchor_id or "?"
         sample_idx = record.sample_index if record.sample_index is not None else "?"
         distance = f"{record.distance_m:.3f} m" if record.distance_m is not None else "n/a"
         status = record.status or "?"
+        n_text = f"{n} samples"
+        fp_text = f"  FP={fp_index}" if fp_index is not None else ""
         canvas.create_text(
             right,
-            top - 6,
-            text=f"anchor {anchor}  sample {sample_idx}  {distance}  {status}",
+            top - 8,
+            text=f"anchor {anchor}  sample {sample_idx}  {distance}  {status}  {n_text}{fp_text}",
             anchor="ne",
             fill="#333333",
         )
@@ -715,11 +753,12 @@ class UwbCaptureApp(tk.Tk):
         self.anchor_distance_windows.clear()
         self.last_sample_row_by_anchor.clear()
         self.collection_sample_rows.clear()
+        self.collection_sample_rows_by_anchor.clear()
         self.collection_table_items.clear()
+        self.collection_table_items_by_anchor.clear()
         self.collection_event_seq = None
         self.pending_diagnostics.clear()
-        self.cir_reassembly.clear()
-        self.cir_reassembly_total = 0
+        self.cir_reassembly_groups.clear()
         self.session_status_var.set(f"Capturing: {self.current_session_id[:8]}")
         self.log_raw(f"# Started session {self.current_session_id}")
         self.log_raw("# Waiting for ML click reports. Send an ML collection command to begin streaming samples.")
@@ -779,8 +818,8 @@ class UwbCaptureApp(tk.Tk):
         if not text:
             return None
         value = safe_int(text)
-        if value is None or not (1 <= value <= 15):
-            raise ProtocolError("Samples per anchor must be from 1 to 15 (blank uses firmware default 8).")
+        if value is None or not (1 <= value <= 100):
+            raise ProtocolError("Samples per anchor must be from 1 to 100 (blank uses firmware default 8).")
         return value
 
     def _ml_discovery_slot_count(self) -> int | None:
@@ -788,8 +827,8 @@ class UwbCaptureApp(tk.Tk):
         if not text:
             return None
         value = safe_int(text)
-        if value is None or not (1 <= value <= 50):
-            raise ProtocolError("Discovery slots must be from 1 to 50 (blank uses firmware default 8).")
+        if value is None or not (1 <= value <= 8):
+            raise ProtocolError("Discovery slots must be from 1 to 8 (blank uses firmware default 8).")
         return value
 
     def _ml_session_id(self) -> int:
@@ -849,7 +888,9 @@ class UwbCaptureApp(tk.Tk):
         self._set_ml_collect_state(False)
         self._flush_diagnostics_to_all_samples()
         self.collection_sample_rows.clear()
+        self.collection_sample_rows_by_anchor.clear()
         self.collection_table_items.clear()
+        self.collection_table_items_by_anchor.clear()
         self.collection_event_seq = None
         samples_text = f" ({sample_count} sample notifications)" if sample_count is not None else ""
         if status == CommandStatus.COMMAND_BUSY:
@@ -961,6 +1002,7 @@ class UwbCaptureApp(tk.Tk):
                     self.collection_sample_rows.append(row_id)
                     if record.anchor_id:
                         self.last_sample_row_by_anchor[record.anchor_id] = row_id
+                        self.collection_sample_rows_by_anchor.setdefault(record.anchor_id, []).append(row_id)
                     alert_error = self.check_los_alert(record)
                     self.check_instability_alert(record)
                     self.add_record_to_table(record, alert_error)
@@ -968,6 +1010,8 @@ class UwbCaptureApp(tk.Tk):
                     if self.collection_sample_rows:
                         item = self.sample_table.get_children()[-1]
                         self.collection_table_items.append(item)
+                        if record.anchor_id:
+                            self.collection_table_items_by_anchor.setdefault(record.anchor_id, []).append(item)
             else:
                 self.add_record_to_table(record)
                 self._add_cir_sample(record)
@@ -979,83 +1023,166 @@ class UwbCaptureApp(tk.Tk):
             self._reassemble_cir_from_fragment(record)
 
     def _reassemble_cir_from_fragment(self, record: ParsedRecord) -> None:
-        import json as _json
         try:
-            tlvs = _json.loads(record.tlv_json)
+            tlvs = json.loads(record.tlv_json or "{}")
         except (ValueError, TypeError):
             return
-        cir_chunk_hex = tlvs.get("DIAG_CIR_CHUNK", [])
-        cir_offset_hex = tlvs.get("DIAG_CIR_OFFSET", [])
-        cir_total_hex = tlvs.get("DIAG_CIR_TOTAL", [])
-        if not cir_chunk_hex:
+        chunk_hex_list = tlvs.get("UWB_CIR_FULL_CHUNK", [])
+        offset_hex_list = tlvs.get("UWB_CIR_BYTE_OFFSET", [])
+        total_bytes = self._first_tlv_uint(tlvs, "UWB_CIR_TOTAL_BYTES")
+        if not chunk_hex_list:
             return
-        for chunk_hex in cir_chunk_hex:
-            chunk = bytes.fromhex(chunk_hex)
+
+        event_seq = record.event_seq if record.event_seq is not None else self.collection_event_seq
+        group_key = (
+            event_seq,
+            record.anchor_id or "",
+            record.burst_id,
+            record.cir_start_index,
+            record.cir_first_path_index,
+            total_bytes,
+        )
+        group = self.cir_reassembly_groups.setdefault(
+            group_key,
+            {
+                "anchor_id": record.anchor_id,
+                "event_seq": event_seq,
+                "burst_id": record.burst_id,
+                "cir_start_index": record.cir_start_index,
+                "cir_first_path_index": record.cir_first_path_index,
+                "total": total_bytes,
+                "bytes": bytearray(),
+            },
+        )
+        if total_bytes is not None:
+            group["total"] = total_bytes
+
+        reassembly = group["bytes"]
+        for chunk_index, chunk_hex in enumerate(chunk_hex_list):
+            try:
+                chunk = bytes.fromhex(chunk_hex)
+            except ValueError:
+                continue
             offset = 0
-            if cir_offset_hex:
-                offset = int.from_bytes(bytes.fromhex(cir_offset_hex[0]), "little")
-            if cir_total_hex:
-                self.cir_reassembly_total = int.from_bytes(bytes.fromhex(cir_total_hex[0]), "little")
+            if offset_hex_list:
+                offset_hex = offset_hex_list[min(chunk_index, len(offset_hex_list) - 1)]
+                try:
+                    offset = int.from_bytes(bytes.fromhex(offset_hex), "little")
+                except ValueError:
+                    offset = 0
             end = offset + len(chunk)
-            if end > len(self.cir_reassembly):
-                self.cir_reassembly.extend(bytearray(end - len(self.cir_reassembly)))
-            self.cir_reassembly[offset:end] = chunk
+            if end > len(reassembly):
+                reassembly.extend(bytearray(end - len(reassembly)))
+            reassembly[offset:end] = chunk
 
     def _flush_diagnostics_to_all_samples(self) -> None:
         if not self.pending_diagnostics or not self.collection_sample_rows:
-            self.pending_diagnostics.clear()
-            self.cir_reassembly.clear()
-            self.cir_reassembly_total = 0
+            self._clear_pending_diagnostics()
             return
-        reassembled_cir = bytes(self.cir_reassembly) if self.cir_reassembly else None
 
-        # Build a merged diagnostic record from all fragments
-        merged_diag = self._merge_all_fragments(reassembled_cir)
+        diagnostics_by_anchor: dict[str, list[ParsedRecord]] = {}
+        for record in self.pending_diagnostics:
+            if record.anchor_id:
+                diagnostics_by_anchor.setdefault(record.anchor_id, []).append(record)
 
-        for row_id in self.collection_sample_rows:
-            if self.store is not None:
-                self.store.merge_diagnostic_into_sample(row_id, merged_diag)
-        if reassembled_cir and self.store is not None:
-            for row_id in self.collection_sample_rows:
-                self.store.update_sample_cir_full(row_id, reassembled_cir.hex())
+        for anchor_id, diagnostics in diagnostics_by_anchor.items():
+            row_ids = self.collection_sample_rows_by_anchor.get(anchor_id, [])
+            if not row_ids:
+                continue
+            reassembled_cir = self._best_reassembled_cir_for_anchor(anchor_id, diagnostics)
+            merged_diag = self._merge_fragments(diagnostics, reassembled_cir)
 
-        # Update live table rows with diagnostic data
-        for item_id in self.collection_table_items:
-            self._update_table_row_with_diag(item_id, merged_diag)
+            for row_id in row_ids:
+                if self.store is not None:
+                    self.store.merge_diagnostic_into_sample(row_id, merged_diag)
+            if reassembled_cir and self.store is not None:
+                cir_hex = reassembled_cir.hex()
+                for row_id in row_ids:
+                    self.store.update_sample_cir_full(row_id, cir_hex)
 
-        # Update CIR visualizer with reassembled CIR for each sample
-        if reassembled_cir:
-            cir_hex = reassembled_cir.hex()
-            for i in range(len(self.collection_sample_rows)):
-                if i < len(self.cir_history):
-                    self.cir_history[i].cir_raw = cir_hex
-            self._draw_cir_plot()
+            for item_id in self.collection_table_items_by_anchor.get(anchor_id, []):
+                self._update_table_row_with_diag(item_id, merged_diag)
 
+            self._apply_diag_to_cir_history(anchor_id, merged_diag)
+
+        self._clear_pending_diagnostics()
+
+    def _clear_pending_diagnostics(self) -> None:
         self.pending_diagnostics.clear()
-        self.cir_reassembly.clear()
-        self.cir_reassembly_total = 0
+        self.cir_reassembly_groups.clear()
 
-    def _merge_all_fragments(self, reassembled_cir: bytes | None) -> ParsedRecord:
-        diag = self.pending_diagnostics[0]
-        merged = self._merge_diag_record(diag, reassembled_cir)
-        for extra in self.pending_diagnostics[1:]:
-            if merged.rx_power_dbm is None and extra.rx_power_dbm is not None:
-                merged = ParsedRecord(
-                    kind="diagnostic_merge", anchor_id=merged.anchor_id,
-                    rx_power_dbm=extra.rx_power_dbm, phy_config_id=merged.phy_config_id or extra.phy_config_id,
-                    burst_id=merged.burst_id or extra.burst_id,
-                    exchange_stride_us=merged.exchange_stride_us or extra.exchange_stride_us,
-                    burst_duration_ms=merged.burst_duration_ms or extra.burst_duration_ms,
-                    diag_status_flags=merged.diag_status_flags or extra.diag_status_flags,
-                    diag_bytes_captured=merged.diag_bytes_captured or extra.diag_bytes_captured,
-                    diag_bytes_transmitted=merged.diag_bytes_transmitted or extra.diag_bytes_transmitted,
-                    report_fragment_count=merged.report_fragment_count or extra.report_fragment_count,
-                    uwb_clock_offset_raw=merged.uwb_clock_offset_raw if merged.uwb_clock_offset_raw is not None else extra.uwb_clock_offset_raw,
-                    uwb_carrier_integrator=merged.uwb_carrier_integrator if merged.uwb_carrier_integrator is not None else extra.uwb_carrier_integrator,
-                    clicker_diag_bytes=merged.clicker_diag_bytes or extra.clicker_diag_bytes,
-                    cir_raw=merged.cir_raw, tlv_json=merged.tlv_json,
-                )
+    @staticmethod
+    def _first_tlv_uint(tlvs: dict[str, list[str]], name: str) -> int | None:
+        values = tlvs.get(name) or []
+        if not values:
+            return None
+        try:
+            return int.from_bytes(bytes.fromhex(values[0]), "little")
+        except ValueError:
+            return None
+
+    def _best_reassembled_cir_for_anchor(
+        self, anchor_id: str, diagnostics: list[ParsedRecord]
+    ) -> bytes | None:
+        event_seqs = {record.event_seq for record in diagnostics if record.event_seq is not None}
+        burst_ids = {record.burst_id for record in diagnostics if record.burst_id is not None}
+        candidates: list[dict[str, Any]] = []
+        for group in self.cir_reassembly_groups.values():
+            if group.get("anchor_id") != anchor_id:
+                continue
+            if event_seqs and group.get("event_seq") not in event_seqs:
+                continue
+            if burst_ids and group.get("burst_id") not in burst_ids:
+                continue
+            if group.get("bytes"):
+                candidates.append(group)
+        if not candidates:
+            return None
+
+        def score(group: dict[str, Any]) -> tuple[int, int]:
+            data_len = len(group["bytes"])
+            total = int(group.get("total") or 0)
+            complete = int(bool(total and data_len >= total))
+            return complete, data_len
+
+        group = max(candidates, key=score)
+        data = bytes(group["bytes"])
+        total = int(group.get("total") or 0)
+        return data[:total] if total and len(data) > total else data
+
+    def _merge_fragments(
+        self, diagnostics: list[ParsedRecord], reassembled_cir: bytes | None
+    ) -> ParsedRecord:
+        merged = self._merge_diag_record(diagnostics[0], reassembled_cir)
+        fields = (
+            "rx_power_dbm", "phy_config_id", "burst_id", "exchange_stride_us",
+            "burst_duration_ms", "diag_status_flags", "diag_bytes_captured",
+            "diag_bytes_transmitted", "report_fragment_count", "uwb_clock_offset_raw",
+            "uwb_carrier_integrator", "clicker_diag_bytes", "cir_raw", "tlv_json",
+            "cir_first_path_index", "cir_start_index", "diag_source",
+        )
+        for extra in diagnostics[1:]:
+            for field in fields:
+                if getattr(merged, field, None) is None and getattr(extra, field, None) is not None:
+                    setattr(merged, field, getattr(extra, field))
+        if reassembled_cir:
+            merged.cir_raw = reassembled_cir.hex()
         return merged
+
+    def _apply_diag_to_cir_history(self, anchor_id: str, diag: ParsedRecord) -> None:
+        changed = False
+        for record in self.cir_history:
+            if record.anchor_id != anchor_id:
+                continue
+            if diag.cir_raw:
+                record.cir_raw = diag.cir_raw
+            if diag.cir_first_path_index is not None:
+                record.cir_first_path_index = diag.cir_first_path_index
+            if diag.cir_start_index is not None:
+                record.cir_start_index = diag.cir_start_index
+            changed = True
+        if changed:
+            self._draw_cir_plot()
 
     def _update_table_row_with_diag(self, item_id: str, diag: ParsedRecord) -> None:
         try:
@@ -1089,6 +1216,9 @@ class UwbCaptureApp(tk.Tk):
             clicker_diag_bytes=diag.clicker_diag_bytes,
             cir_raw=reassembled_cir.hex() if reassembled_cir else diag.cir_raw,
             tlv_json=diag.tlv_json,
+            cir_first_path_index=diag.cir_first_path_index,
+            cir_start_index=diag.cir_start_index,
+            diag_source=diag.diag_source,
         )
 
     def check_los_alert(self, record: ParsedRecord) -> float | None:

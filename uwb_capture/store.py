@@ -83,6 +83,9 @@ class MeasurementStore:
                 uwb_clock_offset_raw INTEGER,
                 uwb_carrier_integrator INTEGER,
                 clicker_diag_bytes TEXT,
+                cir_first_path_index INTEGER,
+                cir_start_index INTEGER,
+                diag_source INTEGER,
                 FOREIGN KEY(session_id) REFERENCES sessions(id)
             );
 
@@ -139,6 +142,9 @@ class MeasurementStore:
         "uwb_clock_offset_raw": "INTEGER",
         "uwb_carrier_integrator": "INTEGER",
         "clicker_diag_bytes": "TEXT",
+        "cir_first_path_index": "INTEGER",
+        "cir_start_index": "INTEGER",
+        "diag_source": "INTEGER",
     }
 
     def _migrate_samples_columns(self) -> None:
@@ -204,9 +210,10 @@ class MeasurementStore:
                 quality, firmware_timestamp_ms, phy_config_id, burst_id, tlv_json,
                 exchange_stride_us, burst_duration_ms, diag_status_flags,
                 diag_bytes_captured, diag_bytes_transmitted, report_fragment_count,
-                uwb_clock_offset_raw, uwb_carrier_integrator, clicker_diag_bytes
+                uwb_clock_offset_raw, uwb_carrier_integrator, clicker_diag_bytes,
+                cir_first_path_index, cir_start_index, diag_source
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -239,6 +246,9 @@ class MeasurementStore:
                 record.uwb_clock_offset_raw,
                 record.uwb_carrier_integrator,
                 record.clicker_diag_bytes,
+                record.cir_first_path_index,
+                record.cir_start_index,
+                record.diag_source,
             ),
         )
         self.conn.commit()
@@ -252,6 +262,7 @@ class MeasurementStore:
             "diag_bytes_captured", "diag_bytes_transmitted", "report_fragment_count",
             "uwb_clock_offset_raw", "uwb_carrier_integrator", "clicker_diag_bytes",
             "cir_raw", "rx_power_dbm", "phy_config_id", "burst_id", "tlv_json",
+            "cir_first_path_index", "cir_start_index", "diag_source",
         ):
             value = getattr(record, field, None)
             if value is not None:

@@ -96,27 +96,25 @@ class TlvId(IntEnum):
     DIAG_TX_FRAME_INFO = 0x38
     DIAG_BYTES_CAPTURED = 0x39
     DIAG_BYTES_TRANSMITTED = 0x3A
-    DIAG_RX_DIAG_INFO = 0x3B
-    DIAG_TX_DIAG_INFO = 0x3C
+    DIAG_BYTES_TRUNCATED = 0x3B
+    DIAG_FRAMES_DROPPED = 0x3C
     REPORT_FRAGMENT_COUNT = 0x3D
-    DIAG_TX_FRAME_INFO_2 = 0x3E
-    DIAG_RX_DIAG_INFO_2 = 0x3F
     CLICKER_DIAG_BYTES = 0x40
-    DIAG_RAW_CIR = 0x41
+    ANCHOR_DIAG_BYTES = 0x41
     PHY_CONFIG_ID = 0x42
     DISCOVERY_SLOT_COUNT = 0x4C
     UWB_CLOCK_OFFSET_RAW = 0x4D
     UWB_CARRIER_INTEGRATOR = 0x4E
-    DIAG_FLAGS = 0x53
-    DIAG_ACCUMULATOR = 0x54
-    DIAG_RX_TUNE = 0x55
-    DIAG_TX_TUNE = 0x56
-    DIAG_SLOT_INFO = 0x57
-    DIAG_CIR_CHUNK = 0x4F
-    DIAG_CIR_OFFSET = 0x50
-    DIAG_CIR_TOTAL = 0x51
-    DIAG_CIR_SIZE = 0x52
-    DIAG_CIR_TIMESTAMP = 0x58
+    UWB_CIR_FULL_CHUNK = 0x4F
+    UWB_CIR_BYTE_OFFSET = 0x50
+    UWB_CIR_TOTAL_BYTES = 0x51
+    UWB_CIR_FIRST_PATH_INDEX = 0x52
+    UWB_RAW_TIMESTAMPS = 0x53
+    UWB_RX_DIAG_BYTES = 0x54
+    DIAG_FRAGMENT_INDEX = 0x55
+    DIAG_FRAGMENT_COUNT = 0x56
+    DIAG_SOURCE = 0x57
+    UWB_CIR_START_INDEX = 0x58
 
 
 @dataclass(frozen=True)
@@ -417,12 +415,12 @@ def build_ml_start_collection_packet(
     """Build a ``CMD_ML_START_COLLECTION`` command proto_packet."""
     extra: list[tuple[int | TlvId, bytes]] = []
     if sample_count is not None:
-        if not (1 <= sample_count <= 15):
-            raise ProtocolError("Sample count must be from 1 to 15.")
+        if not (1 <= sample_count <= 100):
+            raise ProtocolError("Sample count must be from 1 to 100.")
         extra.append((TlvId.SAMPLE_COUNT, u8(sample_count)))
     if discovery_slot_count is not None:
-        if not (1 <= discovery_slot_count <= 50):
-            raise ProtocolError("Discovery slot count must be from 1 to 50.")
+        if not (1 <= discovery_slot_count <= 8):
+            raise ProtocolError("Discovery slot count must be from 1 to 8.")
         extra.append((TlvId.DISCOVERY_SLOT_COUNT, u8(discovery_slot_count)))
     return build_command_packet(
         command_id=CommandId.ML_START_COLLECTION,
@@ -513,6 +511,9 @@ def _ml_sample_records(packet: ImecPacket) -> list[ParsedRecord]:
     uwb_clock_offset_raw = read_int(first_tlv(tlvs, TlvId.UWB_CLOCK_OFFSET_RAW))
     uwb_carrier_integrator = read_int(first_tlv(tlvs, TlvId.UWB_CARRIER_INTEGRATOR))
     clicker_diag = first_tlv(tlvs, TlvId.CLICKER_DIAG_BYTES)
+    cir_first_path_index = read_uint(first_tlv(tlvs, TlvId.UWB_CIR_FIRST_PATH_INDEX))
+    cir_start_index = read_uint(first_tlv(tlvs, TlvId.UWB_CIR_START_INDEX))
+    diag_source = read_uint(first_tlv(tlvs, TlvId.DIAG_SOURCE))
 
     # Diagnostic-only fragments: packets without SAMPLE_INDEX and
     # DISTANCE_SAMPLES_MM carry CIR chunks, tune info, clock offset, etc.
@@ -545,6 +546,9 @@ def _ml_sample_records(packet: ImecPacket) -> list[ParsedRecord]:
                 report_fragment_count=report_fragment_count,
                 uwb_clock_offset_raw=uwb_clock_offset_raw,
                 uwb_carrier_integrator=uwb_carrier_integrator,
+                cir_first_path_index=cir_first_path_index,
+                cir_start_index=cir_start_index,
+                diag_source=diag_source,
             )
         ]
 
@@ -592,6 +596,9 @@ def _ml_sample_records(packet: ImecPacket) -> list[ParsedRecord]:
             report_fragment_count=report_fragment_count,
             uwb_clock_offset_raw=uwb_clock_offset_raw,
             uwb_carrier_integrator=uwb_carrier_integrator,
+            cir_first_path_index=cir_first_path_index,
+            cir_start_index=cir_start_index,
+            diag_source=diag_source,
         )
     ]
 
