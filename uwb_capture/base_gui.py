@@ -170,7 +170,7 @@ class UwbCaptureApp(tk.Tk):
         root.columnconfigure(1, weight=1)
         root.rowconfigure(0, weight=1)
 
-        left = self._build_scrollable_frame(root, width=360)
+        left = self._build_scrollable_frame(root, width=480)
         self._scrollable_container.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
 
         right = ttk.Frame(root)
