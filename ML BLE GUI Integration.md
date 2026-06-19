@@ -136,6 +136,12 @@ The final command result has:
 
 Match results to commands with packet `session_id` and `seq`. Match sample rows to a collection with `TLV_EVENT_SEQ`.
 
+## Command Outcomes
+
+If no anchors reply during fresh UWB discovery, the clicker emits no `MSG_CLICK_REPORT` samples and then sends a `MSG_COMMAND_RESULT | FLAG_DIAGNOSTIC | FLAG_ERROR` with `TLV_COMMAND_STATUS = COMMAND_TIMEOUT` and `TLV_SAMPLE_COUNT = 0`.
+
+If at least one anchor replies but fewer than the build maximum reply, the command continues with the discovered anchors. The schedule uses `min(discovered anchors, CONFIG_IMEC_ML_MAX_ANCHORS)` and requests the configured samples per selected anchor. In that case the final status is `COMMAND_OK` when the scheduled exchanges complete and all sample notifications are delivered; `TLV_SAMPLE_COUNT` is the actual number of `MSG_CLICK_REPORT` notifications emitted.
+
 ## Practical GUI Behavior
 
 1. Scan for `IMEC ML Clicker`, connect, discover the service, and subscribe to `Packet TX`.

@@ -458,6 +458,14 @@ def command_status_from_packet(packet: ImecPacket) -> int | None:
     return read_uint(first_tlv(tlvs, TlvId.COMMAND_STATUS))
 
 
+def command_sample_count_from_packet(packet: ImecPacket) -> int | None:
+    """Number of sample notifications the clicker reports for a command result."""
+    if packet.msg_type != MessageType.COMMAND_RESULT:
+        return None
+    tlvs = decode_tlvs(packet.payload)
+    return read_uint(first_tlv(tlvs, TlvId.SAMPLE_COUNT))
+
+
 def records_from_packet(packet: ImecPacket) -> list[ParsedRecord]:
     if packet.msg_type == MessageType.CLICK_REPORT:
         return _ml_sample_records(packet)

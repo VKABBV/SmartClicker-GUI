@@ -12,6 +12,8 @@ from uwb_capture.protocol import (
     cobs_decode,
     cobs_encode,
     command_result_summary,
+    command_sample_count_from_packet,
+    command_status_from_packet,
     decode_packet,
     encode_packet,
     encode_tlvs,
@@ -266,6 +268,29 @@ class CommandResultTests(unittest.TestCase):
             payload=payload,
         )
         self.assertIn("FLAG_ERROR", command_result_summary(packet))
+
+    def test_timeout_result_carries_zero_sample_count(self) -> None:
+        payload = encode_tlvs(
+            [
+                (TlvId.COMMAND_ID, u16(CommandId.ML_START_COLLECTION)),
+                (TlvId.COMMAND_STATUS, u8(CommandStatus.COMMAND_TIMEOUT)),
+                (TlvId.REASON, u8(0)),
+                (TlvId.SAMPLE_COUNT, u16(0)),
+            ]
+        )
+        packet = ImecPacket(
+            msg_type=MessageType.COMMAND_RESULT,
+            flags=FLAG_DIAGNOSTIC | 0x40,
+            source_id=0xAABBCCDD,
+            destination_id=0,
+            session_id=1234,
+            sequence=7,
+            ttl=1,
+            message_age_ms=0,
+            payload=payload,
+        )
+        self.assertEqual(command_status_from_packet(packet), CommandStatus.COMMAND_TIMEOUT)
+        self.assertEqual(command_sample_count_from_packet(packet), 0)
 
 
 if __name__ == "__main__":
