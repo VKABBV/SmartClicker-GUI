@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import queue
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -53,6 +54,21 @@ from .store import MeasurementStore
 APP_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT_DIR = APP_DIR / "Measurements" / "GUI_Captures"
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_BT_DEBUG_RE = re.compile(
+    r"bt_hci_core|bt_sdc_hci_driver|bt_tx_irq_raise|hci_driver_send|messages dropped",
+    re.IGNORECASE,
+)
+
+
+def _clean_log_line(line: str) -> str:
+    return _ANSI_RE.sub("", line).strip()
+
+
+def _is_bt_debug_noise(line: str) -> bool:
+    return bool(_BT_DEBUG_RE.search(line))
+
+
 class UwbCaptureApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -75,6 +91,7 @@ class UwbCaptureApp(tk.Tk):
         self.last_alert_prompt: dict[str, float] = {}
         self.last_instability_prompt: dict[str, float] = {}
         self.anchor_distance_windows: dict[str, list[float]] = {}
+        self.suppressed_log_count = 0
         self._build_variables()
         self._build_style()
         self._build_layout()
@@ -459,6 +476,7 @@ class UwbCaptureApp(tk.Tk):
             self.bluetooth_worker.stop()
             self.bluetooth_worker = None
         self.connected_device = None
+        self._flush_suppressed_log_summary()
         self.status_var.set("Disconnected")
 
     def start_capture(self) -> None:
@@ -498,6 +516,7 @@ class UwbCaptureApp(tk.Tk):
         if not self.capture_active:
             return
         self.capture_active = False
+        self._flush_suppressed_log_summary()
         if self.store is not None and self.current_session_id is not None:
             self.store.finish_session(self.current_session_id)
             counts = self.store.counts(self.current_session_id)
@@ -692,14 +711,24 @@ class UwbCaptureApp(tk.Tk):
         self.after(80, self.process_events)
 
     def handle_serial_line(self, line: str) -> None:
-        self.log_raw(line)
-        records = parse_serial_line(line)
+        cleaned = _clean_log_line(line)
+        if _is_bt_debug_noise(cleaned):
+            self.suppressed_log_count += 1
+            return
+        self._flush_suppressed_log_summary()
+        self.log_raw(cleaned)
+        records = parse_serial_line(cleaned)
         if self.capture_active and self.store is not None and self.current_session_id is not None:
-            self.store.insert_raw_line(self.current_session_id, line, bool(records))
+            self.store.insert_raw_line(self.current_session_id, cleaned, bool(records))
         if not self.capture_active:
             return
 
         self.handle_records(records)
+
+    def _flush_suppressed_log_summary(self) -> None:
+        if self.suppressed_log_count:
+            self.log_raw(f"# ({self.suppressed_log_count} BT debug line(s) suppressed)")
+            self.suppressed_log_count = 0
 
     def handle_records(self, records: list[ParsedRecord]) -> None:
         for record in records:
