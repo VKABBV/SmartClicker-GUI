@@ -321,18 +321,6 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             padx=(6, 0),
         )
 
-        self.pyth_canvas = tk.Canvas(
-            helper,
-            height=150,
-            background="#ffffff",
-            highlightthickness=1,
-            highlightbackground="#c8c8c8",
-        )
-        self.pyth_canvas.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(8, 0))
-        self.pyth_canvas.bind("<Configure>", lambda _event: self._draw_pythagorean_triangle())
-        self.pyth_canvas.bind("<Button-1>", self._set_pythagorean_from_canvas)
-        self.pyth_canvas.bind("<B1-Motion>", self._set_pythagorean_from_canvas)
-
         ttk.Button(helper, text="Calculate", command=self.calculate_pythagorean_distance).grid(
             row=2,
             column=0,
@@ -365,7 +353,6 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
 
         self.pyth_side_a_var.trace_add("write", self._on_pythagorean_sides_changed)
         self.pyth_side_b_var.trace_add("write", self._on_pythagorean_sides_changed)
-        self._draw_pythagorean_triangle()
 
     def _add_measurement_list_button(self) -> None:
         storage = find_labelframe(self, "Storage")
@@ -421,7 +408,6 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
                 self.pyth_result_var.set("")
             finally:
                 self._pyth_updating = False
-            self._draw_pythagorean_triangle()
             return None
 
         result = math.sqrt(side_a**2 + side_b**2)
@@ -430,78 +416,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             self.pyth_result_var.set(format_meter(result))
         finally:
             self._pyth_updating = False
-        self._draw_pythagorean_triangle()
         return result
-
-    def _triangle_plot_area(self) -> tuple[int, int, int, int]:
-        canvas = self.pyth_canvas
-        width = max(canvas.winfo_width(), 280)
-        height = max(canvas.winfo_height(), 150)
-        left = 28
-        top = 18
-        right = width - 24
-        bottom = height - 32
-        return left, top, right, bottom
-
-    def _draw_pythagorean_triangle(self) -> None:
-        if not hasattr(self, "pyth_canvas"):
-            return
-
-        canvas = self.pyth_canvas
-        canvas.delete("all")
-        side_a = safe_float(self.pyth_side_a_var.get())
-        side_b = safe_float(self.pyth_side_b_var.get())
-        if side_a is None or side_a <= 0:
-            side_a = 3.0
-        if side_b is None or side_b <= 0:
-            side_b = 2.0
-
-        left, top, right, bottom = self._triangle_plot_area()
-        plot_w = max(right - left, 1)
-        plot_h = max(bottom - top, 1)
-        scale = min(plot_w / side_a, plot_h / side_b)
-        x0 = left
-        y0 = bottom
-        x1 = left + side_a * scale
-        y1 = bottom
-        x2 = x1
-        y2 = bottom - side_b * scale
-        hypotenuse = math.sqrt(side_a**2 + side_b**2)
-
-        canvas.create_line(x0, y0, x1, y1, fill="#1f77b4", width=3)
-        canvas.create_line(x1, y1, x2, y2, fill="#2ca02c", width=3)
-        canvas.create_line(x0, y0, x2, y2, fill="#d62728", width=3)
-        canvas.create_rectangle(x1 - 14, y1 - 14, x1, y1, outline="#666666")
-        canvas.create_oval(x2 - 6, y2 - 6, x2 + 6, y2 + 6, fill="#d97706", outline="")
-
-        canvas.create_text((x0 + x1) / 2, y1 + 14, text=f"A {format_meter(side_a)} m", fill="#1f77b4")
-        canvas.create_text(x1 + 36, (y1 + y2) / 2, text=f"B {format_meter(side_b)} m", fill="#2ca02c")
-        canvas.create_text((x0 + x2) / 2 - 8, (y0 + y2) / 2 - 10, text=f"true {format_meter(hypotenuse)} m", fill="#d62728")
-        canvas.create_text(right - 64, top + 10, text="drag point", fill="#666666")
-
-    def _set_pythagorean_from_canvas(self, event: Any) -> None:
-        left, top, right, bottom = self._triangle_plot_area()
-        plot_w = max(right - left, 1)
-        plot_h = max(bottom - top, 1)
-        x = min(max(float(event.x), left + 4), right)
-        y = min(max(float(event.y), top), bottom - 4)
-
-        current_a = safe_float(self.pyth_side_a_var.get()) or 0.0
-        current_b = safe_float(self.pyth_side_b_var.get()) or 0.0
-        current_result = safe_float(self.pyth_result_var.get()) or 0.0
-        max_meter = max(current_a, current_b, current_result, 5.0)
-        side_a = max(0.01, ((x - left) / plot_w) * max_meter)
-        side_b = max(0.01, ((bottom - y) / plot_h) * max_meter)
-        result = math.sqrt(side_a**2 + side_b**2)
-
-        self._pyth_updating = True
-        try:
-            self.pyth_side_a_var.set(format_meter(side_a))
-            self.pyth_side_b_var.set(format_meter(side_b))
-            self.pyth_result_var.set(format_meter(result))
-        finally:
-            self._pyth_updating = False
-        self._draw_pythagorean_triangle()
 
     def save_direct_true_distance(self) -> None:
         anchor_id = self._selected_anchor_id()
@@ -543,7 +458,6 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             self.pyth_result_var.set(format_meter(result))
         finally:
             self._pyth_updating = False
-        self._draw_pythagorean_triangle()
         return result
 
     def use_pythagorean_distance_for_anchor(self) -> None:
@@ -603,7 +517,6 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             self.pyth_side_a_var.set("")
             self.pyth_side_b_var.set("")
             self.pyth_result_var.set("")
-            self._draw_pythagorean_triangle()
             return
         self.anchor_true_distance_var.set(format_meter(data["true_distance_m"]))
         self.pyth_side_a_var.set(
@@ -616,7 +529,6 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             self.pyth_result_var.set(format_meter(data["true_distance_m"]))
         else:
             self.pyth_result_var.set("")
-        self._draw_pythagorean_triangle()
 
     def _refresh_anchor_truth_table(self) -> None:
         if not hasattr(self, "anchor_truth_table"):
