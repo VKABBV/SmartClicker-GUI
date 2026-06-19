@@ -90,6 +90,16 @@ def _command_status_name(status: int | None) -> str:
         return f"STATUS_{status}"
 
 
+def _decode_cir_bytes(cir_hex: str | None) -> list[int]:
+    if not cir_hex:
+        return []
+    try:
+        raw = bytes.fromhex(cir_hex)
+    except ValueError:
+        return []
+    return list(raw)
+
+
 class UwbCaptureApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -112,6 +122,7 @@ class UwbCaptureApp(tk.Tk):
         self.last_alert_prompt: dict[str, float] = {}
         self.last_instability_prompt: dict[str, float] = {}
         self.anchor_distance_windows: dict[str, list[float]] = {}
+        self.cir_history: list[ParsedRecord] = []
         self._build_variables()
         self._build_style()
         self._build_layout()
@@ -505,6 +516,123 @@ class UwbCaptureApp(tk.Tk):
         alert_scroll.grid(row=0, column=1, sticky="ns")
         notebook.add(alert_frame, text="Alerts")
 
+        self.cir_notebook_tab = self._build_cir_panel(notebook)
+
+    def _build_cir_panel(self, notebook: ttk.Notebook) -> ttk.Frame:
+        frame = ttk.Frame(notebook)
+        frame.rowconfigure(1, weight=1)
+        frame.columnconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=0)
+
+        header = ttk.Frame(frame)
+        header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="Channel Impulse Response samples", style="Status.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        self.cir_status_var = tk.StringVar(value="No CIR samples yet")
+        ttk.Label(header, textvariable=self.cir_status_var).grid(row=1, column=0, sticky="w")
+
+        list_frame = ttk.Frame(frame)
+        list_frame.grid(row=1, column=0, sticky="nsew")
+        list_frame.rowconfigure(0, weight=1)
+        list_frame.columnconfigure(0, weight=1)
+        self.cir_listbox = tk.Listbox(list_frame, height=12, exportselection=False)
+        cir_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.cir_listbox.yview)
+        self.cir_listbox.configure(yscrollcommand=cir_scroll.set)
+        self.cir_listbox.grid(row=0, column=0, sticky="nsew")
+        cir_scroll.grid(row=0, column=1, sticky="ns")
+        self.cir_listbox.bind("<<ListboxSelect>>", self._on_cir_selected)
+
+        self.cir_canvas = tk.Canvas(frame, background="#ffffff", highlightthickness=1, highlightbackground="#c8c8c8")
+        self.cir_canvas.grid(row=1, column=1, sticky="nsew", padx=(8, 0))
+        self.cir_canvas.bind("<Configure>", lambda _event: self._draw_cir_plot())
+
+        notebook.add(frame, text="CIR Visualizer")
+        return frame
+
+    def _on_cir_selected(self, _event: Any = None) -> None:
+        self._draw_cir_plot()
+
+    def _draw_cir_plot(self) -> None:
+        canvas = getattr(self, "cir_canvas", None)
+        if canvas is None:
+            return
+        canvas.delete("all")
+        if not hasattr(self, "cir_listbox"):
+            return
+        selection = self.cir_listbox.curselection()
+        if not selection:
+            return
+        index = int(selection[0])
+        if index >= len(self.cir_history):
+            return
+        record = self.cir_history[index]
+        values = _decode_cir_bytes(record.cir_raw)
+        if not values:
+            canvas.create_text(
+                canvas.winfo_width() // 2 or 100,
+                canvas.winfo_height() // 2 or 50,
+                text="No CIR bytes in this sample",
+                fill="#666666",
+            )
+            return
+
+        width = max(canvas.winfo_width(), 200)
+        height = max(canvas.winfo_height(), 120)
+        left, top, right, bottom = 36, 18, width - 12, height - 28
+        plot_w = max(right - left, 1)
+        plot_h = max(bottom - top, 1)
+        max_val = max(values) if values else 1
+        min_val = min(values) if values else 0
+        span = max(max_val - min_val, 1)
+        n = len(values)
+        bar_w = max(plot_w / n - 2, 2)
+
+        canvas.create_line(left, bottom, right, bottom, fill="#cccccc")
+        canvas.create_line(left, top, left, bottom, fill="#cccccc")
+        canvas.create_text(left - 6, top - 6, text=str(max_val), anchor="e", fill="#666666")
+        canvas.create_text(left - 6, bottom + 6, text=str(min_val), anchor="e", fill="#666666")
+
+        for i, value in enumerate(values):
+            x = left + (plot_w * i / n) + 1
+            bar_h = (value - min_val) / span * plot_h
+            y_top = bottom - bar_h
+            canvas.create_rectangle(x, y_top, x + bar_w, bottom, fill="#1f77b4", outline="")
+            canvas.create_text(x + bar_w / 2, bottom + 12, text=str(i), anchor="n", fill="#666666")
+
+        anchor = record.anchor_id or "?"
+        sample_idx = record.sample_index if record.sample_index is not None else "?"
+        distance = f"{record.distance_m:.3f} m" if record.distance_m is not None else "n/a"
+        status = record.status or "?"
+        canvas.create_text(
+            right,
+            top - 6,
+            text=f"anchor {anchor}  sample {sample_idx}  {distance}  {status}",
+            anchor="ne",
+            fill="#333333",
+        )
+
+    def _add_cir_sample(self, record: ParsedRecord) -> None:
+        if not record.cir_raw:
+            return
+        self.cir_history.append(record)
+        if len(self.cir_history) > 200:
+            del self.cir_history[: len(self.cir_history) - 200]
+        label = self._cir_label(record, len(self.cir_history) - 1)
+        self.cir_listbox.insert(tk.END, label)
+        self.cir_listbox.selection_clear(0, tk.END)
+        self.cir_listbox.selection_set(tk.END)
+        self.cir_listbox.see(tk.END)
+        self.cir_status_var.set(f"{len(self.cir_history)} CIR sample(s) stored")
+        self._draw_cir_plot()
+
+    def _cir_label(self, record: ParsedRecord, index: int) -> str:
+        anchor = record.anchor_id or "?"
+        sample_idx = record.sample_index if record.sample_index is not None else "?"
+        distance = f"{record.distance_m:.3f}m" if record.distance_m is not None else "n/a"
+        return f"#{index} anchor {anchor[-8:]} s{sample_idx} {distance} {record.status or ''}"
+
     def choose_output_dir(self) -> None:
         path = filedialog.askdirectory(initialdir=self.output_dir_var.get(), parent=self)
         if not path:
@@ -809,8 +937,10 @@ class UwbCaptureApp(tk.Tk):
                     alert_error = self.check_los_alert(record)
                     self.check_instability_alert(record)
                     self.add_record_to_table(record, alert_error)
+                    self._add_cir_sample(record)
             else:
                 self.add_record_to_table(record)
+                self._add_cir_sample(record)
         self.update_counts()
 
     def check_los_alert(self, record: ParsedRecord) -> float | None:
@@ -907,6 +1037,13 @@ class UwbCaptureApp(tk.Tk):
         self.table_rows = 0
         self.raw_text.delete("1.0", tk.END)
         self.alert_text.delete("1.0", tk.END)
+        self.cir_history.clear()
+        if hasattr(self, "cir_listbox"):
+            self.cir_listbox.delete(0, tk.END)
+        if hasattr(self, "cir_status_var"):
+            self.cir_status_var.set("No CIR samples yet")
+        if hasattr(self, "cir_canvas"):
+            self.cir_canvas.delete("all")
 
     def log_raw(self, message: str) -> None:
         self.raw_text.insert(tk.END, f"{message}\n")
