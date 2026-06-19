@@ -1,6 +1,6 @@
 import unittest
 
-from uwb_capture.base_gui import _cir_first_path_local_index
+from uwb_capture.base_gui import _cir_first_path_local_index, _cir_record_matches_diag
 from uwb_capture.common import ParsedRecord
 
 
@@ -27,6 +27,18 @@ class CirPlotTests(unittest.TestCase):
         )
 
         self.assertIsNone(_cir_first_path_local_index(record, 32))
+
+    def test_cir_record_matching_rejects_old_trigger_event(self) -> None:
+        old_record = ParsedRecord(kind="sample", anchor_id="anchor-1", event_seq=10)
+        current_record = ParsedRecord(kind="sample", anchor_id="anchor-1", event_seq=11)
+
+        self.assertFalse(_cir_record_matches_diag(old_record, "anchor-1", 11))
+        self.assertTrue(_cir_record_matches_diag(current_record, "anchor-1", 11))
+
+    def test_cir_record_matching_allows_current_trigger_without_event_seq(self) -> None:
+        record = ParsedRecord(kind="sample", anchor_id="anchor-1")
+
+        self.assertTrue(_cir_record_matches_diag(record, "anchor-1", None))
 
 
 if __name__ == "__main__":

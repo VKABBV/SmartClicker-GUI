@@ -122,6 +122,14 @@ def _cir_first_path_local_index(record: ParsedRecord, point_count: int) -> int |
     return None
 
 
+def _cir_record_matches_diag(record: ParsedRecord, anchor_id: str, event_seq: int | None) -> bool:
+    if record.anchor_id != anchor_id:
+        return False
+    if event_seq is None:
+        return True
+    return record.event_seq == event_seq
+
+
 class UwbCaptureApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -149,6 +157,7 @@ class UwbCaptureApp(tk.Tk):
         self.collection_sample_rows_by_anchor: dict[str, list[int]] = {}
         self.collection_table_items: list[str] = []
         self.collection_table_items_by_anchor: dict[str, list[str]] = {}
+        self.collection_cir_records_by_anchor: dict[str, list[ParsedRecord]] = {}
         self.collection_event_seq: int | None = None
         self.pending_diagnostics: list[ParsedRecord] = []
         self.cir_reassembly_groups: dict[tuple[Any, ...], dict[str, Any]] = {}
@@ -684,6 +693,16 @@ class UwbCaptureApp(tk.Tk):
         distance = f"{record.distance_m:.3f}m" if record.distance_m is not None else "n/a"
         return f"#{index} anchor {anchor[-8:]} s{sample_idx} {distance} {record.status or ''}"
 
+    def _reset_trigger_collection_state(self) -> None:
+        self.collection_sample_rows.clear()
+        self.collection_sample_rows_by_anchor.clear()
+        self.collection_table_items.clear()
+        self.collection_table_items_by_anchor.clear()
+        self.collection_cir_records_by_anchor.clear()
+        self.collection_event_seq = None
+        self.pending_diagnostics.clear()
+        self.cir_reassembly_groups.clear()
+
     def choose_output_dir(self) -> None:
         path = filedialog.askdirectory(initialdir=self.output_dir_var.get(), parent=self)
         if not path:
@@ -752,13 +771,7 @@ class UwbCaptureApp(tk.Tk):
         self.last_instability_prompt.clear()
         self.anchor_distance_windows.clear()
         self.last_sample_row_by_anchor.clear()
-        self.collection_sample_rows.clear()
-        self.collection_sample_rows_by_anchor.clear()
-        self.collection_table_items.clear()
-        self.collection_table_items_by_anchor.clear()
-        self.collection_event_seq = None
-        self.pending_diagnostics.clear()
-        self.cir_reassembly_groups.clear()
+        self._reset_trigger_collection_state()
         self.session_status_var.set(f"Capturing: {self.current_session_id[:8]}")
         self.log_raw(f"# Started session {self.current_session_id}")
         self.log_raw("# Waiting for ML click reports. Send an ML collection command to begin streaming samples.")
@@ -804,6 +817,7 @@ class UwbCaptureApp(tk.Tk):
         if not sent:
             self.log_raw("# Did not send ML collection; Bluetooth is not ready.")
             return
+        self._reset_trigger_collection_state()
         self.ml_command_in_flight = True
         self.ml_pending_session = session_id
         self.ml_pending_seq = self.protocol_sequence
@@ -887,11 +901,7 @@ class UwbCaptureApp(tk.Tk):
         self.ml_pending_seq = None
         self._set_ml_collect_state(False)
         self._flush_diagnostics_to_all_samples()
-        self.collection_sample_rows.clear()
-        self.collection_sample_rows_by_anchor.clear()
-        self.collection_table_items.clear()
-        self.collection_table_items_by_anchor.clear()
-        self.collection_event_seq = None
+        self._reset_trigger_collection_state()
         samples_text = f" ({sample_count} sample notifications)" if sample_count is not None else ""
         if status == CommandStatus.COMMAND_BUSY:
             self.log_raw("# ML collection rejected as BUSY; wait for the prior collection to finish, then retry.")
@@ -1007,6 +1017,8 @@ class UwbCaptureApp(tk.Tk):
                     self.check_instability_alert(record)
                     self.add_record_to_table(record, alert_error)
                     self._add_cir_sample(record)
+                    if record.anchor_id:
+                        self.collection_cir_records_by_anchor.setdefault(record.anchor_id, []).append(record)
                     if self.collection_sample_rows:
                         item = self.sample_table.get_children()[-1]
                         self.collection_table_items.append(item)
@@ -1155,7 +1167,7 @@ class UwbCaptureApp(tk.Tk):
     ) -> ParsedRecord:
         merged = self._merge_diag_record(diagnostics[0], reassembled_cir)
         fields = (
-            "rx_power_dbm", "phy_config_id", "burst_id", "exchange_stride_us",
+            "event_seq", "rx_power_dbm", "phy_config_id", "burst_id", "exchange_stride_us",
             "burst_duration_ms", "diag_status_flags", "diag_bytes_captured",
             "diag_bytes_transmitted", "report_fragment_count", "uwb_clock_offset_raw",
             "uwb_carrier_integrator", "clicker_diag_bytes", "cir_raw", "tlv_json",
@@ -1171,8 +1183,9 @@ class UwbCaptureApp(tk.Tk):
 
     def _apply_diag_to_cir_history(self, anchor_id: str, diag: ParsedRecord) -> None:
         changed = False
-        for record in self.cir_history:
-            if record.anchor_id != anchor_id:
+        event_seq = diag.event_seq if diag.event_seq is not None else self.collection_event_seq
+        for record in self.collection_cir_records_by_anchor.get(anchor_id, []):
+            if not _cir_record_matches_diag(record, anchor_id, event_seq):
                 continue
             if diag.cir_raw:
                 record.cir_raw = diag.cir_raw
@@ -1202,6 +1215,7 @@ class UwbCaptureApp(tk.Tk):
         return ParsedRecord(
             kind="diagnostic_merge",
             anchor_id=diag.anchor_id,
+            event_seq=diag.event_seq,
             rx_power_dbm=diag.rx_power_dbm,
             phy_config_id=diag.phy_config_id,
             burst_id=diag.burst_id,
