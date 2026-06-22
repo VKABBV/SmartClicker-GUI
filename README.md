@@ -24,6 +24,20 @@ After a capture, select each responder ID and save its own LOS/NLOS label before
 exporting; the per-anchor workbooks and measurement-list workbook use those
 independent labels.
 
+## Localization And Simulation
+
+The extended GUI includes a `Localization` tab for anchor coordinates and tag
+position solving. Enter each anchor's X/Y coordinates in meters, load the latest
+captured ranges, then solve. The solver uses a radical-axis linear seed followed
+by iterative weighted least squares (Gauss-Newton WLS). Results report the
+estimated X/Y point, residual RMSE in meters, confidence, and per-anchor
+residuals.
+
+Use `Run Square Simulation` to fill a four-anchor square/floor-plan test with
+fake ranges, solve it, and plot both the simulated true point and estimated
+point. This is a quick way to validate the algorithm before using real anchor
+coordinates.
+
 ## Bluetooth Protocol Workflow
 
 The GUI now treats Connect and Disconnect as BLE transport actions. Enter or
@@ -80,6 +94,7 @@ PHY,channel,prf_mhz,preamble_code,preamble_symbols,data_rate_kbps,pac_size,ntm_1
 uwb_capture/common.py       shared helpers and ParsedRecord model
 uwb_capture/protocol.py     IMEC binary packet/TLV codec
 uwb_capture/bluetooth_io.py BLE scanner, connector, and packet writer
+uwb_capture/localization.py 2D radical-axis + WLS localization solver
 uwb_capture/parser.py       legacy text line parser
 uwb_capture/store.py        SQLite persistence and base workbook export
 uwb_capture/base_gui.py     base capture GUI

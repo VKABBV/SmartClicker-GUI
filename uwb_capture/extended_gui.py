@@ -18,7 +18,13 @@ from openpyxl.styles import Font, PatternFill
 from openpyxl.worksheet.datavalidation import DataValidation
 
 from . import base_gui as original
-from .localization import LocalizationReading, LocalizationResult, solve_position
+from .localization import (
+    LOCALIZATION_ALGORITHM,
+    LocalizationReading,
+    LocalizationResult,
+    build_square_simulation,
+    solve_position,
+)
 
 tk = original.tk
 ttk = original.ttk
@@ -136,6 +142,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self.localization_row_order: list[str] = []
         self.localization_anchor_positions: dict[str, tuple[str, str]] = {}
         self.localization_result: LocalizationResult | None = None
+        self.localization_true_position: tuple[float, float] | None = None
         self._pyth_updating = False
         super().__init__()
         self._install_extensions()
@@ -277,13 +284,17 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
     def _build_localization_panel(self, parent: Any) -> None:
         header = ttk.LabelFrame(parent, text="Position Solver", padding=8)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        header.columnconfigure(0, weight=1)
-        header.columnconfigure(1, weight=1)
-        header.columnconfigure(2, weight=1)
+        for column in range(4):
+            header.columnconfigure(column, weight=1)
 
         self.localization_status_var = tk.StringVar(
             value="Capture anchor ranges, enter anchor X/Y positions, then solve."
         )
+        self.sim_width_var = tk.StringVar(value="7")
+        self.sim_height_var = tk.StringVar(value="7")
+        self.sim_true_x_var = tk.StringVar(value="3.1")
+        self.sim_true_y_var = tk.StringVar(value="4.2")
+        self.sim_noise_var = tk.StringVar(value="0")
         ttk.Button(
             header,
             text="Use Latest Capture",
@@ -291,24 +302,48 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         ).grid(row=0, column=0, sticky="ew", padx=(0, 5))
         ttk.Button(
             header,
+            text="Run Square Simulation",
+            command=self.run_square_simulation,
+        ).grid(row=0, column=1, sticky="ew", padx=5)
+        ttk.Button(
+            header,
             text="Solve",
             style="Accent.TButton",
             command=self.solve_localization_from_form,
-        ).grid(row=0, column=1, sticky="ew", padx=5)
+        ).grid(row=0, column=2, sticky="ew", padx=5)
         ttk.Button(
             header,
             text="Clear",
             command=self.clear_localization_inputs,
-        ).grid(row=0, column=2, sticky="ew", padx=(5, 0))
+        ).grid(row=0, column=3, sticky="ew", padx=(5, 0))
         ttk.Label(header, textvariable=self.localization_status_var, style="Status.TLabel").grid(
             row=1,
             column=0,
-            columnspan=3,
+            columnspan=4,
             sticky="w",
             pady=(8, 0),
         )
+        sim_frame = ttk.Frame(header)
+        sim_frame.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        for column in (1, 3, 5, 7, 9):
+            sim_frame.columnconfigure(column, weight=1)
+        sim_rows = [
+            ("Width m", self.sim_width_var),
+            ("Height m", self.sim_height_var),
+            ("True X m", self.sim_true_x_var),
+            ("True Y m", self.sim_true_y_var),
+            ("Noise m", self.sim_noise_var),
+        ]
+        for index, (label, variable) in enumerate(sim_rows):
+            ttk.Label(sim_frame, text=label).grid(row=0, column=index * 2, sticky="w", padx=(0, 4))
+            ttk.Entry(sim_frame, textvariable=variable, width=8).grid(
+                row=0,
+                column=index * 2 + 1,
+                sticky="ew",
+                padx=(0, 8),
+            )
 
-        input_frame = ttk.LabelFrame(parent, text="Anchor Inputs", padding=8)
+        input_frame = ttk.LabelFrame(parent, text="Anchor Coordinates and Ranges (meters)", padding=8)
         input_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
         input_frame.columnconfigure(2, weight=1)
         input_frame.columnconfigure(3, weight=1)
@@ -502,6 +537,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             return False
 
         self._remember_localization_positions()
+        self.localization_true_position = None
         for anchor_id, distance in sorted(distances.items(), key=lambda item: item[0]):
             row = self._ensure_localization_row(anchor_id)
             saved_x, saved_y = self.localization_anchor_positions.get(anchor_id, ("", ""))
@@ -516,6 +552,61 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             f"Loaded {len(distances)} latest anchor range(s) from capture data."
         )
         return True
+
+    def run_square_simulation(self) -> None:
+        try:
+            width_m = self._positive_sim_float(self.sim_width_var, "Simulation width")
+            height_m = self._positive_sim_float(self.sim_height_var, "Simulation height")
+            true_x_m = self._sim_float(self.sim_true_x_var, "True X")
+            true_y_m = self._sim_float(self.sim_true_y_var, "True Y")
+            noise_m = self._nonnegative_sim_float(self.sim_noise_var, "Simulation noise")
+            scenario = build_square_simulation(
+                width_m=width_m,
+                height_m=height_m,
+                true_x_m=true_x_m,
+                true_y_m=true_y_m,
+                noise_m=noise_m,
+            )
+        except ValueError as exc:
+            self.localization_status_var.set(str(exc))
+            self._write_localization_result(str(exc))
+            messagebox.showerror("Invalid simulation", str(exc), parent=self)
+            return
+
+        self.localization_true_position = (scenario.true_x_m, scenario.true_y_m)
+        for reading in scenario.readings:
+            row = self._ensure_localization_row(reading.anchor_id)
+            row["enabled_var"].set(True)
+            row["anchor_var"].set(reading.anchor_id)
+            row["x_var"].set(format_meter(reading.x_m, ""))
+            row["y_var"].set(format_meter(reading.y_m, ""))
+            row["range_var"].set(format_meter(reading.range_m, ""))
+            row["offset_var"].set("0")
+            row["sigma_var"].set(format_meter(reading.sigma_m, ""))
+
+        self.localization_status_var.set(
+            f"Loaded square simulation with true position x={scenario.true_x_m:.3f} m, "
+            f"y={scenario.true_y_m:.3f} m."
+        )
+        self.solve_localization_from_form()
+
+    def _sim_float(self, variable: Any, label: str) -> float:
+        value = safe_float(variable.get())
+        if value is None:
+            raise ValueError(f"{label} must be numeric.")
+        return value
+
+    def _positive_sim_float(self, variable: Any, label: str) -> float:
+        value = self._sim_float(variable, label)
+        if value <= 0:
+            raise ValueError(f"{label} must be greater than 0.")
+        return value
+
+    def _nonnegative_sim_float(self, variable: Any, label: str) -> float:
+        value = self._sim_float(variable, label)
+        if value < 0:
+            raise ValueError(f"{label} must be 0 or greater.")
+        return value
 
     def solve_latest_position(self) -> None:
         if not self.populate_localization_from_latest_capture():
@@ -577,13 +668,24 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
 
     def _show_localization_result(self, result: LocalizationResult) -> None:
         lines = [
+            f"Algorithm: {LOCALIZATION_ALGORITHM}",
+            "Units: meters",
+            "",
             f"Estimated position: x={result.x_m:.3f} m, y={result.y_m:.3f} m",
             f"Seed position: x={result.seed_x_m:.3f} m, y={result.seed_y_m:.3f} m",
             f"RMSE: {result.rmse_m:.3f} m",
             f"Confidence: {result.confidence}",
-            "",
-            "Per-anchor residuals:",
         ]
+        if self.localization_true_position is not None:
+            true_x, true_y = self.localization_true_position
+            position_error = math.hypot(result.x_m - true_x, result.y_m - true_y)
+            lines.extend(
+                [
+                    f"Simulated true position: x={true_x:.3f} m, y={true_y:.3f} m",
+                    f"Position error: {position_error:.3f} m",
+                ]
+            )
+        lines.extend(["", "Per-anchor residuals:"])
         for reading in result.processed_readings:
             residual = result.residuals_m.get(reading.anchor_id, 0.0)
             lines.append(
@@ -610,6 +712,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
 
     def clear_localization_inputs(self) -> None:
         self.localization_result = None
+        self.localization_true_position = None
         for key in self.localization_row_order:
             row = self.localization_rows.get(key)
             if not row:
@@ -628,7 +731,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         canvas.create_text(
             18,
             18,
-            text="Position plot appears after solving.",
+            text="Position plot appears after solving or running the square simulation.",
             anchor="nw",
             fill="#57606a",
         )
@@ -640,6 +743,8 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         height = max(canvas.winfo_height(), 260)
         points = [(reading.x_m, reading.y_m) for reading in result.processed_readings]
         points.append((result.x_m, result.y_m))
+        if self.localization_true_position is not None:
+            points.append(self.localization_true_position)
         min_x = min(x for x, _ in points)
         max_x = max(x for x, _ in points)
         min_y = min(y for _, y in points)
@@ -670,6 +775,13 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             height - margin,
             outline="#d0d7de",
         )
+        canvas.create_text(margin, height - margin + 18, text=f"{min_x:.1f} m", anchor="n", fill="#57606a")
+        canvas.create_text(width - margin, height - margin + 18, text=f"{max_x:.1f} m", anchor="n", fill="#57606a")
+        canvas.create_text(margin - 8, height - margin, text=f"{min_y:.1f} m", anchor="e", fill="#57606a")
+        canvas.create_text(margin - 8, margin, text=f"{max_y:.1f} m", anchor="e", fill="#57606a")
+        canvas.create_text(width / 2, height - 8, text="x position (m)", anchor="s", fill="#57606a")
+        canvas.create_text(8, height / 2, text="y position (m)", anchor="w", fill="#57606a", angle=90)
+
         tag_x, tag_y = project(result.x_m, result.y_m)
         for reading in result.processed_readings:
             anchor_x, anchor_y = project(reading.x_m, reading.y_m)
@@ -690,6 +802,20 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
                 anchor="sw",
                 fill="#24292f",
             )
+
+        if self.localization_true_position is not None:
+            true_x_m, true_y_m = self.localization_true_position
+            true_x, true_y = project(true_x_m, true_y_m)
+            canvas.create_line(true_x - 8, true_y, true_x + 8, true_y, fill="#1a7f37", width=2)
+            canvas.create_line(true_x, true_y - 8, true_x, true_y + 8, fill="#1a7f37", width=2)
+            canvas.create_text(
+                true_x + 10,
+                true_y - 10,
+                text=f"True\n({true_x_m:.2f}, {true_y_m:.2f})",
+                anchor="sw",
+                fill="#1a7f37",
+            )
+            canvas.create_line(true_x, true_y, tag_x, tag_y, fill="#1a7f37", dash=(3, 3))
 
         canvas.create_oval(
             tag_x - 8,

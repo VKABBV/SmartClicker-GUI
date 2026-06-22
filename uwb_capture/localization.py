@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 
+LOCALIZATION_ALGORITHM = "Radical-axis seed + iterative weighted least squares (Gauss-Newton WLS)"
+
 
 @dataclass(frozen=True)
 class LocalizationReading:
@@ -52,6 +54,15 @@ class LocalizationResult:
     warnings: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class SimulatedLocalizationScenario:
+    """Deterministic fake anchor ranges for GUI and regression testing."""
+
+    true_x_m: float
+    true_y_m: float
+    readings: tuple[LocalizationReading, ...]
+
+
 def solve_position(
     readings: list[LocalizationReading],
     *,
@@ -86,6 +97,56 @@ def solve_position(
         processed_readings=tuple(processed),
         residuals_m=residuals,
         warnings=tuple(warnings),
+    )
+
+
+def build_square_simulation(
+    *,
+    width_m: float = 7.0,
+    height_m: float = 7.0,
+    true_x_m: float = 3.1,
+    true_y_m: float = 4.2,
+    sigma_m: float = 0.05,
+    noise_m: float = 0.0,
+) -> SimulatedLocalizationScenario:
+    """Build a simple four-anchor floor-plan simulation in metric units.
+
+    The optional noise is deterministic so test output and GUI demos are
+    repeatable. Distances remain physically plausible for small noise values.
+    """
+
+    if width_m <= 0 or height_m <= 0:
+        raise ValueError("Simulation width and height must be greater than 0.")
+    if true_x_m < 0 or true_x_m > width_m or true_y_m < 0 or true_y_m > height_m:
+        raise ValueError("Simulated true position must be inside the square.")
+    if sigma_m <= 0:
+        raise ValueError("Simulation sigma must be greater than 0.")
+    if noise_m < 0:
+        raise ValueError("Simulation noise must be 0 or greater.")
+
+    anchors = (
+        ("A1", 0.0, 0.0, 0.0),
+        ("A2", width_m, 0.0, 0.65),
+        ("A3", width_m, height_m, -0.45),
+        ("A4", 0.0, height_m, 0.25),
+    )
+    readings = []
+    for anchor_id, x_m, y_m, noise_scale in anchors:
+        true_range = math.hypot(true_x_m - x_m, true_y_m - y_m)
+        measured_range = max(true_range + noise_m * noise_scale, 0.05)
+        readings.append(
+            LocalizationReading(
+                anchor_id=anchor_id,
+                x_m=x_m,
+                y_m=y_m,
+                range_m=measured_range,
+                sigma_m=sigma_m,
+            )
+        )
+    return SimulatedLocalizationScenario(
+        true_x_m=true_x_m,
+        true_y_m=true_y_m,
+        readings=tuple(readings),
     )
 
 

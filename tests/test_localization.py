@@ -1,7 +1,12 @@
 import math
 import unittest
 
-from uwb_capture.localization import LocalizationReading, solve_position
+from uwb_capture.localization import (
+    LOCALIZATION_ALGORITHM,
+    LocalizationReading,
+    build_square_simulation,
+    solve_position,
+)
 
 
 class LocalizationSolverTests(unittest.TestCase):
@@ -65,6 +70,36 @@ class LocalizationSolverTests(unittest.TestCase):
 
         self.assertAlmostEqual(result.x_m, true_x, places=4)
         self.assertAlmostEqual(result.y_m, true_y, places=4)
+
+    def test_square_simulation_reports_position_error_metric(self) -> None:
+        scenario = build_square_simulation(
+            width_m=7.0,
+            height_m=7.0,
+            true_x_m=3.1,
+            true_y_m=4.2,
+        )
+
+        result = solve_position(list(scenario.readings))
+        position_error = math.hypot(result.x_m - scenario.true_x_m, result.y_m - scenario.true_y_m)
+
+        self.assertIn("weighted least squares", LOCALIZATION_ALGORITHM.lower())
+        self.assertLess(position_error, 1e-4)
+        self.assertLess(result.rmse_m, 1e-4)
+
+    def test_noisy_square_simulation_still_solves_near_true_point(self) -> None:
+        scenario = build_square_simulation(
+            width_m=8.0,
+            height_m=5.0,
+            true_x_m=2.75,
+            true_y_m=2.25,
+            noise_m=0.08,
+        )
+
+        result = solve_position(list(scenario.readings))
+        position_error = math.hypot(result.x_m - scenario.true_x_m, result.y_m - scenario.true_y_m)
+
+        self.assertLess(position_error, 0.12)
+        self.assertLess(result.rmse_m, 0.08)
 
 
 if __name__ == "__main__":
