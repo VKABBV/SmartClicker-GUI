@@ -10,6 +10,7 @@ from uwb_capture.protocol import (
     ProtocolError,
     TlvId,
     build_ml_start_collection_packet,
+    build_ml_start_fast_ranging_packet,
     cobs_decode,
     cobs_encode,
     command_result_summary,
@@ -102,6 +103,22 @@ class CommandTests(unittest.TestCase):
         )
 
         self.assertIn(bytes([TlvId.SAMPLE_COUNT, 1, 100]), packet.payload)
+        self.assertIn(bytes([TlvId.DISCOVERY_SLOT_COUNT, 1, 8]), packet.payload)
+
+    def test_build_ml_start_fast_ranging_packet_uses_same_tlvs(self) -> None:
+        raw = build_ml_start_fast_ranging_packet(
+            source_id=0x100,
+            destination_id=0,
+            session_id=1234,
+            sequence=7,
+            sample_count=12,
+            discovery_slot_count=8,
+        )
+        packet = decode_packet(raw)
+
+        self.assertEqual(packet.msg_type, MessageType.COMMAND)
+        self.assertIn(bytes([TlvId.COMMAND_ID, 2, 0x01, 0x80]), packet.payload)
+        self.assertIn(bytes([TlvId.SAMPLE_COUNT, 1, 12]), packet.payload)
         self.assertIn(bytes([TlvId.DISCOVERY_SLOT_COUNT, 1, 8]), packet.payload)
 
     def test_ml_start_collection_packet_rejects_out_of_range_limits(self) -> None:
@@ -346,6 +363,31 @@ class CommandResultTests(unittest.TestCase):
             payload=payload,
         )
         self.assertIn("FLAG_ERROR", command_result_summary(packet))
+
+    def test_fast_ranging_command_result_summary_includes_ml_status(self) -> None:
+        payload = encode_tlvs(
+            [
+                (TlvId.COMMAND_ID, u16(CommandId.ML_START_FAST_RANGING)),
+                (TlvId.COMMAND_STATUS, u8(CommandStatus.COMMAND_OK)),
+                (TlvId.SAMPLE_COUNT, u16(32)),
+            ]
+        )
+        packet = ImecPacket(
+            msg_type=MessageType.COMMAND_RESULT,
+            flags=FLAG_DIAGNOSTIC,
+            source_id=0xAABBCCDD,
+            destination_id=0,
+            session_id=1234,
+            sequence=7,
+            ttl=1,
+            message_age_ms=0,
+            payload=payload,
+        )
+        summary = command_result_summary(packet)
+
+        self.assertIn("ML_START_FAST_RANGING", summary)
+        self.assertIn("COMMAND_OK", summary)
+        self.assertIn("samples=32", summary)
 
     def test_timeout_result_carries_zero_sample_count(self) -> None:
         payload = encode_tlvs(

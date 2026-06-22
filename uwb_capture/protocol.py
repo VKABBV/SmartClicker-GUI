@@ -44,6 +44,7 @@ class MessageType(IntEnum):
 
 class CommandId(IntEnum):
     ML_START_COLLECTION = 0x8000
+    ML_START_FAST_RANGING = 0x8001
 
 
 class CommandStatus(IntEnum):
@@ -403,8 +404,9 @@ def build_command_packet(
     return encode_packet(packet)
 
 
-def build_ml_start_collection_packet(
+def _build_ml_start_packet(
     *,
+    command_id: CommandId,
     source_id: int,
     destination_id: int,
     session_id: int,
@@ -412,7 +414,6 @@ def build_ml_start_collection_packet(
     sample_count: int | None = None,
     discovery_slot_count: int | None = None,
 ) -> bytes:
-    """Build a ``CMD_ML_START_COLLECTION`` command proto_packet."""
     extra: list[tuple[int | TlvId, bytes]] = []
     if sample_count is not None:
         if not (1 <= sample_count <= 100):
@@ -423,12 +424,54 @@ def build_ml_start_collection_packet(
             raise ProtocolError("Discovery slot count must be from 1 to 8.")
         extra.append((TlvId.DISCOVERY_SLOT_COUNT, u8(discovery_slot_count)))
     return build_command_packet(
-        command_id=CommandId.ML_START_COLLECTION,
+        command_id=command_id,
         source_id=source_id,
         destination_id=destination_id,
         session_id=session_id,
         sequence=sequence,
         extra_tlvs=extra,
+    )
+
+
+def build_ml_start_collection_packet(
+    *,
+    source_id: int,
+    destination_id: int,
+    session_id: int,
+    sequence: int,
+    sample_count: int | None = None,
+    discovery_slot_count: int | None = None,
+) -> bytes:
+    """Build a ``CMD_ML_START_COLLECTION`` command proto_packet."""
+    return _build_ml_start_packet(
+        command_id=CommandId.ML_START_COLLECTION,
+        source_id=source_id,
+        destination_id=destination_id,
+        session_id=session_id,
+        sequence=sequence,
+        sample_count=sample_count,
+        discovery_slot_count=discovery_slot_count,
+    )
+
+
+def build_ml_start_fast_ranging_packet(
+    *,
+    source_id: int,
+    destination_id: int,
+    session_id: int,
+    sequence: int,
+    sample_count: int | None = None,
+    discovery_slot_count: int | None = None,
+) -> bytes:
+    """Build a ``CMD_ML_START_FAST_RANGING`` command proto_packet."""
+    return _build_ml_start_packet(
+        command_id=CommandId.ML_START_FAST_RANGING,
+        source_id=source_id,
+        destination_id=destination_id,
+        session_id=session_id,
+        sequence=sequence,
+        sample_count=sample_count,
+        discovery_slot_count=discovery_slot_count,
     )
 
 
