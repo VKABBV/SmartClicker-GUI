@@ -142,7 +142,6 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self.localization_row_order: list[str] = []
         self.localization_anchor_positions: dict[str, tuple[str, str]] = {}
         self.localization_result: LocalizationResult | None = None
-        self.localization_reference_clicker_position: tuple[float, float] | None = None
         self._pyth_updating = False
         super().__init__()
         self._install_extensions()
@@ -292,8 +291,6 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         )
         self.sim_width_var = tk.StringVar(value="7")
         self.sim_height_var = tk.StringVar(value="7")
-        self.sim_clicker_x_var = tk.StringVar(value="3.1")
-        self.sim_clicker_y_var = tk.StringVar(value="4.2")
         self.sim_noise_var = tk.StringVar(value="0")
         ttk.Button(
             header,
@@ -325,13 +322,11 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         )
         sim_frame = ttk.Frame(header)
         sim_frame.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
-        for column in (1, 3, 5, 7, 9):
+        for column in (1, 3, 5):
             sim_frame.columnconfigure(column, weight=1)
         sim_rows = [
             ("Width m", self.sim_width_var),
             ("Height m", self.sim_height_var),
-            ("Clicker X m", self.sim_clicker_x_var),
-            ("Clicker Y m", self.sim_clicker_y_var),
             ("Noise m", self.sim_noise_var),
         ]
         for index, (label, variable) in enumerate(sim_rows):
@@ -537,7 +532,6 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             return False
 
         self._remember_localization_positions()
-        self.localization_reference_clicker_position = None
         for anchor_id, distance in sorted(distances.items(), key=lambda item: item[0]):
             row = self._ensure_localization_row(anchor_id)
             saved_x, saved_y = self.localization_anchor_positions.get(anchor_id, ("", ""))
@@ -557,14 +551,10 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         try:
             width_m = self._positive_sim_float(self.sim_width_var, "Simulation width")
             height_m = self._positive_sim_float(self.sim_height_var, "Simulation height")
-            clicker_x_m = self._sim_float(self.sim_clicker_x_var, "Clicker X")
-            clicker_y_m = self._sim_float(self.sim_clicker_y_var, "Clicker Y")
             noise_m = self._nonnegative_sim_float(self.sim_noise_var, "Simulation noise")
             scenario = build_square_simulation(
                 width_m=width_m,
                 height_m=height_m,
-                clicker_x_m=clicker_x_m,
-                clicker_y_m=clicker_y_m,
                 noise_m=noise_m,
             )
         except ValueError as exc:
@@ -573,7 +563,6 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             messagebox.showerror("Invalid simulation", str(exc), parent=self)
             return
 
-        self.localization_reference_clicker_position = (scenario.clicker_x_m, scenario.clicker_y_m)
         for reading in scenario.readings:
             row = self._ensure_localization_row(reading.anchor_id)
             row["enabled_var"].set(True)
@@ -585,8 +574,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             row["sigma_var"].set(format_meter(reading.sigma_m, ""))
 
         self.localization_status_var.set(
-            f"Loaded square simulation with reference clicker x={scenario.clicker_x_m:.3f} m, "
-            f"y={scenario.clicker_y_m:.3f} m."
+            "Loaded square simulation ranges. The clicker position is solved from ranges only."
         )
         self.solve_localization_from_form()
 
@@ -676,15 +664,6 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             f"RMSE: {result.rmse_m:.3f} m",
             f"Confidence: {result.confidence}",
         ]
-        if self.localization_reference_clicker_position is not None:
-            clicker_x, clicker_y = self.localization_reference_clicker_position
-            position_error = math.hypot(result.x_m - clicker_x, result.y_m - clicker_y)
-            lines.extend(
-                [
-                    f"Simulated clicker reference: x={clicker_x:.3f} m, y={clicker_y:.3f} m",
-                    f"Estimate error vs simulation: {position_error:.3f} m",
-                ]
-            )
         lines.extend(["", "Per-anchor residuals:"])
         for reading in result.processed_readings:
             residual = result.residuals_m.get(reading.anchor_id, 0.0)
@@ -712,7 +691,6 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
 
     def clear_localization_inputs(self) -> None:
         self.localization_result = None
-        self.localization_reference_clicker_position = None
         for key in self.localization_row_order:
             row = self.localization_rows.get(key)
             if not row:
@@ -743,8 +721,6 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         height = max(canvas.winfo_height(), 260)
         points = [(reading.x_m, reading.y_m) for reading in result.processed_readings]
         points.append((result.x_m, result.y_m))
-        if self.localization_reference_clicker_position is not None:
-            points.append(self.localization_reference_clicker_position)
         min_x = min(x for x, _ in points)
         max_x = max(x for x, _ in points)
         min_y = min(y for _, y in points)
@@ -802,20 +778,6 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
                 anchor="sw",
                 fill="#24292f",
             )
-
-        if self.localization_reference_clicker_position is not None:
-            clicker_x_m, clicker_y_m = self.localization_reference_clicker_position
-            reference_x, reference_y = project(clicker_x_m, clicker_y_m)
-            canvas.create_line(reference_x - 8, reference_y, reference_x + 8, reference_y, fill="#1a7f37", width=2)
-            canvas.create_line(reference_x, reference_y - 8, reference_x, reference_y + 8, fill="#1a7f37", width=2)
-            canvas.create_text(
-                reference_x + 10,
-                reference_y - 10,
-                text=f"Sim clicker\n({clicker_x_m:.2f}, {clicker_y_m:.2f})",
-                anchor="sw",
-                fill="#1a7f37",
-            )
-            canvas.create_line(reference_x, reference_y, tag_x, tag_y, fill="#1a7f37", dash=(3, 3))
 
         canvas.create_oval(
             tag_x - 8,
