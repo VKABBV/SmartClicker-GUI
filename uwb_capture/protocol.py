@@ -39,10 +39,19 @@ class MessageType(IntEnum):
     CLICK_REPORT = 0x20
     COMMAND = 0x40
     COMMAND_RESULT = 0x41
+    SURVEY_REACH_REPORT = 0x51
+    SURVEY_PAIR_RESULT = 0x53
     MSG_ERROR = 0x7F
 
 
 class CommandId(IntEnum):
+    GET_STATUS = 0x0002
+    START_HEARTBEAT = 0x0009
+    STOP_HEARTBEAT = 0x000A
+    SURVEY_REACHABILITY = 0x0100
+    SURVEY_PREPARE_PAIR = 0x0101
+    SURVEY_START_PAIR = 0x0102
+    SURVEY_ABORT = 0x0103
     ML_START_COLLECTION = 0x8000
     ML_START_FAST_RANGING = 0x8001
 
@@ -116,6 +125,10 @@ class TlvId(IntEnum):
     DIAG_FRAGMENT_COUNT = 0x56
     DIAG_SOURCE = 0x57
     UWB_CIR_START_INDEX = 0x58
+    SURVEY_ANCHOR_A_ID = 0x60
+    SURVEY_ANCHOR_B_ID = 0x61
+    SURVEY_PAIR_DISTANCE_MM = 0x62
+    SURVEY_PAIR_STATUS = 0x63
 
 
 @dataclass(frozen=True)
@@ -475,6 +488,33 @@ def build_ml_start_fast_ranging_packet(
     )
 
 
+def build_survey_start_pair_packet(
+    *,
+    source_id: int,
+    destination_id: int,
+    session_id: int,
+    sequence: int,
+    sample_count: int | None = None,
+    discovery_slot_count: int | None = None,
+) -> bytes:
+    """Build a ``CMD_SURVEY_START_PAIR`` command proto_packet.
+
+    The firmware-side all-pair survey flow is still expected to settle. Keeping
+    this helper separate gives the GUI one small callsite to update when the
+    exact command payload is finalized.
+    """
+
+    return _build_ml_start_packet(
+        command_id=CommandId.SURVEY_START_PAIR,
+        source_id=source_id,
+        destination_id=destination_id,
+        session_id=session_id,
+        sequence=sequence,
+        sample_count=sample_count,
+        discovery_slot_count=discovery_slot_count,
+    )
+
+
 def packet_summary(packet: ImecPacket) -> str:
     try:
         name = MessageType(packet.msg_type).name
@@ -527,7 +567,67 @@ def command_sample_count_from_packet(packet: ImecPacket) -> int | None:
 def records_from_packet(packet: ImecPacket) -> list[ParsedRecord]:
     if packet.msg_type == MessageType.CLICK_REPORT:
         return _ml_sample_records(packet)
+    if packet.msg_type == MessageType.SURVEY_PAIR_RESULT:
+        return _survey_pair_records(packet)
     return []
+
+
+def _survey_pair_records(packet: ImecPacket) -> list[ParsedRecord]:
+    tlvs = decode_tlvs(packet.payload)
+    anchor_a = read_uint(first_tlv(tlvs, TlvId.SURVEY_ANCHOR_A_ID))
+    anchor_b = read_uint(first_tlv(tlvs, TlvId.SURVEY_ANCHOR_B_ID))
+
+    repeated_anchor_ids = tlvs.get(int(TlvId.ANCHOR_ID), [])
+    if anchor_a is None and len(repeated_anchor_ids) >= 1:
+        anchor_a = read_uint(repeated_anchor_ids[0])
+    if anchor_b is None and len(repeated_anchor_ids) >= 2:
+        anchor_b = read_uint(repeated_anchor_ids[1])
+    if anchor_a is None:
+        anchor_a = packet.source_id
+    if anchor_b is None and len(repeated_anchor_ids) == 1:
+        anchor_b = read_uint(repeated_anchor_ids[0])
+
+    distance_mm = read_int(first_tlv(tlvs, TlvId.SURVEY_PAIR_DISTANCE_MM))
+    if distance_mm is None:
+        distance_mm = read_int(first_tlv(tlvs, TlvId.DISTANCE_MM))
+    if distance_mm is None:
+        sample_array = first_tlv(tlvs, TlvId.DISTANCE_SAMPLES_MM)
+        if sample_array and len(sample_array) >= 4:
+            distance_mm = struct.unpack_from("<i", sample_array, 0)[0]
+
+    range_status = read_uint(first_tlv(tlvs, TlvId.SURVEY_PAIR_STATUS))
+    if range_status is None:
+        range_status = read_uint(first_tlv(tlvs, TlvId.RANGE_STATUS))
+    sample_count = read_uint(first_tlv(tlvs, TlvId.SAMPLE_COUNT))
+    event_seq = read_uint(first_tlv(tlvs, TlvId.EVENT_SEQ))
+    timestamp_ms = read_uint(first_tlv(tlvs, TlvId.TIMESTAMP_MS))
+    quality = read_uint(first_tlv(tlvs, TlvId.QUALITY))
+
+    ok = range_status in (None, 0)
+    if anchor_a is None or anchor_b is None or distance_mm is None:
+        return []
+    distance_m = None
+    if distance_mm >= 0 and ok:
+        distance_m = distance_mm / 1000.0
+
+    return [
+        ParsedRecord(
+            kind="survey_pair" if ok else "survey_pair_failure",
+            anchor_id=format_device_id(anchor_a),
+            peer_anchor_id=format_device_id(anchor_b),
+            sample_index=0,
+            distance_m=distance_m,
+            scheduled_sample_count=sample_count,
+            event_seq=event_seq,
+            firmware_timestamp_ms=timestamp_ms,
+            quality=quality,
+            status=_range_status_text(range_status),
+            error_code=None if ok else str(range_status),
+            source="survey_pair_result",
+            raw_line=packet_summary(packet),
+            tlv_json=_tlvs_to_json(tlvs),
+        )
+    ]
 
 
 def _ml_sample_records(packet: ImecPacket) -> list[ParsedRecord]:

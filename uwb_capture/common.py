@@ -53,6 +53,7 @@ def safe_filename(value: str) -> str:
 class ParsedRecord:
     kind: str
     anchor_id: str | None = None
+    peer_anchor_id: str | None = None
     clicker_id: str | None = None
     sample_index: int | None = None
     distance_m: float | None = None
