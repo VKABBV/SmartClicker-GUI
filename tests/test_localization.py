@@ -75,12 +75,12 @@ class LocalizationSolverTests(unittest.TestCase):
         scenario = build_square_simulation(
             width_m=7.0,
             height_m=7.0,
-            true_x_m=3.1,
-            true_y_m=4.2,
+            clicker_x_m=3.1,
+            clicker_y_m=4.2,
         )
 
         result = solve_position(list(scenario.readings))
-        position_error = math.hypot(result.x_m - scenario.true_x_m, result.y_m - scenario.true_y_m)
+        position_error = math.hypot(result.x_m - scenario.clicker_x_m, result.y_m - scenario.clicker_y_m)
 
         self.assertIn("weighted least squares", LOCALIZATION_ALGORITHM.lower())
         self.assertLess(position_error, 1e-4)
@@ -90,13 +90,13 @@ class LocalizationSolverTests(unittest.TestCase):
         scenario = build_square_simulation(
             width_m=8.0,
             height_m=5.0,
-            true_x_m=2.75,
-            true_y_m=2.25,
+            clicker_x_m=2.75,
+            clicker_y_m=2.25,
             noise_m=0.08,
         )
 
         result = solve_position(list(scenario.readings))
-        position_error = math.hypot(result.x_m - scenario.true_x_m, result.y_m - scenario.true_y_m)
+        position_error = math.hypot(result.x_m - scenario.clicker_x_m, result.y_m - scenario.clicker_y_m)
 
         self.assertLess(position_error, 0.12)
         self.assertLess(result.rmse_m, 0.08)

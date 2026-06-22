@@ -34,9 +34,10 @@ estimated X/Y point, residual RMSE in meters, confidence, and per-anchor
 residuals.
 
 Use `Run Square Simulation` to fill a four-anchor square/floor-plan test with
-fake ranges, solve it, and plot both the simulated true point and estimated
-point. This is a quick way to validate the algorithm before using real anchor
-coordinates.
+fake ranges, solve it, and plot both the simulated clicker reference point and
+estimated point. The anchor X/Y fields are the known anchor placements; the
+simulated clicker point exists only to generate fake test ranges and calculate
+simulation error before using real capture data.
 
 ## Bluetooth Protocol Workflow
 

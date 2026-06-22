@@ -58,8 +58,8 @@ class LocalizationResult:
 class SimulatedLocalizationScenario:
     """Deterministic fake anchor ranges for GUI and regression testing."""
 
-    true_x_m: float
-    true_y_m: float
+    clicker_x_m: float
+    clicker_y_m: float
     readings: tuple[LocalizationReading, ...]
 
 
@@ -104,8 +104,8 @@ def build_square_simulation(
     *,
     width_m: float = 7.0,
     height_m: float = 7.0,
-    true_x_m: float = 3.1,
-    true_y_m: float = 4.2,
+    clicker_x_m: float = 3.1,
+    clicker_y_m: float = 4.2,
     sigma_m: float = 0.05,
     noise_m: float = 0.0,
 ) -> SimulatedLocalizationScenario:
@@ -117,8 +117,8 @@ def build_square_simulation(
 
     if width_m <= 0 or height_m <= 0:
         raise ValueError("Simulation width and height must be greater than 0.")
-    if true_x_m < 0 or true_x_m > width_m or true_y_m < 0 or true_y_m > height_m:
-        raise ValueError("Simulated true position must be inside the square.")
+    if clicker_x_m < 0 or clicker_x_m > width_m or clicker_y_m < 0 or clicker_y_m > height_m:
+        raise ValueError("Simulated clicker position must be inside the square.")
     if sigma_m <= 0:
         raise ValueError("Simulation sigma must be greater than 0.")
     if noise_m < 0:
@@ -132,7 +132,7 @@ def build_square_simulation(
     )
     readings = []
     for anchor_id, x_m, y_m, noise_scale in anchors:
-        true_range = math.hypot(true_x_m - x_m, true_y_m - y_m)
+        true_range = math.hypot(clicker_x_m - x_m, clicker_y_m - y_m)
         measured_range = max(true_range + noise_m * noise_scale, 0.05)
         readings.append(
             LocalizationReading(
@@ -144,8 +144,8 @@ def build_square_simulation(
             )
         )
     return SimulatedLocalizationScenario(
-        true_x_m=true_x_m,
-        true_y_m=true_y_m,
+        clicker_x_m=clicker_x_m,
+        clicker_y_m=clicker_y_m,
         readings=tuple(readings),
     )
 
