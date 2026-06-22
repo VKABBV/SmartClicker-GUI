@@ -71,11 +71,13 @@ Payload TLVs:
 
 | TLV | Type | Length | Required | Meaning |
 | --- | ---: | ---: | --- | --- |
-| `TLV_COMMAND_ID` | `0x10` | 2 | Yes | `CMD_ML_START_COLLECTION = 0x8000` |
+| `TLV_COMMAND_ID` | `0x10` | 2 | Yes | `CMD_ML_START_COLLECTION = 0x8000` or `CMD_ML_START_FAST_RANGING = 0x8001` |
 | `TLV_SAMPLE_COUNT` | `0x0F` | 1 or 2 | No | Samples per selected anchor. Valid range is `1..100`; default build value is `8`. |
 | `TLV_DISCOVERY_SLOT_COUNT` | `0x4C` | 1 or 2 | No | Fresh discovery reply slots and selected-anchor cap. Valid range is `1..8`; default build value is `8`. |
 
-Every command starts a fresh UWB discovery pass, then schedules up to the configured discovery slot count. The current ML firmware supports up to eight scheduled anchors per collection.
+`CMD_ML_START_COLLECTION` is the full diagnostics / CIR mode. It preserves the existing behavior: fresh UWB discovery, scheduled range samples, and post-burst diagnostic/CIR packets.
+
+`CMD_ML_START_FAST_RANGING` is range-data only. It uses the same packet framing and sample-count/discovery-slot TLVs, but intentionally emits only scheduled range sample reports plus the final command result. The firmware may skip fresh discovery when at least four anchors have actively ranged within the last 30 seconds; otherwise it falls back to fresh discovery automatically. The GUI does not decide whether the cache is valid.
 
 ## Collection Limits And Timeouts
 
@@ -88,10 +90,10 @@ Current limits:
 | Selected anchors per collection | `1..8`, capped by `TLV_DISCOVERY_SLOT_COUNT` |
 | Samples per selected anchor | `1..100` |
 | Maximum scheduled sample notifications | `8 * 100 = 800` |
-| Scheduled sample stride | `60000 us` |
-| Maximum scheduled UWB burst | about `48 s` |
+| Scheduled sample stride | `33000 us` |
+| Maximum scheduled UWB burst | about `26.4 s` |
 
-Use a command-result timeout of at least `60 s` for maximum-size captures; `75 s` is a practical GUI default because it also covers discovery, post-burst diagnostics, BLE notification drain, and host scheduling jitter. Do not treat a lack of packet notifications during the UWB burst as a disconnect: the ML firmware intentionally keeps BLE quiet while ranging, buffers scheduled sample records, then sends them after the UWB burst.
+Use the longer full-diagnostics command-result timeout for `CMD_ML_START_COLLECTION`; `75 s` is a practical GUI default because it covers discovery, post-burst diagnostics, BLE notification drain, and host scheduling jitter. Fast ranging can use a shorter timeout, but should still allow the maximum scheduled burst, discovery fallback, BLE drain, and host scheduling jitter.
 
 For progress display, expect `selected_anchor_count * requested_samples_per_anchor` scheduled sample notifications when at least one anchor is found. Failed DS-TWR attempts are still emitted as sample rows with non-zero `TLV_RANGE_STATUS`, so they count toward progress and should be stored.
 
@@ -102,10 +104,12 @@ Subscribe to `Packet TX` and parse complete COBS-delimited frames. During a coll
 | Message | Meaning |
 | --- | --- |
 | `MSG_CLICK_REPORT = 0x20` with `FLAG_DIAGNOSTIC = 0x10` | One ML range sample notification. Store these as training rows. |
-| `MSG_CLICK_REPORT = 0x20` with `FLAG_DIAGNOSTIC = 0x10` and no `TLV_SAMPLE_COUNT` | One post-burst diagnostic packet for an anchor. Store these with the matching collection/anchor, not as training rows. |
+| `MSG_CLICK_REPORT = 0x20` with `FLAG_DIAGNOSTIC = 0x10` and no `TLV_SAMPLE_COUNT` | Full diagnostics mode only: one post-burst diagnostic packet for an anchor. Store these with the matching collection/anchor, not as training rows. |
 | `MSG_COMMAND_RESULT = 0x41` with `FLAG_DIAGNOSTIC = 0x10` | Final command result for the trigger. `FLAG_ERROR = 0x40` is set when status is not OK. |
 
 The GUI should not wait for the command result before collecting samples. The ML clicker keeps BLE packet and log notifications quiet while the UWB collection is active, buffers sample packets in firmware, then emits the buffered `MSG_CLICK_REPORT` frames in schedule order before the final command result.
+
+For fast ranging, absence of post-burst diagnostic/CIR packets is expected and should not be reported as packet loss.
 
 ## ML Sample TLVs
 
@@ -240,10 +244,10 @@ If at least one anchor replies but fewer than the configured discovery slot coun
 ## Practical GUI Behavior
 
 1. Scan for `IMEC ML Clicker`, connect, discover the service, and subscribe to `Packet TX`.
-2. Send one `CMD_ML_START_COLLECTION` command with the desired sample count.
+2. Send one `CMD_ML_START_COLLECTION` command for full diagnostics / CIR, or `CMD_ML_START_FAST_RANGING` for range-data-only collection, with the desired sample count.
 3. Buffer and decode every `Packet TX` notification until the matching command result arrives. Samples may arrive as a post-UWB burst rather than one-by-one during ranging.
-4. Save every `MSG_CLICK_REPORT | FLAG_DIAGNOSTIC` packet. Rows with `TLV_SAMPLE_COUNT` are scheduled training samples; rows without it are post-burst diagnostics.
+4. Save every `MSG_CLICK_REPORT | FLAG_DIAGNOSTIC` packet. Rows with `TLV_SAMPLE_COUNT` are scheduled training samples, including failed rows with nonzero `TLV_RANGE_STATUS`; rows without it are post-burst diagnostics and are expected only in full diagnostics mode.
 5. Treat `COMMAND_BUSY` as a retryable state; wait for the prior collection to finish before sending another command.
-6. Keep the BLE connection open between captures. The firmware runs fresh UWB discovery for every command, so the GUI does not need to manage anchor identity or cache discovery results.
+6. Keep the BLE connection open between captures. The GUI does not manage anchor identity or cache discovery results; fast ranging either uses the firmware's recent ranging cache or falls back to fresh discovery.
 
 Source-of-truth implementation files are `firmware/include/protocol.h`, `firmware/include/report.h`, `firmware/src/serial_frame.c`, and `firmware/app/src/main.c`.

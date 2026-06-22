@@ -41,6 +41,7 @@ from .protocol import (
     MessageType,
     ProtocolError,
     build_ml_start_collection_packet,
+    build_ml_start_fast_ranging_packet,
     command_result_summary,
     command_sample_count_from_packet,
     command_status_from_packet,
@@ -55,6 +56,22 @@ from .store import MeasurementStore
 
 APP_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT_DIR = APP_DIR / "Measurements" / "GUI_Captures"
+ML_COLLECTION_MODE_FULL = "full_diagnostics"
+ML_COLLECTION_MODE_FAST = "fast_ranging"
+ML_COLLECTION_MODE_LABELS = {
+    ML_COLLECTION_MODE_FULL: "Full diagnostics / CIR",
+    ML_COLLECTION_MODE_FAST: "Fast ranging only",
+}
+ML_COLLECTION_MODE_DETAILS = {
+    ML_COLLECTION_MODE_FULL: (
+        "Full diagnostics / CIR sends 0x8000 and keeps post-burst diagnostic/CIR handling."
+    ),
+    ML_COLLECTION_MODE_FAST: (
+        "Fast ranging only sends 0x8001, stores range rows only, and expects no post-burst CIR."
+    ),
+}
+FULL_DIAGNOSTICS_COMMAND_TIMEOUT_MS = 75_000
+FAST_RANGING_COMMAND_TIMEOUT_MS = 45_000
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _BT_DEBUG_RE = re.compile(r"<(?:dbg|err|wrn|inf)> bt_|bt_\w+:", re.IGNORECASE)
@@ -145,6 +162,10 @@ class UwbCaptureApp(tk.Tk):
         self.ml_command_in_flight = False
         self.ml_pending_session: int | None = None
         self.ml_pending_seq: int | None = None
+        self.ml_pending_mode: str | None = None
+        self.ml_timeout_after_id: str | None = None
+        self.ml_expected_sample_notifications: int | None = None
+        self.ml_received_sample_notifications = 0
         self.capture_active = False
         self.current_session_id: str | None = None
         self.store: MeasurementStore | None = None
@@ -183,6 +204,8 @@ class UwbCaptureApp(tk.Tk):
         self.ml_session_id_var = tk.StringVar(value=str(self.protocol_session_seed))
         self.ml_sample_count_var = tk.StringVar(value="8")
         self.ml_discovery_slot_count_var = tk.StringVar(value="8")
+        self.ml_collection_mode_var = tk.StringVar(value=ML_COLLECTION_MODE_FULL)
+        self.ml_mode_detail_var = tk.StringVar(value=ML_COLLECTION_MODE_DETAILS[ML_COLLECTION_MODE_FULL])
         self.constellation_var = tk.StringVar()
         self.los_var = tk.BooleanVar(value=True)
         self.nlos_var = tk.BooleanVar(value=False)
@@ -427,21 +450,46 @@ class UwbCaptureApp(tk.Tk):
             pady=2,
         )
 
+        ttk.Label(control, text="Collection mode").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        mode_frame = ttk.Frame(control)
+        mode_frame.grid(row=4, column=1, columnspan=3, sticky="ew", padx=(6, 0), pady=(8, 0))
+        for column in range(2):
+            mode_frame.columnconfigure(column, weight=1)
+        ttk.Radiobutton(
+            mode_frame,
+            text=ML_COLLECTION_MODE_LABELS[ML_COLLECTION_MODE_FULL],
+            value=ML_COLLECTION_MODE_FULL,
+            variable=self.ml_collection_mode_var,
+            command=self._update_ml_mode_detail,
+        ).grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Radiobutton(
+            mode_frame,
+            text=ML_COLLECTION_MODE_LABELS[ML_COLLECTION_MODE_FAST],
+            value=ML_COLLECTION_MODE_FAST,
+            variable=self.ml_collection_mode_var,
+            command=self._update_ml_mode_detail,
+        ).grid(row=0, column=1, sticky="w")
+        ttk.Label(
+            control,
+            textvariable=self.ml_mode_detail_var,
+            wraplength=320,
+        ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(4, 0))
+
         self.ml_collect_button = ttk.Button(
             control,
             text="Trigger ML Collection",
             style="Accent.TButton",
             command=self.send_ml_start_collection,
         )
-        self.ml_collect_button.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self.ml_collect_button.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         ttk.Label(
             control,
-            text="Sends one CMD_ML_START_COLLECTION. The clicker runs fresh UWB discovery, buffers scheduled samples, then sends post-burst notifications.",
+            text="Sample count and discovery slots are sent with either command. Fast mode lets firmware reuse a recent four-anchor ranging cache or run discovery automatically.",
             wraplength=320,
-        ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(4, 0))
         self.ml_status_var = tk.StringVar(value="No collection command sent")
         ttk.Label(control, textvariable=self.ml_status_var, style="Status.TLabel").grid(
-            row=6,
+            row=8,
             column=0,
             columnspan=4,
             sticky="w",
@@ -703,6 +751,106 @@ class UwbCaptureApp(tk.Tk):
         self.pending_diagnostics.clear()
         self.cir_reassembly_groups.clear()
 
+    def _ml_collection_mode(self, override: str | None = None) -> str:
+        mode = override if override is not None else self.ml_collection_mode_var.get()
+        if mode not in ML_COLLECTION_MODE_LABELS:
+            raise ProtocolError("Collection mode must be Full diagnostics / CIR or Fast ranging only.")
+        return mode
+
+    def _update_ml_mode_detail(self) -> None:
+        try:
+            mode = self._ml_collection_mode()
+        except ProtocolError:
+            mode = ML_COLLECTION_MODE_FULL
+            self.ml_collection_mode_var.set(mode)
+        self.ml_mode_detail_var.set(ML_COLLECTION_MODE_DETAILS[mode])
+
+    @staticmethod
+    def _ml_command_name(mode: str) -> str:
+        if mode == ML_COLLECTION_MODE_FAST:
+            return "ML_START_FAST_RANGING"
+        return "ML_START_COLLECTION"
+
+    @staticmethod
+    def _ml_command_timeout_ms(mode: str) -> int:
+        if mode == ML_COLLECTION_MODE_FAST:
+            return FAST_RANGING_COMMAND_TIMEOUT_MS
+        return FULL_DIAGNOSTICS_COMMAND_TIMEOUT_MS
+
+    @staticmethod
+    def _ml_expected_sample_notifications(
+        sample_count: int | None,
+        discovery_slot_count: int | None,
+    ) -> int | None:
+        if sample_count is None or discovery_slot_count is None:
+            return None
+        return sample_count * discovery_slot_count
+
+    def _ml_progress_text(self) -> str:
+        received = self.ml_received_sample_notifications
+        expected = self.ml_expected_sample_notifications
+        if expected is None:
+            return f"{received} sample row(s) received"
+        return f"{received}/{expected} sample row(s) received"
+
+    def _update_ml_progress_status(self) -> None:
+        if not self.ml_command_in_flight or not hasattr(self, "ml_status_var"):
+            return
+        mode = self.ml_pending_mode or ML_COLLECTION_MODE_FULL
+        self.ml_status_var.set(f"{ML_COLLECTION_MODE_LABELS[mode]}: {self._ml_progress_text()}")
+
+    def _note_ml_sample_notification(self, record: ParsedRecord) -> None:
+        if not self.ml_command_in_flight:
+            return
+        if record.scheduled_sample_count is not None:
+            self.ml_expected_sample_notifications = record.scheduled_sample_count
+        self.ml_received_sample_notifications += 1
+        self._update_ml_progress_status()
+
+    def _start_ml_command_timeout(self, mode: str) -> None:
+        self._cancel_ml_command_timeout()
+        self.ml_timeout_after_id = self.after(
+            self._ml_command_timeout_ms(mode),
+            self._handle_ml_command_timeout,
+        )
+
+    def _cancel_ml_command_timeout(self) -> None:
+        after_id = self.ml_timeout_after_id
+        self.ml_timeout_after_id = None
+        if after_id is None:
+            return
+        try:
+            self.after_cancel(after_id)
+        except Exception:
+            pass
+
+    def _clear_ml_command_tracking(self) -> None:
+        self.ml_command_in_flight = False
+        self.ml_pending_session = None
+        self.ml_pending_seq = None
+        self.ml_pending_mode = None
+        self.ml_expected_sample_notifications = None
+        self.ml_received_sample_notifications = 0
+
+    def _handle_ml_command_timeout(self) -> None:
+        self.ml_timeout_after_id = None
+        if not self.ml_command_in_flight:
+            return
+        mode = self.ml_pending_mode or ML_COLLECTION_MODE_FULL
+        progress = self._ml_progress_text()
+        timeout_s = self._ml_command_timeout_ms(mode) / 1000
+        self._flush_diagnostics_to_all_samples()
+        self._clear_ml_command_tracking()
+        self._set_ml_collect_state(False)
+        self._reset_trigger_collection_state()
+        label = ML_COLLECTION_MODE_LABELS[mode]
+        self.log_raw(
+            f"# {label} timed out after {timeout_s:.0f}s without final command result "
+            f"({progress})."
+        )
+        if hasattr(self, "ml_status_var"):
+            self.ml_status_var.set(f"{label} timed out ({progress})")
+
     def choose_output_dir(self) -> None:
         path = filedialog.askdirectory(initialdir=self.output_dir_var.get(), parent=self)
         if not path:
@@ -786,7 +934,7 @@ class UwbCaptureApp(tk.Tk):
             self.session_status_var.set(f"Stopped: {counts['samples']} samples, {counts['alerts']} alerts")
             self.log_raw(f"# Stopped session {self.current_session_id}")
 
-    def send_ml_start_collection(self) -> bool:
+    def send_ml_start_collection(self, *, collection_mode: str | None = None) -> bool:
         if self.bluetooth_worker is None:
             self.log_raw("# Did not send ML collection; Bluetooth is not connected.")
             return False
@@ -794,6 +942,7 @@ class UwbCaptureApp(tk.Tk):
             self.log_raw("# ML collection already in flight; wait for the command result before retrying.")
             return False
         try:
+            mode = self._ml_collection_mode(collection_mode)
             sample_count = self._ml_sample_count()
             discovery_slots = self._ml_discovery_slot_count()
             session_id = self._ml_session_id()
@@ -802,7 +951,12 @@ class UwbCaptureApp(tk.Tk):
                 raise ProtocolError("Host ID must be a stable non-zero device ID.")
             destination_id = parse_device_id(self.clicker_id_var.get(), default=0)
             self.protocol_sequence = next_sequence(self.protocol_sequence)
-            packet = build_ml_start_collection_packet(
+            builder = (
+                build_ml_start_fast_ranging_packet
+                if mode == ML_COLLECTION_MODE_FAST
+                else build_ml_start_collection_packet
+            )
+            packet = builder(
                 source_id=source_id,
                 destination_id=destination_id,
                 session_id=session_id,
@@ -821,9 +975,18 @@ class UwbCaptureApp(tk.Tk):
         self.ml_command_in_flight = True
         self.ml_pending_session = session_id
         self.ml_pending_seq = self.protocol_sequence
+        self.ml_pending_mode = mode
+        self.ml_received_sample_notifications = 0
+        self.ml_expected_sample_notifications = self._ml_expected_sample_notifications(
+            sample_count,
+            discovery_slots,
+        )
+        self._start_ml_command_timeout(mode)
         self._set_ml_collect_state(True)
+        self._update_ml_progress_status()
+        command_name = self._ml_command_name(mode)
         self.log_raw(
-            f"# Queued ML_START_COLLECTION to {self.clicker_id_var.get().strip() or 'broadcast'} "
+            f"# Queued {command_name} to {self.clicker_id_var.get().strip() or 'broadcast'} "
             f"(session={session_id} seq={self.protocol_sequence})"
         )
         return True
@@ -856,8 +1019,9 @@ class UwbCaptureApp(tk.Tk):
         if hasattr(self, "ml_collect_button"):
             self.ml_collect_button.configure(state="disabled" if in_flight else "normal")
         if hasattr(self, "ml_status_var"):
+            mode = self.ml_pending_mode or ML_COLLECTION_MODE_FULL
             self.ml_status_var.set(
-                "Collection in flight..." if in_flight else "Ready to collect"
+                f"{ML_COLLECTION_MODE_LABELS[mode]} in flight..." if in_flight else "Ready to collect"
             )
 
     def handle_protocol_packet(self, data: bytes) -> None:
@@ -891,33 +1055,55 @@ class UwbCaptureApp(tk.Tk):
         )
         if not matches:
             return
+        mode = self.ml_pending_mode or ML_COLLECTION_MODE_FULL
         status = command_status_from_packet(packet)
         sample_count = command_sample_count_from_packet(packet)
-        self.ml_command_in_flight = False
-        self.ml_pending_session = None
-        self.ml_pending_seq = None
+        self._cancel_ml_command_timeout()
+        progress = self._ml_progress_text()
+        self._clear_ml_command_tracking()
         self._set_ml_collect_state(False)
         self._flush_diagnostics_to_all_samples()
         self._reset_trigger_collection_state()
         samples_text = f" ({sample_count} sample notifications)" if sample_count is not None else ""
         if status == CommandStatus.COMMAND_BUSY:
-            self.log_raw("# ML collection rejected as BUSY; wait for the prior collection to finish, then retry.")
+            if mode == ML_COLLECTION_MODE_FAST:
+                self.log_raw("# Fast ranging rejected as BUSY; wait for the prior request to finish, then retry.")
+            else:
+                self.log_raw("# ML collection rejected as BUSY; wait for the prior collection to finish, then retry.")
             if hasattr(self, "ml_status_var"):
                 self.ml_status_var.set("Busy - retry after prior collection finishes")
         elif status == CommandStatus.COMMAND_TIMEOUT:
-            self.log_raw(
-                f"# ML collection timed out with no anchor replies{samples_text}. "
-                "Check anchor placement/power and retry."
-            )
+            if mode == ML_COLLECTION_MODE_FAST:
+                self.log_raw(
+                    f"# Fast ranging timed out with no anchor replies{samples_text}. "
+                    "Firmware may have attempted fresh discovery; check anchor placement/power and retry."
+                )
+            else:
+                self.log_raw(
+                    f"# ML collection timed out with no anchor replies{samples_text}. "
+                    "Check anchor placement/power and retry."
+                )
             if hasattr(self, "ml_status_var"):
                 self.ml_status_var.set("Timeout - no anchors replied")
         elif status is None or status == CommandStatus.COMMAND_OK:
-            self.log_raw(f"# ML collection command result: OK{samples_text}")
+            if mode == ML_COLLECTION_MODE_FAST:
+                self.log_raw(
+                    f"# Fast ranging command result: OK{samples_text}; no post-burst CIR expected."
+                )
+            else:
+                self.log_raw(f"# ML collection command result: OK{samples_text}")
             if hasattr(self, "ml_status_var"):
-                self.ml_status_var.set(f"Collection complete{samples_text}")
+                if mode == ML_COLLECTION_MODE_FAST:
+                    suffix = samples_text or f" ({progress})"
+                    self.ml_status_var.set(f"Fast ranging complete{suffix}")
+                else:
+                    self.ml_status_var.set(f"Collection complete{samples_text}")
         else:
             name = _command_status_name(status)
-            self.log_raw(f"# ML collection command result: {name}{samples_text}")
+            if mode == ML_COLLECTION_MODE_FAST:
+                self.log_raw(f"# Fast ranging command result: {name}{samples_text}")
+            else:
+                self.log_raw(f"# ML collection command result: {name}{samples_text}")
             if hasattr(self, "ml_status_var"):
                 self.ml_status_var.set(f"Result: {name}{samples_text}")
 
@@ -997,6 +1183,8 @@ class UwbCaptureApp(tk.Tk):
             if record.kind == "diagnostic_fragment":
                 self._buffer_diagnostic_fragment(record)
                 continue
+            if record.kind in ("sample", "failure"):
+                self._note_ml_sample_notification(record)
             if self.store is not None and self.current_session_id is not None:
                 if record.kind == "summary":
                     self.store.insert_summary(self.current_session_id, record)
@@ -1385,6 +1573,7 @@ class UwbCaptureApp(tk.Tk):
             if not proceed:
                 return
             self.stop_capture()
+        self._cancel_ml_command_timeout()
         self.disconnect_transport()
         if self.store is not None:
             self.store.close()

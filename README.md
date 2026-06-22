@@ -40,11 +40,12 @@ operator and is always estimated from anchor ranges. The visible simulation
 controls only set the floor-plan width and height. The plot can be opened in
 fullscreen from the `Fullscreen` button beside the layout preview.
 
-Use `Start Live Tracking` to send `CMD_ML_START_COLLECTION` to the clicker every
-configured number of seconds. Returned anchors are added to the localization
-table as their ranges arrive. Enter each returned anchor's real X/Y coordinate;
-after at least three anchors have coordinates and ranges, the GUI updates the
-estimated clicker position with the same radical-axis solver.
+Use `Start Live Tracking` to send range-data-only
+`CMD_ML_START_FAST_RANGING` requests to the clicker every configured number of
+seconds. Returned anchors are added to the localization table as their ranges
+arrive. Enter each returned anchor's real X/Y coordinate; after at least three
+anchors have coordinates and ranges, the GUI updates the estimated clicker
+position with the same radical-axis solver.
 
 ## Bluetooth Protocol Workflow
 
@@ -74,6 +75,8 @@ CMD_SURVEY_REACHABILITY 0x0100
 CMD_SURVEY_PREPARE_PAIR 0x0101
 CMD_SURVEY_START_PAIR   0x0102
 CMD_SURVEY_ABORT        0x0103
+CMD_ML_START_COLLECTION 0x8000
+CMD_ML_START_FAST_RANGING 0x8001
 ```
 
 The command packets use the shared IMEC binary envelope and TLV payloads from

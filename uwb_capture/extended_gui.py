@@ -724,9 +724,9 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         if self.ml_command_in_flight:
             self.live_tracking_status_var.set("Waiting for the current range request to finish.")
         else:
-            sent = self.send_ml_start_collection()
+            sent = self.send_ml_start_collection(collection_mode=original.ML_COLLECTION_MODE_FAST)
             if sent:
-                self.live_tracking_status_var.set("Range request sent; waiting for anchor replies.")
+                self.live_tracking_status_var.set("Fast range request sent; waiting for anchor replies.")
             else:
                 self.stop_live_tracking("Live tracking stopped; range request was not sent.")
                 return
