@@ -37,7 +37,8 @@ Use `Run Square Simulation` to fill a four-anchor square/floor-plan test with
 fake ranges, solve it, and plot the estimated clicker point. The anchor X/Y
 fields are the known anchor placements; the clicker X/Y is not entered by the
 operator and is always estimated from anchor ranges. The visible simulation
-controls only set the floor-plan width and height.
+controls only set the floor-plan width and height. The plot can be opened in
+fullscreen from the `Fullscreen` button beside the layout preview.
 
 Use `Start Live Tracking` to send `CMD_ML_START_COLLECTION` to the clicker every
 configured number of seconds. Returned anchors are added to the localization

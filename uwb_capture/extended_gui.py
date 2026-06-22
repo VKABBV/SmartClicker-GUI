@@ -142,6 +142,8 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self.localization_row_order: list[str] = []
         self.localization_anchor_positions: dict[str, tuple[str, str]] = {}
         self.localization_result: LocalizationResult | None = None
+        self.localization_fullscreen_window: Any | None = None
+        self.localization_fullscreen_canvas: Any | None = None
         self.live_tracking_active = False
         self.live_tracking_after_id: str | None = None
         self._pyth_updating = False
@@ -408,7 +410,15 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         plot_frame = ttk.LabelFrame(output_frame, text="Layout Preview", padding=8)
         plot_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
         plot_frame.columnconfigure(0, weight=1)
-        plot_frame.rowconfigure(0, weight=1)
+        plot_frame.rowconfigure(1, weight=1)
+        plot_toolbar = ttk.Frame(plot_frame)
+        plot_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        plot_toolbar.columnconfigure(0, weight=1)
+        ttk.Button(
+            plot_toolbar,
+            text="Fullscreen",
+            command=self.open_localization_plot_fullscreen,
+        ).grid(row=0, column=1, sticky="e")
         self.localization_canvas = tk.Canvas(
             plot_frame,
             height=280,
@@ -416,7 +426,11 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             highlightthickness=1,
             highlightbackground="#d0d7de",
         )
-        self.localization_canvas.grid(row=0, column=0, sticky="nsew")
+        self.localization_canvas.grid(row=1, column=0, sticky="nsew")
+        self.localization_canvas.bind(
+            "<Configure>",
+            lambda _event: self._redraw_localization_canvas(self.localization_canvas),
+        )
         self._draw_empty_localization_plot()
 
     def _ensure_localization_row(self, anchor_id: str) -> dict[str, Any]:
@@ -849,9 +863,10 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self._draw_empty_localization_plot()
 
     def _draw_empty_localization_plot(self) -> None:
-        if not hasattr(self, "localization_canvas"):
-            return
-        canvas = self.localization_canvas
+        self._redraw_localization_canvas(getattr(self, "localization_canvas", None))
+        self._redraw_localization_canvas(getattr(self, "localization_fullscreen_canvas", None))
+
+    def _render_empty_localization_plot(self, canvas: Any) -> None:
         canvas.delete("all")
         canvas.create_text(
             18,
@@ -861,8 +876,86 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             fill="#57606a",
         )
 
+    def open_localization_plot_fullscreen(self) -> None:
+        window = getattr(self, "localization_fullscreen_window", None)
+        if window is not None:
+            try:
+                if window.winfo_exists():
+                    window.lift()
+                    window.focus_force()
+                    return
+            except tk.TclError:
+                self.localization_fullscreen_window = None
+                self.localization_fullscreen_canvas = None
+
+        window = tk.Toplevel(self)
+        window.title("Localization Plot")
+        window.configure(background="white")
+        self.localization_fullscreen_window = window
+
+        toolbar = ttk.Frame(window, padding=8)
+        toolbar.pack(fill=tk.X)
+        toolbar.columnconfigure(0, weight=1)
+        ttk.Label(toolbar, text="Localization Plot", style="Status.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Button(
+            toolbar,
+            text="Exit Fullscreen",
+            command=self.close_localization_plot_fullscreen,
+        ).grid(row=0, column=1, sticky="e")
+
+        canvas = tk.Canvas(
+            window,
+            background="white",
+            highlightthickness=0,
+        )
+        canvas.pack(fill=tk.BOTH, expand=True)
+        self.localization_fullscreen_canvas = canvas
+        canvas.bind("<Configure>", lambda _event: self._redraw_localization_canvas(canvas))
+        window.bind("<Escape>", lambda _event: self.close_localization_plot_fullscreen())
+        window.protocol("WM_DELETE_WINDOW", self.close_localization_plot_fullscreen)
+        try:
+            window.attributes("-fullscreen", True)
+        except tk.TclError:
+            try:
+                window.state("zoomed")
+            except tk.TclError:
+                pass
+        self._redraw_localization_canvas(canvas)
+
+    def close_localization_plot_fullscreen(self) -> None:
+        window = getattr(self, "localization_fullscreen_window", None)
+        self.localization_fullscreen_window = None
+        self.localization_fullscreen_canvas = None
+        if window is None:
+            return
+        try:
+            if window.winfo_exists():
+                window.destroy()
+        except tk.TclError:
+            pass
+
+    def _redraw_localization_canvas(self, canvas: Any) -> None:
+        if canvas is None:
+            return
+        try:
+            if not canvas.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        if self.localization_result is None:
+            self._render_empty_localization_plot(canvas)
+        else:
+            self._render_localization_plot(canvas, self.localization_result)
+
     def _draw_localization_plot(self, result: LocalizationResult) -> None:
-        canvas = self.localization_canvas
+        self._render_localization_plot(self.localization_canvas, result)
+        fullscreen_canvas = getattr(self, "localization_fullscreen_canvas", None)
+        if fullscreen_canvas is not None:
+            self._redraw_localization_canvas(fullscreen_canvas)
+
+    def _render_localization_plot(self, canvas: Any, result: LocalizationResult) -> None:
+        if not hasattr(self, "localization_canvas"):
+            return
         canvas.delete("all")
         width = max(canvas.winfo_width(), 420)
         height = max(canvas.winfo_height(), 260)
