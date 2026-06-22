@@ -71,6 +71,35 @@ class LocalizationSolverTests(unittest.TestCase):
         self.assertAlmostEqual(result.x_m, true_x, places=4)
         self.assertAlmostEqual(result.y_m, true_y, places=4)
 
+    def test_common_height_component_cancels_in_radical_axis_solve(self) -> None:
+        true_x = 2.6
+        true_y = 1.8
+        height_delta = 1.4
+        anchors = [
+            ("A1", 0.0, 0.0),
+            ("A2", 5.0, 0.0),
+            ("A3", 5.0, 4.0),
+            ("A4", 0.0, 4.0),
+        ]
+        readings = []
+        for anchor_id, x_m, y_m in anchors:
+            horizontal_distance = math.hypot(true_x - x_m, true_y - y_m)
+            readings.append(
+                LocalizationReading(
+                    anchor_id=anchor_id,
+                    x_m=x_m,
+                    y_m=y_m,
+                    range_m=math.hypot(horizontal_distance, height_delta),
+                )
+            )
+
+        result = solve_position(readings)
+
+        self.assertIn("radical-axis", LOCALIZATION_ALGORITHM.lower())
+        self.assertIn("least squares", LOCALIZATION_ALGORITHM.lower())
+        self.assertAlmostEqual(result.x_m, true_x, places=4)
+        self.assertAlmostEqual(result.y_m, true_y, places=4)
+
     def test_square_simulation_solves_inside_floor_plan(self) -> None:
         scenario = build_square_simulation(
             width_m=7.0,
@@ -79,7 +108,8 @@ class LocalizationSolverTests(unittest.TestCase):
 
         result = solve_position(list(scenario.readings))
 
-        self.assertIn("weighted least squares", LOCALIZATION_ALGORITHM.lower())
+        self.assertIn("radical-axis", LOCALIZATION_ALGORITHM.lower())
+        self.assertIn("least squares", LOCALIZATION_ALGORITHM.lower())
         self.assertGreaterEqual(result.x_m, 0.0)
         self.assertLessEqual(result.x_m, 7.0)
         self.assertGreaterEqual(result.y_m, 0.0)

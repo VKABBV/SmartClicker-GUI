@@ -28,10 +28,10 @@ independent labels.
 
 The extended GUI includes a `Localization` tab for anchor coordinates and tag
 position solving. Enter each anchor's X/Y coordinates in meters, load the latest
-captured ranges, then solve. The solver uses a radical-axis linear seed followed
-by iterative weighted least squares (Gauss-Newton WLS). Results report the
-estimated X/Y point, residual RMSE in meters, confidence, and per-anchor
-residuals.
+captured ranges, then solve. The solver subtracts squared anchor-range equations
+to form radical-axis lines, then performs least squares on those lines. Any
+common height term cancels during the subtraction. Results report the estimated
+X/Y point, radical-axis RMSE in meters, confidence, and line residuals.
 
 Use `Run Square Simulation` to fill a four-anchor square/floor-plan test with
 fake ranges, solve it, and plot the estimated clicker point. The anchor X/Y
@@ -95,7 +95,7 @@ PHY,channel,prf_mhz,preamble_code,preamble_symbols,data_rate_kbps,pac_size,ntm_1
 uwb_capture/common.py       shared helpers and ParsedRecord model
 uwb_capture/protocol.py     IMEC binary packet/TLV codec
 uwb_capture/bluetooth_io.py BLE scanner, connector, and packet writer
-uwb_capture/localization.py 2D radical-axis + WLS localization solver
+uwb_capture/localization.py 2D radical-axis line least-squares solver
 uwb_capture/parser.py       legacy text line parser
 uwb_capture/store.py        SQLite persistence and base workbook export
 uwb_capture/base_gui.py     base capture GUI

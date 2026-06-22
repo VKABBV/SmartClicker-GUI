@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 
-LOCALIZATION_ALGORITHM = "Radical-axis seed + iterative weighted least squares (Gauss-Newton WLS)"
+LOCALIZATION_ALGORITHM = "Radical-axis line least squares (range-difference LS)"
 
 
 @dataclass(frozen=True)
@@ -28,7 +28,7 @@ class LocalizationReading:
 
 @dataclass(frozen=True)
 class ProcessedReading:
-    """Validated range measurement prepared for weighted least squares."""
+    """Validated range measurement prepared for radical-axis solving."""
 
     anchor_id: str
     x_m: float
@@ -66,28 +66,24 @@ def solve_position(
     *,
     min_sigma_m: float = 0.01,
     min_range_m: float = 0.05,
-    max_iterations: int = 30,
-    tolerance_m: float = 1e-5,
 ) -> LocalizationResult:
-    """Solve a 2D position from at least three anchor range readings."""
+    """Solve a 2D position from radical-axis line least squares.
+
+    Subtracting squared range equations turns each anchor pair into a line. A
+    common vertical height term appears in every squared range, so it cancels
+    before the least-squares solve.
+    """
 
     processed = _preprocess_readings(
         readings,
         min_sigma_m=min_sigma_m,
         min_range_m=min_range_m,
     )
-    seed_x, seed_y = _radical_axis_seed(processed)
-    x, y = _weighted_least_squares(
-        processed,
-        seed_x=seed_x,
-        seed_y=seed_y,
-        max_iterations=max_iterations,
-        tolerance_m=tolerance_m,
-    )
-    residuals, rmse, confidence, warnings = _analyze_residuals(processed, x, y)
+    x, y = _solve_radical_axis_lines(processed)
+    residuals, rmse, confidence, warnings = _analyze_radical_axis_residuals(processed, x, y)
     return LocalizationResult(
-        seed_x_m=seed_x,
-        seed_y_m=seed_y,
+        seed_x_m=x,
+        seed_y_m=y,
         x_m=x,
         y_m=y,
         rmse_m=rmse,
@@ -179,10 +175,25 @@ def _preprocess_readings(
     return processed
 
 
-def _radical_axis_seed(readings: list[ProcessedReading]) -> tuple[float, float]:
+def _solve_radical_axis_lines(readings: list[ProcessedReading]) -> tuple[float, float]:
     a11 = a12 = a22 = 0.0
     b1 = b2 = 0.0
     row_count = 0
+    for first, second, rx, ry, rhs, weight in _radical_axis_rows(readings):
+        a11 += weight * rx * rx
+        a12 += weight * rx * ry
+        a22 += weight * ry * ry
+        b1 += weight * rx * rhs
+        b2 += weight * ry * rhs
+        row_count += 1
+    if row_count < 2:
+        raise ValueError("At least two independent anchor pairs are required.")
+    return _solve_2x2(a11, a12, a22, b1, b2, "anchor geometry is singular")
+
+
+def _radical_axis_rows(
+    readings: list[ProcessedReading],
+):
     for i, first in enumerate(readings):
         for second in readings[i + 1 :]:
             rx = 2.0 * (second.x_m - first.x_m)
@@ -195,54 +206,12 @@ def _radical_axis_seed(readings: list[ProcessedReading]) -> tuple[float, float]:
                 - first.x_m**2
                 - first.y_m**2
             )
-            weight = min(first.weight, second.weight)
-            a11 += weight * rx * rx
-            a12 += weight * rx * ry
-            a22 += weight * ry * ry
-            b1 += weight * rx * rhs
-            b2 += weight * ry * rhs
-            row_count += 1
-    if row_count < 2:
-        raise ValueError("At least two independent anchor pairs are required.")
-    return _solve_2x2(a11, a12, a22, b1, b2, "anchor geometry is singular")
+            if math.hypot(rx, ry) <= 1e-12:
+                continue
+            yield first, second, rx, ry, rhs, min(first.weight, second.weight)
 
 
-def _weighted_least_squares(
-    readings: list[ProcessedReading],
-    *,
-    seed_x: float,
-    seed_y: float,
-    max_iterations: int,
-    tolerance_m: float,
-) -> tuple[float, float]:
-    x = float(seed_x)
-    y = float(seed_y)
-    for _ in range(max_iterations):
-        a11 = a12 = a22 = 0.0
-        b1 = b2 = 0.0
-        for reading in readings:
-            dx = x - reading.x_m
-            dy = y - reading.y_m
-            predicted = max(math.hypot(dx, dy), 1e-9)
-            residual = predicted - reading.corrected_range_m
-            jx = dx / predicted
-            jy = dy / predicted
-            weight = reading.weight
-            a11 += weight * jx * jx
-            a12 += weight * jx * jy
-            a22 += weight * jy * jy
-            b1 += -weight * jx * residual
-            b2 += -weight * jy * residual
-
-        step_x, step_y = _solve_2x2(a11, a12, a22, b1, b2, "WLS solve failed")
-        x += step_x
-        y += step_y
-        if math.hypot(step_x, step_y) < tolerance_m:
-            break
-    return x, y
-
-
-def _analyze_residuals(
+def _analyze_radical_axis_residuals(
     readings: list[ProcessedReading],
     x_m: float,
     y_m: float,
@@ -251,24 +220,29 @@ def _analyze_residuals(
     weak_rmse_m: float = 0.35,
 ) -> tuple[dict[str, float], float, str, list[str]]:
     residuals: dict[str, float] = {}
-    residual_values: list[float] = []
+    weighted_residual_sum = 0.0
+    weight_total = 0.0
     warnings: list[str] = []
-    for reading in readings:
-        predicted = math.hypot(x_m - reading.x_m, y_m - reading.y_m)
-        residual = predicted - reading.corrected_range_m
-        residuals[reading.anchor_id] = residual
-        residual_values.append(residual)
+    for first, second, rx, ry, rhs, weight in _radical_axis_rows(readings):
+        line_length = math.hypot(rx, ry)
+        residual = (rx * x_m + ry * y_m - rhs) / line_length
+        pair_id = f"{first.anchor_id}-{second.anchor_id}"
+        residuals[pair_id] = residual
+        weighted_residual_sum += weight * residual * residual
+        weight_total += weight
         if abs(residual) > weak_rmse_m:
-            warnings.append(f"{reading.anchor_id} residual is {residual:.3f} m.")
+            warnings.append(f"{pair_id} radical-axis residual is {residual:.3f} m.")
 
-    rmse = math.sqrt(sum(value * value for value in residual_values) / len(residual_values))
+    if weight_total <= 0.0:
+        raise ValueError("At least two independent anchor pairs are required.")
+    rmse = math.sqrt(weighted_residual_sum / weight_total)
     if rmse <= good_rmse_m:
         confidence = "High"
     elif rmse <= weak_rmse_m:
         confidence = "Medium"
     else:
         confidence = "Low"
-        warnings.append("Residual RMSE is high; check anchor positions, NLOS, or bad ranges.")
+        warnings.append("Radical-axis RMSE is high; check anchor positions, NLOS, or bad ranges.")
     return residuals, rmse, confidence, warnings
 
 

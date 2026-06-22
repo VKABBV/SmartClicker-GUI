@@ -650,16 +650,13 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             "Units: meters",
             "",
             f"Estimated position: x={result.x_m:.3f} m, y={result.y_m:.3f} m",
-            f"Seed position: x={result.seed_x_m:.3f} m, y={result.seed_y_m:.3f} m",
-            f"RMSE: {result.rmse_m:.3f} m",
+            f"Radical-axis RMSE: {result.rmse_m:.3f} m",
             f"Confidence: {result.confidence}",
         ]
-        lines.extend(["", "Per-anchor residuals:"])
-        for reading in result.processed_readings:
-            residual = result.residuals_m.get(reading.anchor_id, 0.0)
+        lines.extend(["", "Radical-axis line residuals:"])
+        for pair_id, residual in sorted(result.residuals_m.items()):
             lines.append(
-                f"- {reading.anchor_id}: measured={reading.measured_range_m:.3f} m, "
-                f"corrected={reading.corrected_range_m:.3f} m, residual={residual:.3f} m"
+                f"- {pair_id}: residual={residual:.3f} m"
             )
         if result.warnings:
             lines.append("")
@@ -711,6 +708,14 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         height = max(canvas.winfo_height(), 260)
         points = [(reading.x_m, reading.y_m) for reading in result.processed_readings]
         points.append((result.x_m, result.y_m))
+        for reading in result.processed_readings:
+            radius = reading.corrected_range_m
+            points.extend(
+                [
+                    (reading.x_m - radius, reading.y_m - radius),
+                    (reading.x_m + radius, reading.y_m + radius),
+                ]
+            )
         min_x = min(x for x, _ in points)
         max_x = max(x for x, _ in points)
         min_y = min(y for _, y in points)
@@ -728,10 +733,25 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         min_y -= pad_y
         max_y += pad_y
         margin = 32
+        plot_width = width - 2 * margin
+        plot_height = height - 2 * margin
+        data_width = max(max_x - min_x, 1e-9)
+        data_height = max(max_y - min_y, 1e-9)
+        scale = min(plot_width / data_width, plot_height / data_height)
+        center_x_m = (min_x + max_x) / 2.0
+        center_y_m = (min_y + max_y) / 2.0
+        view_width_m = plot_width / scale
+        view_height_m = plot_height / scale
+        view_min_x = center_x_m - view_width_m / 2.0
+        view_max_x = center_x_m + view_width_m / 2.0
+        view_min_y = center_y_m - view_height_m / 2.0
+        view_max_y = center_y_m + view_height_m / 2.0
+        center_x_px = width / 2.0
+        center_y_px = height / 2.0
 
         def project(x_m: float, y_m: float) -> tuple[float, float]:
-            x = margin + ((x_m - min_x) / (max_x - min_x)) * (width - 2 * margin)
-            y = height - margin - ((y_m - min_y) / (max_y - min_y)) * (height - 2 * margin)
+            x = center_x_px + (x_m - center_x_m) * scale
+            y = center_y_px - (y_m - center_y_m) * scale
             return x, y
 
         canvas.create_rectangle(
@@ -741,14 +761,27 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             height - margin,
             outline="#d0d7de",
         )
-        canvas.create_text(margin, height - margin + 18, text=f"{min_x:.1f} m", anchor="n", fill="#57606a")
-        canvas.create_text(width - margin, height - margin + 18, text=f"{max_x:.1f} m", anchor="n", fill="#57606a")
-        canvas.create_text(margin - 8, height - margin, text=f"{min_y:.1f} m", anchor="e", fill="#57606a")
-        canvas.create_text(margin - 8, margin, text=f"{max_y:.1f} m", anchor="e", fill="#57606a")
+        canvas.create_text(margin, height - margin + 18, text=f"{view_min_x:.1f} m", anchor="n", fill="#57606a")
+        canvas.create_text(width - margin, height - margin + 18, text=f"{view_max_x:.1f} m", anchor="n", fill="#57606a")
+        canvas.create_text(margin - 8, height - margin, text=f"{view_min_y:.1f} m", anchor="e", fill="#57606a")
+        canvas.create_text(margin - 8, margin, text=f"{view_max_y:.1f} m", anchor="e", fill="#57606a")
         canvas.create_text(width / 2, height - 8, text="x position (m)", anchor="s", fill="#57606a")
         canvas.create_text(8, height / 2, text="y position (m)", anchor="w", fill="#57606a", angle=90)
 
         tag_x, tag_y = project(result.x_m, result.y_m)
+        for reading in result.processed_readings:
+            anchor_x, anchor_y = project(reading.x_m, reading.y_m)
+            radius_px = reading.corrected_range_m * scale
+            canvas.create_oval(
+                anchor_x - radius_px,
+                anchor_y - radius_px,
+                anchor_x + radius_px,
+                anchor_y + radius_px,
+                outline="#8ecae6",
+                width=1,
+                dash=(4, 3),
+            )
+
         for reading in result.processed_readings:
             anchor_x, anchor_y = project(reading.x_m, reading.y_m)
             canvas.create_line(anchor_x, anchor_y, tag_x, tag_y, fill="#d0d7de")
@@ -760,11 +793,10 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
                 fill="#0969da",
                 outline="",
             )
-            residual = result.residuals_m.get(reading.anchor_id, 0.0)
             canvas.create_text(
                 anchor_x + 8,
                 anchor_y - 8,
-                text=f"{reading.anchor_id}\n{reading.measured_range_m:.2f} m\nr={residual:+.2f}",
+                text=f"{reading.anchor_id}\nrange={reading.corrected_range_m:.2f} m",
                 anchor="sw",
                 fill="#24292f",
             )
