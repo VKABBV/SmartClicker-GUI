@@ -39,6 +39,12 @@ fields are the known anchor placements; the clicker X/Y is not entered by the
 operator and is always estimated from anchor ranges. The visible simulation
 controls only set the floor-plan width and height.
 
+Use `Start Live Tracking` to send `CMD_ML_START_COLLECTION` to the clicker every
+configured number of seconds. Returned anchors are added to the localization
+table as their ranges arrive. Enter each returned anchor's real X/Y coordinate;
+after at least three anchors have coordinates and ranges, the GUI updates the
+estimated clicker position with the same radical-axis solver.
+
 ## Bluetooth Protocol Workflow
 
 The GUI now treats Connect and Disconnect as BLE transport actions. Enter or

@@ -142,6 +142,8 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self.localization_row_order: list[str] = []
         self.localization_anchor_positions: dict[str, tuple[str, str]] = {}
         self.localization_result: LocalizationResult | None = None
+        self.live_tracking_active = False
+        self.live_tracking_after_id: str | None = None
         self._pyth_updating = False
         super().__init__()
         self._install_extensions()
@@ -291,6 +293,8 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         )
         self.sim_width_var = tk.StringVar(value="7")
         self.sim_height_var = tk.StringVar(value="7")
+        self.live_tracking_interval_var = tk.StringVar(value="2")
+        self.live_tracking_status_var = tk.StringVar(value="Live tracking stopped")
         ttk.Button(
             header,
             text="Use Latest Capture",
@@ -335,6 +339,40 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
                 sticky="ew",
                 padx=(0, 8),
             )
+
+        live_frame = ttk.Frame(header)
+        live_frame.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        live_frame.columnconfigure(1, weight=1)
+        live_frame.columnconfigure(2, weight=1)
+        live_frame.columnconfigure(3, weight=1)
+        ttk.Label(live_frame, text="Live every s").grid(row=0, column=0, sticky="w", padx=(0, 4))
+        ttk.Entry(live_frame, textvariable=self.live_tracking_interval_var, width=8).grid(
+            row=0,
+            column=1,
+            sticky="ew",
+            padx=(0, 8),
+        )
+        self.live_tracking_start_button = ttk.Button(
+            live_frame,
+            text="Start Live Tracking",
+            style="Accent.TButton",
+            command=self.start_live_tracking,
+        )
+        self.live_tracking_start_button.grid(row=0, column=2, sticky="ew", padx=(0, 5))
+        self.live_tracking_stop_button = ttk.Button(
+            live_frame,
+            text="Stop Live Tracking",
+            command=self.stop_live_tracking,
+        )
+        self.live_tracking_stop_button.grid(row=0, column=3, sticky="ew", padx=(5, 0))
+        ttk.Label(live_frame, textvariable=self.live_tracking_status_var, style="Status.TLabel").grid(
+            row=1,
+            column=0,
+            columnspan=4,
+            sticky="w",
+            pady=(6, 0),
+        )
+        self._set_live_tracking_button_state()
 
         input_frame = ttk.LabelFrame(parent, text="Anchor Coordinates and Ranges (meters)", padding=8)
         input_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
@@ -586,6 +624,111 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             raise ValueError(f"{label} must be greater than 0.")
         return value
 
+    def start_live_tracking(self) -> None:
+        if self.live_tracking_active:
+            return
+        try:
+            self._live_tracking_interval_ms()
+        except ValueError as exc:
+            self.live_tracking_status_var.set(str(exc))
+            messagebox.showerror("Invalid live tracking interval", str(exc), parent=self)
+            return
+        if self.bluetooth_worker is None:
+            self.live_tracking_status_var.set("Connect to the clicker before live tracking.")
+            messagebox.showwarning(
+                "Bluetooth not connected",
+                "Connect to the clicker before starting live tracking.",
+                parent=self,
+            )
+            return
+
+        self.live_tracking_active = True
+        self.live_tracking_status_var.set("Live tracking active; waiting for ranges.")
+        self._set_live_tracking_button_state()
+        self._cancel_live_tracking_timer()
+        self._live_tracking_tick()
+
+    def stop_live_tracking(self, reason: str = "Live tracking stopped.") -> None:
+        if not self.live_tracking_active and self.live_tracking_after_id is None:
+            return
+        self.live_tracking_active = False
+        self._cancel_live_tracking_timer()
+        if hasattr(self, "live_tracking_status_var"):
+            self.live_tracking_status_var.set(reason)
+        self._set_live_tracking_button_state()
+
+    def _set_live_tracking_button_state(self) -> None:
+        if hasattr(self, "live_tracking_start_button"):
+            self.live_tracking_start_button.configure(
+                state="disabled" if self.live_tracking_active else "normal"
+            )
+        if hasattr(self, "live_tracking_stop_button"):
+            self.live_tracking_stop_button.configure(
+                state="normal" if self.live_tracking_active else "disabled"
+            )
+
+    def _cancel_live_tracking_timer(self) -> None:
+        after_id = self.live_tracking_after_id
+        self.live_tracking_after_id = None
+        if after_id is None:
+            return
+        try:
+            self.after_cancel(after_id)
+        except Exception:
+            pass
+
+    def _live_tracking_interval_ms(self) -> int:
+        value = safe_float(self.live_tracking_interval_var.get())
+        if value is None or value <= 0:
+            raise ValueError("Live tracking interval must be greater than 0 seconds.")
+        return max(int(value * 1000), 100)
+
+    def _schedule_live_tracking_tick(self) -> None:
+        if not self.live_tracking_active:
+            return
+        try:
+            interval_ms = self._live_tracking_interval_ms()
+        except ValueError as exc:
+            self.stop_live_tracking(str(exc))
+            return
+        self.live_tracking_after_id = self.after(interval_ms, self._live_tracking_tick)
+
+    def _live_tracking_tick(self) -> None:
+        self.live_tracking_after_id = None
+        if not self.live_tracking_active:
+            return
+        if self.bluetooth_worker is None:
+            self.stop_live_tracking("Live tracking stopped; Bluetooth is disconnected.")
+            return
+
+        if self.ml_command_in_flight:
+            self.live_tracking_status_var.set("Waiting for the current range request to finish.")
+        else:
+            sent = self.send_ml_start_collection()
+            if sent:
+                self.live_tracking_status_var.set("Range request sent; waiting for anchor replies.")
+            else:
+                self.stop_live_tracking("Live tracking stopped; range request was not sent.")
+                return
+        self._schedule_live_tracking_tick()
+
+    def _try_live_tracking_solve(self) -> bool:
+        if not self.live_tracking_active:
+            return False
+        try:
+            solved = self.solve_localization_from_form(
+                show_errors=False,
+                require_complete_enabled=False,
+            )
+        except Exception as exc:
+            self.live_tracking_status_var.set(f"Live solve failed: {exc}")
+            return False
+        if not solved:
+            self.live_tracking_status_var.set(
+                "Live tracking active; enter X/Y for at least three returned anchors."
+            )
+        return solved
+
     def solve_latest_position(self) -> None:
         if not self.populate_localization_from_latest_capture():
             return
@@ -593,22 +736,38 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             self.right_notebook.select(self.localization_tab)
         self.solve_localization_from_form()
 
-    def solve_localization_from_form(self) -> None:
+    def solve_localization_from_form(
+        self,
+        *,
+        show_errors: bool = True,
+        require_complete_enabled: bool = True,
+    ) -> bool:
         try:
-            readings = self._read_localization_form()
+            readings = self._read_localization_form(require_complete_enabled=require_complete_enabled)
             result = solve_position(readings)
         except ValueError as exc:
             self.localization_status_var.set(str(exc))
             self._write_localization_result(str(exc))
-            messagebox.showerror("Cannot solve position", str(exc), parent=self)
-            return
+            if show_errors:
+                messagebox.showerror("Cannot solve position", str(exc), parent=self)
+            return False
 
         self.localization_result = result
         self._remember_localization_positions()
         self._show_localization_result(result)
         self._draw_localization_plot(result)
+        if self.live_tracking_active:
+            self.live_tracking_status_var.set(
+                f"Live position x={result.x_m:.3f} m, y={result.y_m:.3f} m "
+                f"({result.confidence} confidence)."
+            )
+        return True
 
-    def _read_localization_form(self) -> list[LocalizationReading]:
+    def _read_localization_form(
+        self,
+        *,
+        require_complete_enabled: bool = True,
+    ) -> list[LocalizationReading]:
         readings: list[LocalizationReading] = []
         missing: list[str] = []
         for key in self.localization_row_order:
@@ -622,7 +781,8 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             offset_m = safe_float(row["offset_var"].get()) or 0.0
             sigma_m = safe_float(row["sigma_var"].get()) or 0.05
             if x_m is None or y_m is None or range_m is None:
-                missing.append(anchor_id)
+                if require_complete_enabled:
+                    missing.append(anchor_id)
                 continue
             readings.append(
                 LocalizationReading(
@@ -1417,10 +1577,15 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self._persist_all_anchor_true_distances()
         self._persist_all_anchor_los_nlos()
 
+    def disconnect_transport(self) -> None:
+        self.stop_live_tracking("Live tracking stopped; Bluetooth is disconnected.")
+        super().disconnect_transport()
+
     def handle_serial_line(self, line: str) -> None:
         super().handle_serial_line(line)
 
     def handle_records(self, records: list[Any]) -> None:
+        localization_updated = False
         for record in records:
             if record.anchor_id:
                 anchor_key = str(record.anchor_id).strip()
@@ -1432,6 +1597,9 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
                     if len(history) > 200:
                         del history[: len(history) - 200]
                     self._update_localization_range(anchor_key, float(record.distance_m))
+                    localization_updated = True
+        if localization_updated and self.live_tracking_active:
+            self._try_live_tracking_solve()
         self._refresh_anchor_truth_table()
         super().handle_records(records)
 
