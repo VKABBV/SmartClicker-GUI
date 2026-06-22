@@ -36,7 +36,8 @@ residuals.
 Use `Run Square Simulation` to fill a four-anchor square/floor-plan test with
 fake ranges, solve it, and plot the estimated clicker point. The anchor X/Y
 fields are the known anchor placements; the clicker X/Y is not entered by the
-operator and is always estimated from anchor ranges.
+operator and is always estimated from anchor ranges. The visible simulation
+controls only set the floor-plan width and height.
 
 ## Bluetooth Protocol Workflow
 

@@ -291,7 +291,6 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         )
         self.sim_width_var = tk.StringVar(value="7")
         self.sim_height_var = tk.StringVar(value="7")
-        self.sim_noise_var = tk.StringVar(value="0")
         ttk.Button(
             header,
             text="Use Latest Capture",
@@ -322,12 +321,11 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         )
         sim_frame = ttk.Frame(header)
         sim_frame.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
-        for column in (1, 3, 5):
+        for column in (1, 3):
             sim_frame.columnconfigure(column, weight=1)
         sim_rows = [
             ("Width m", self.sim_width_var),
             ("Height m", self.sim_height_var),
-            ("Noise m", self.sim_noise_var),
         ]
         for index, (label, variable) in enumerate(sim_rows):
             ttk.Label(sim_frame, text=label).grid(row=0, column=index * 2, sticky="w", padx=(0, 4))
@@ -551,11 +549,9 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         try:
             width_m = self._positive_sim_float(self.sim_width_var, "Simulation width")
             height_m = self._positive_sim_float(self.sim_height_var, "Simulation height")
-            noise_m = self._nonnegative_sim_float(self.sim_noise_var, "Simulation noise")
             scenario = build_square_simulation(
                 width_m=width_m,
                 height_m=height_m,
-                noise_m=noise_m,
             )
         except ValueError as exc:
             self.localization_status_var.set(str(exc))
@@ -588,12 +584,6 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         value = self._sim_float(variable, label)
         if value <= 0:
             raise ValueError(f"{label} must be greater than 0.")
-        return value
-
-    def _nonnegative_sim_float(self, variable: Any, label: str) -> float:
-        value = self._sim_float(variable, label)
-        if value < 0:
-            raise ValueError(f"{label} must be 0 or greater.")
         return value
 
     def solve_latest_position(self) -> None:
