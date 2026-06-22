@@ -47,6 +47,23 @@ arrive. Enter each returned anchor's real X/Y coordinate; after at least three
 anchors have coordinates and ranges, the GUI updates the estimated clicker
 position with the same radical-axis solver.
 
+## Anchor Geometry Survey
+
+The extended GUI also includes an `Anchor Geometry` tab for anchor-to-anchor
+survey data. `Gather Anchor Distances` sends `CMD_SURVEY_START_PAIR` to the
+clicker, then waits for the configured collection window while incoming
+`SURVEY_PAIR_RESULT` packets populate the pair table. The final firmware TLV
+shape is still expected to settle; the parser accepts repeated `ANCHOR_ID` TLVs
+and provisional pair-specific TLVs for anchor A, anchor B, pair distance, and
+pair status.
+
+Pair distances can also be added manually. `Solve Layout` treats each pair
+distance as a spring and optimizes the lowest-energy 2D anchor layout with a
+dependency-free multi-seed basin-hopping solver. The layout plot shows anchor
+positions and pair distances, supports mirror and rotation controls, and can be
+drag-rotated with the mouse. Select two anchors and press `Straighten` to rotate
+the layout so that pair lies on the same Y coordinate for a straight box view.
+
 ## Bluetooth Protocol Workflow
 
 The GUI now treats Connect and Disconnect as BLE transport actions. Enter or
@@ -106,6 +123,7 @@ uwb_capture/common.py       shared helpers and ParsedRecord model
 uwb_capture/protocol.py     IMEC binary packet/TLV codec
 uwb_capture/bluetooth_io.py BLE scanner, connector, and packet writer
 uwb_capture/localization.py 2D radical-axis line least-squares solver
+uwb_capture/anchor_geometry.py anchor-to-anchor spring layout solver
 uwb_capture/parser.py       legacy text line parser
 uwb_capture/store.py        SQLite persistence and base workbook export
 uwb_capture/base_gui.py     base capture GUI

@@ -18,6 +18,16 @@ from openpyxl.styles import Font, PatternFill
 from openpyxl.worksheet.datavalidation import DataValidation
 
 from . import base_gui as original
+from .anchor_geometry import (
+    ANCHOR_LAYOUT_ALGORITHM,
+    AnchorLayoutResult,
+    AnchorPairDistance,
+    mirror_layout,
+    pair_residuals,
+    rotate_layout,
+    rotate_layout_to_level,
+    solve_anchor_layout,
+)
 from .common import export_timestamp
 from .localization import (
     LOCALIZATION_ALGORITHM,
@@ -25,6 +35,14 @@ from .localization import (
     LocalizationResult,
     build_square_simulation,
     solve_position,
+)
+from .protocol import (
+    CommandStatus,
+    ProtocolError,
+    build_survey_start_pair_packet,
+    command_status_from_packet,
+    next_sequence,
+    parse_device_id,
 )
 
 tk = original.tk
@@ -150,6 +168,17 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self.localization_result: LocalizationResult | None = None
         self.localization_fullscreen_window: Any | None = None
         self.localization_fullscreen_canvas: Any | None = None
+        self.anchor_pair_distances: dict[tuple[str, str], AnchorPairDistance] = {}
+        self.anchor_pair_status: dict[tuple[str, str], str] = {}
+        self.anchor_layout_result: AnchorLayoutResult | None = None
+        self.anchor_layout_positions: dict[str, tuple[float, float]] = {}
+        self.anchor_layout_drag_start_angle: float | None = None
+        self.anchor_layout_drag_positions: dict[str, tuple[float, float]] | None = None
+        self.anchor_survey_in_flight = False
+        self.anchor_survey_pending_session: int | None = None
+        self.anchor_survey_pending_seq: int | None = None
+        self.anchor_survey_after_id: str | None = None
+        self.anchor_survey_start_pair_count = 0
         self.live_tracking_active = False
         self.live_tracking_after_id: str | None = None
         self._pyth_updating = False
@@ -176,8 +205,12 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self.localization_tab.columnconfigure(0, weight=1)
         self.localization_tab.rowconfigure(1, weight=1)
         self.localization_tab.rowconfigure(2, weight=1)
+        self.anchor_geometry_tab = ttk.Frame(right_notebook, padding=8)
+        self.anchor_geometry_tab.columnconfigure(0, weight=1)
+        self.anchor_geometry_tab.rowconfigure(1, weight=1)
         right_notebook.add(self.capture_tab, text="Capture Data")
         right_notebook.add(self.localization_tab, text="Localization")
+        right_notebook.add(self.anchor_geometry_tab, text="Anchor Geometry")
         self.right_notebook = right_notebook
 
         self._build_connection_panel(left)
@@ -187,6 +220,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self._build_live_panel(self.capture_tab)
         self._build_log_panel(self.capture_tab)
         self._build_localization_panel(self.localization_tab)
+        self._build_anchor_geometry_panel(self.anchor_geometry_tab)
 
     def _build_session_panel(self, parent: Any) -> None:
         frame = ttk.LabelFrame(parent, text="Measurement Session", padding=8)
@@ -1073,6 +1107,828 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             fill="#cf222e",
         )
 
+    def _build_anchor_geometry_panel(self, parent: Any) -> None:
+        header = ttk.LabelFrame(parent, text="Anchor Pair Survey", padding=8)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        for column in range(6):
+            header.columnconfigure(column, weight=1)
+
+        self.anchor_geometry_status_var = tk.StringVar(
+            value="Send a survey command or add anchor-to-anchor distances manually."
+        )
+        self.anchor_survey_wait_var = tk.StringVar(value="6")
+        self.anchor_layout_seed_count_var = tk.StringVar(value="24")
+        self.anchor_layout_basin_hops_var = tk.StringVar(value="10")
+        self.anchor_pair_a_var = tk.StringVar()
+        self.anchor_pair_b_var = tk.StringVar()
+        self.anchor_pair_distance_var = tk.StringVar()
+        self.anchor_pair_sigma_var = tk.StringVar(value="0.05")
+        self.anchor_layout_level_a_var = tk.StringVar()
+        self.anchor_layout_level_b_var = tk.StringVar()
+        self.anchor_layout_rotate_degrees_var = tk.StringVar(value="15")
+
+        ttk.Label(header, text="Collect window s").grid(row=0, column=0, sticky="w")
+        ttk.Entry(header, textvariable=self.anchor_survey_wait_var, width=8).grid(
+            row=0,
+            column=1,
+            sticky="ew",
+            padx=(6, 10),
+        )
+        self.anchor_survey_button = ttk.Button(
+            header,
+            text="Gather Anchor Distances",
+            style="Accent.TButton",
+            command=self.send_anchor_pair_survey,
+        )
+        self.anchor_survey_button.grid(row=0, column=2, columnspan=2, sticky="ew", padx=(0, 5))
+        self.anchor_survey_stop_button = ttk.Button(
+            header,
+            text="Stop Waiting",
+            command=self.stop_anchor_pair_survey_wait,
+        )
+        self.anchor_survey_stop_button.grid(row=0, column=4, sticky="ew", padx=5)
+        ttk.Button(
+            header,
+            text="Solve Layout",
+            command=self.solve_anchor_geometry,
+        ).grid(row=0, column=5, sticky="ew", padx=(5, 0))
+
+        ttk.Label(header, text="Seeds").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(header, textvariable=self.anchor_layout_seed_count_var, width=8).grid(
+            row=1,
+            column=1,
+            sticky="ew",
+            padx=(6, 10),
+            pady=(8, 0),
+        )
+        ttk.Label(header, text="Basin hops").grid(row=1, column=2, sticky="w", pady=(8, 0))
+        ttk.Entry(header, textvariable=self.anchor_layout_basin_hops_var, width=8).grid(
+            row=1,
+            column=3,
+            sticky="ew",
+            padx=(6, 10),
+            pady=(8, 0),
+        )
+        ttk.Label(header, textvariable=self.anchor_geometry_status_var, style="Status.TLabel").grid(
+            row=2,
+            column=0,
+            columnspan=6,
+            sticky="w",
+            pady=(8, 0),
+        )
+
+        body = ttk.Frame(parent)
+        body.grid(row=1, column=0, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(1, weight=1)
+
+        pair_frame = ttk.LabelFrame(body, text="Anchor Pair Distances", padding=8)
+        pair_frame.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 5))
+        pair_frame.columnconfigure(0, weight=1)
+        pair_frame.rowconfigure(2, weight=1)
+
+        manual = ttk.Frame(pair_frame)
+        manual.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        for column in (1, 3, 5, 7):
+            manual.columnconfigure(column, weight=1)
+        ttk.Label(manual, text="Anchor A").grid(row=0, column=0, sticky="w")
+        self.anchor_pair_a_combo = ttk.Combobox(
+            manual,
+            textvariable=self.anchor_pair_a_var,
+            values=[],
+            width=18,
+            state="normal",
+        )
+        self.anchor_pair_a_combo.grid(row=0, column=1, sticky="ew", padx=(4, 8))
+        ttk.Label(manual, text="Anchor B").grid(row=0, column=2, sticky="w")
+        self.anchor_pair_b_combo = ttk.Combobox(
+            manual,
+            textvariable=self.anchor_pair_b_var,
+            values=[],
+            width=18,
+            state="normal",
+        )
+        self.anchor_pair_b_combo.grid(row=0, column=3, sticky="ew", padx=(4, 8))
+        ttk.Label(manual, text="Distance m").grid(row=0, column=4, sticky="w")
+        ttk.Entry(manual, textvariable=self.anchor_pair_distance_var, width=10).grid(
+            row=0,
+            column=5,
+            sticky="ew",
+            padx=(4, 8),
+        )
+        ttk.Label(manual, text="Sigma m").grid(row=0, column=6, sticky="w")
+        ttk.Entry(manual, textvariable=self.anchor_pair_sigma_var, width=8).grid(
+            row=0,
+            column=7,
+            sticky="ew",
+            padx=(4, 0),
+        )
+
+        buttons = ttk.Frame(pair_frame)
+        buttons.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        for column in range(3):
+            buttons.columnconfigure(column, weight=1)
+        ttk.Button(
+            buttons,
+            text="Add / Update Pair",
+            command=self.add_manual_anchor_pair_distance,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        ttk.Button(
+            buttons,
+            text="Delete Selected",
+            command=self.delete_selected_anchor_pair_distance,
+        ).grid(row=0, column=1, sticky="ew", padx=5)
+        ttk.Button(
+            buttons,
+            text="Clear Pairs",
+            command=self.clear_anchor_pair_distances,
+        ).grid(row=0, column=2, sticky="ew", padx=(5, 0))
+
+        columns = ("anchor_a", "anchor_b", "distance", "status", "source")
+        self.anchor_pair_table = ttk.Treeview(pair_frame, columns=columns, show="headings", height=10)
+        headings = {
+            "anchor_a": "Anchor A",
+            "anchor_b": "Anchor B",
+            "distance": "Distance m",
+            "status": "Status",
+            "source": "Source",
+        }
+        widths = {
+            "anchor_a": 150,
+            "anchor_b": 150,
+            "distance": 90,
+            "status": 90,
+            "source": 120,
+        }
+        for column in columns:
+            self.anchor_pair_table.heading(column, text=headings[column])
+            self.anchor_pair_table.column(column, width=widths[column], anchor="center")
+        pair_scroll = ttk.Scrollbar(pair_frame, orient=tk.VERTICAL, command=self.anchor_pair_table.yview)
+        self.anchor_pair_table.configure(yscrollcommand=pair_scroll.set)
+        self.anchor_pair_table.grid(row=2, column=0, sticky="nsew")
+        pair_scroll.grid(row=2, column=1, sticky="ns")
+        self.anchor_pair_table.bind("<<TreeviewSelect>>", self.on_anchor_pair_selected)
+
+        result_frame = ttk.LabelFrame(body, text="Spring Solver", padding=8)
+        result_frame.grid(row=2, column=0, sticky="ew", padx=(0, 5), pady=(8, 0))
+        result_frame.columnconfigure(0, weight=1)
+        self.anchor_layout_result_text = tk.Text(result_frame, height=8, wrap=tk.WORD)
+        self.anchor_layout_result_text.grid(row=0, column=0, sticky="ew")
+        self.anchor_layout_result_text.configure(state=tk.DISABLED)
+
+        plot_frame = ttk.LabelFrame(body, text="Anchor Layout", padding=8)
+        plot_frame.grid(row=0, column=1, rowspan=3, sticky="nsew", padx=(5, 0))
+        plot_frame.columnconfigure(0, weight=1)
+        plot_frame.rowconfigure(1, weight=1)
+
+        toolbar = ttk.Frame(plot_frame)
+        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        for column in (1, 3, 5):
+            toolbar.columnconfigure(column, weight=1)
+        ttk.Label(toolbar, text="Level").grid(row=0, column=0, sticky="w")
+        self.anchor_layout_level_a_combo = ttk.Combobox(
+            toolbar,
+            textvariable=self.anchor_layout_level_a_var,
+            values=[],
+            width=14,
+            state="normal",
+        )
+        self.anchor_layout_level_a_combo.grid(row=0, column=1, sticky="ew", padx=(4, 4))
+        self.anchor_layout_level_b_combo = ttk.Combobox(
+            toolbar,
+            textvariable=self.anchor_layout_level_b_var,
+            values=[],
+            width=14,
+            state="normal",
+        )
+        self.anchor_layout_level_b_combo.grid(row=0, column=2, sticky="ew", padx=(0, 4))
+        ttk.Button(
+            toolbar,
+            text="Straighten",
+            command=self.level_anchor_layout_pair,
+        ).grid(row=0, column=3, sticky="ew", padx=(0, 8))
+        ttk.Button(toolbar, text="Mirror X", command=lambda: self.mirror_anchor_layout("x")).grid(
+            row=0,
+            column=4,
+            sticky="ew",
+            padx=(0, 4),
+        )
+        ttk.Button(toolbar, text="Mirror Y", command=lambda: self.mirror_anchor_layout("y")).grid(
+            row=0,
+            column=5,
+            sticky="ew",
+            padx=(0, 4),
+        )
+
+        rotate_toolbar = ttk.Frame(plot_frame)
+        rotate_toolbar.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        for column in (1, 3):
+            rotate_toolbar.columnconfigure(column, weight=1)
+        ttk.Label(rotate_toolbar, text="Rotate deg").grid(row=0, column=0, sticky="w")
+        ttk.Entry(
+            rotate_toolbar,
+            textvariable=self.anchor_layout_rotate_degrees_var,
+            width=8,
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 8))
+        ttk.Button(
+            rotate_toolbar,
+            text="Apply",
+            command=self.rotate_anchor_layout_from_form,
+        ).grid(row=0, column=2, sticky="ew", padx=(0, 4))
+        ttk.Button(
+            rotate_toolbar,
+            text="-90",
+            command=lambda: self.rotate_anchor_layout(-90.0),
+        ).grid(row=0, column=3, sticky="ew", padx=(0, 4))
+        ttk.Button(
+            rotate_toolbar,
+            text="+90",
+            command=lambda: self.rotate_anchor_layout(90.0),
+        ).grid(row=0, column=4, sticky="ew")
+
+        self.anchor_geometry_canvas = tk.Canvas(
+            plot_frame,
+            height=360,
+            background="white",
+            highlightthickness=1,
+            highlightbackground="#d0d7de",
+        )
+        self.anchor_geometry_canvas.grid(row=1, column=0, sticky="nsew")
+        self.anchor_geometry_canvas.bind("<Configure>", lambda _event: self._redraw_anchor_geometry_canvas())
+        self.anchor_geometry_canvas.bind("<ButtonPress-1>", self._start_anchor_layout_drag_rotate)
+        self.anchor_geometry_canvas.bind("<B1-Motion>", self._drag_anchor_layout_rotate)
+        self.anchor_geometry_canvas.bind("<ButtonRelease-1>", self._end_anchor_layout_drag_rotate)
+        self._set_anchor_survey_state(False)
+        self._redraw_anchor_geometry_canvas()
+
+    def _anchor_pair_key(self, anchor_a: str, anchor_b: str) -> tuple[str, str]:
+        return tuple(sorted((anchor_a.strip(), anchor_b.strip())))
+
+    def _anchor_pair_anchor_ids(self) -> list[str]:
+        anchor_ids = set(self.detected_anchor_ids)
+        for pair in self.anchor_pair_distances.values():
+            anchor_ids.add(pair.anchor_a_id)
+            anchor_ids.add(pair.anchor_b_id)
+        for anchor_id in self.anchor_layout_positions:
+            anchor_ids.add(anchor_id)
+        return sorted(anchor_id for anchor_id in anchor_ids if anchor_id)
+
+    def _update_anchor_pair_combos(self) -> None:
+        values = self._anchor_pair_anchor_ids()
+        for name in (
+            "anchor_pair_a_combo",
+            "anchor_pair_b_combo",
+            "anchor_layout_level_a_combo",
+            "anchor_layout_level_b_combo",
+        ):
+            combo = getattr(self, name, None)
+            if combo is not None:
+                combo.configure(values=values)
+        if len(values) >= 2:
+            if not self.anchor_layout_level_a_var.get().strip():
+                self.anchor_layout_level_a_var.set(values[0])
+            if not self.anchor_layout_level_b_var.get().strip():
+                self.anchor_layout_level_b_var.set(values[1])
+
+    def add_manual_anchor_pair_distance(self) -> None:
+        anchor_a = self.anchor_pair_a_var.get().strip()
+        anchor_b = self.anchor_pair_b_var.get().strip()
+        distance = safe_float(self.anchor_pair_distance_var.get())
+        sigma = safe_float(self.anchor_pair_sigma_var.get()) or 0.05
+        if not anchor_a or not anchor_b or anchor_a == anchor_b:
+            messagebox.showerror("Invalid pair", "Enter two different anchor IDs.", parent=self)
+            return
+        if distance is None or distance <= 0:
+            messagebox.showerror("Invalid distance", "Distance must be numeric and greater than 0.", parent=self)
+            return
+        if sigma <= 0:
+            messagebox.showerror("Invalid sigma", "Sigma must be greater than 0.", parent=self)
+            return
+        self._save_anchor_pair_distance(anchor_a, anchor_b, distance, sigma, "manual", "ok")
+        self.anchor_geometry_status_var.set(
+            f"Saved {anchor_a}-{anchor_b} = {distance:.3f} m."
+        )
+
+    def _save_anchor_pair_distance(
+        self,
+        anchor_a: str,
+        anchor_b: str,
+        distance_m: float,
+        sigma_m: float,
+        source: str,
+        status: str,
+    ) -> None:
+        key = self._anchor_pair_key(anchor_a, anchor_b)
+        anchor_a_key, anchor_b_key = key
+        pair = AnchorPairDistance(
+            anchor_a_id=anchor_a_key,
+            anchor_b_id=anchor_b_key,
+            distance_m=distance_m,
+            sigma_m=sigma_m,
+            source=source,
+        )
+        self.anchor_pair_distances[key] = pair
+        self.anchor_pair_status[key] = status
+        self._register_detected_anchor(anchor_a_key)
+        self._register_detected_anchor(anchor_b_key)
+        self._refresh_anchor_pair_table()
+        self._update_anchor_pair_combos()
+
+    def delete_selected_anchor_pair_distance(self) -> None:
+        selected = self.anchor_pair_table.selection()
+        if not selected:
+            return
+        for item in selected:
+            values = self.anchor_pair_table.item(item, "values")
+            if len(values) < 2:
+                continue
+            key = self._anchor_pair_key(str(values[0]), str(values[1]))
+            self.anchor_pair_distances.pop(key, None)
+            self.anchor_pair_status.pop(key, None)
+        self.anchor_layout_result = None
+        self.anchor_layout_positions = {}
+        self._refresh_anchor_pair_table()
+        self._update_anchor_pair_combos()
+        self._write_anchor_layout_result("")
+        self._redraw_anchor_geometry_canvas()
+
+    def clear_anchor_pair_distances(self) -> None:
+        self.anchor_pair_distances.clear()
+        self.anchor_pair_status.clear()
+        self.anchor_layout_result = None
+        self.anchor_layout_positions = {}
+        self._refresh_anchor_pair_table()
+        self._update_anchor_pair_combos()
+        self._write_anchor_layout_result("")
+        self.anchor_geometry_status_var.set("Cleared anchor pair distances.")
+        self._redraw_anchor_geometry_canvas()
+
+    def _refresh_anchor_pair_table(self) -> None:
+        if not hasattr(self, "anchor_pair_table"):
+            return
+        for item in self.anchor_pair_table.get_children():
+            self.anchor_pair_table.delete(item)
+        for key, pair in sorted(self.anchor_pair_distances.items()):
+            self.anchor_pair_table.insert(
+                "",
+                tk.END,
+                values=(
+                    pair.anchor_a_id,
+                    pair.anchor_b_id,
+                    format_meter(pair.distance_m, ""),
+                    self.anchor_pair_status.get(key, "ok"),
+                    pair.source,
+                ),
+            )
+
+    def on_anchor_pair_selected(self, _event: Any = None) -> None:
+        selected = self.anchor_pair_table.selection()
+        if not selected:
+            return
+        values = self.anchor_pair_table.item(selected[0], "values")
+        if len(values) < 3:
+            return
+        self.anchor_pair_a_var.set(str(values[0]))
+        self.anchor_pair_b_var.set(str(values[1]))
+        self.anchor_pair_distance_var.set(str(values[2]))
+        self.anchor_layout_level_a_var.set(str(values[0]))
+        self.anchor_layout_level_b_var.set(str(values[1]))
+
+    def send_anchor_pair_survey(self) -> bool:
+        if self.bluetooth_worker is None:
+            self.anchor_geometry_status_var.set("Connect to the clicker before gathering anchor distances.")
+            self.log_raw("# Did not send anchor pair survey; Bluetooth is not connected.")
+            return False
+        if self.ml_command_in_flight:
+            self.anchor_geometry_status_var.set("Wait for the ML collection command to finish first.")
+            self.log_raw("# Did not send anchor pair survey; ML collection is in flight.")
+            return False
+        if self.anchor_survey_in_flight:
+            self.anchor_geometry_status_var.set("Anchor pair survey is already waiting for results.")
+            return False
+        try:
+            wait_ms = self._anchor_survey_wait_ms()
+            sample_count = self._ml_sample_count()
+            discovery_slots = self._ml_discovery_slot_count()
+            session_id = self._ml_session_id()
+            source_id = parse_device_id(self.host_id_var.get(), default=0)
+            if source_id == 0:
+                raise ProtocolError("Host ID must be a stable non-zero device ID.")
+            destination_id = parse_device_id(self.clicker_id_var.get(), default=0)
+            self.protocol_sequence = next_sequence(self.protocol_sequence)
+            packet = build_survey_start_pair_packet(
+                source_id=source_id,
+                destination_id=destination_id,
+                session_id=session_id,
+                sequence=self.protocol_sequence,
+                sample_count=sample_count,
+                discovery_slot_count=discovery_slots,
+            )
+        except ProtocolError as exc:
+            messagebox.showerror("Invalid anchor survey command", str(exc), parent=self)
+            return False
+
+        sent = self.bluetooth_worker.send_packet(packet)
+        if not sent:
+            self.anchor_geometry_status_var.set("Bluetooth is not ready for anchor pair survey.")
+            self.log_raw("# Did not send anchor pair survey; Bluetooth is not ready.")
+            return False
+
+        self.anchor_survey_in_flight = True
+        self.anchor_survey_pending_session = session_id
+        self.anchor_survey_pending_seq = self.protocol_sequence
+        self.anchor_survey_start_pair_count = len(self.anchor_pair_distances)
+        self._set_anchor_survey_state(True)
+        self._cancel_anchor_survey_timer()
+        self.anchor_survey_after_id = self.after(wait_ms, self._finish_anchor_pair_survey_window)
+        self.anchor_geometry_status_var.set(
+            f"Anchor pair survey sent; collecting results for {wait_ms / 1000:.1f} s."
+        )
+        self.log_raw(
+            f"# Queued SURVEY_START_PAIR to {self.clicker_id_var.get().strip() or 'broadcast'} "
+            f"(session={session_id} seq={self.protocol_sequence})"
+        )
+        return True
+
+    def _anchor_survey_wait_ms(self) -> int:
+        seconds = safe_float(self.anchor_survey_wait_var.get())
+        if seconds is None or seconds <= 0:
+            raise ProtocolError("Collect window must be greater than 0 seconds.")
+        return max(int(seconds * 1000), 250)
+
+    def _set_anchor_survey_state(self, in_flight: bool) -> None:
+        if hasattr(self, "anchor_survey_button"):
+            self.anchor_survey_button.configure(state="disabled" if in_flight else "normal")
+        if hasattr(self, "anchor_survey_stop_button"):
+            self.anchor_survey_stop_button.configure(state="normal" if in_flight else "disabled")
+
+    def _cancel_anchor_survey_timer(self) -> None:
+        after_id = self.anchor_survey_after_id
+        self.anchor_survey_after_id = None
+        if after_id is None:
+            return
+        try:
+            self.after_cancel(after_id)
+        except Exception:
+            pass
+
+    def stop_anchor_pair_survey_wait(self) -> None:
+        if not self.anchor_survey_in_flight:
+            return
+        self._finish_anchor_pair_survey_window("Anchor pair survey wait stopped.")
+
+    def _finish_anchor_pair_survey_window(self, reason: str | None = None) -> None:
+        self._cancel_anchor_survey_timer()
+        new_count = max(len(self.anchor_pair_distances) - self.anchor_survey_start_pair_count, 0)
+        self.anchor_survey_in_flight = False
+        self.anchor_survey_pending_session = None
+        self.anchor_survey_pending_seq = None
+        self._set_anchor_survey_state(False)
+        message = reason or f"Anchor pair survey window ended; {new_count} new pair(s) received."
+        self.anchor_geometry_status_var.set(message)
+        if self.anchor_pair_distances:
+            self.solve_anchor_geometry(show_errors=False)
+
+    def _handle_anchor_survey_command_result(self, packet: Any) -> None:
+        matches = (
+            self.anchor_survey_pending_session == packet.session_id
+            and self.anchor_survey_pending_seq == packet.sequence
+        )
+        if not matches:
+            return
+        status = command_status_from_packet(packet)
+        if status is None or status == CommandStatus.COMMAND_OK:
+            self.anchor_geometry_status_var.set("Survey command accepted; waiting for pair results.")
+            return
+
+        self._cancel_anchor_survey_timer()
+        self.anchor_survey_in_flight = False
+        self.anchor_survey_pending_session = None
+        self.anchor_survey_pending_seq = None
+        self._set_anchor_survey_state(False)
+        self.anchor_geometry_status_var.set(f"Survey command result: {original._command_status_name(status)}")
+
+    def _handle_anchor_pair_record(self, record: Any) -> None:
+        anchor_a = str(record.anchor_id or "").strip()
+        anchor_b = str(getattr(record, "peer_anchor_id", "") or "").strip()
+        if not anchor_a or not anchor_b:
+            return
+        self._register_detected_anchor(anchor_a)
+        self._register_detected_anchor(anchor_b)
+        if record.kind == "survey_pair_failure" or record.distance_m is None:
+            self.anchor_geometry_status_var.set(
+                f"Anchor pair {anchor_a}-{anchor_b} failed: {record.status or record.error_code or 'unknown'}"
+            )
+            self.log_raw(
+                f"# Anchor pair survey failure {anchor_a}-{anchor_b}: "
+                f"{record.status or record.error_code or 'unknown'}"
+            )
+            self._update_anchor_pair_combos()
+            return
+        source = "survey"
+        if record.event_seq is not None:
+            source = f"survey event {record.event_seq}"
+        self._save_anchor_pair_distance(
+            anchor_a,
+            anchor_b,
+            float(record.distance_m),
+            0.05,
+            source,
+            record.status or "ok",
+        )
+        self.anchor_geometry_status_var.set(
+            f"Received pair {anchor_a}-{anchor_b}: {float(record.distance_m):.3f} m."
+        )
+        self._redraw_anchor_geometry_canvas()
+
+    def _anchor_layout_seed_count(self) -> int:
+        value = original.safe_int(self.anchor_layout_seed_count_var.get())
+        if value is None or value <= 0:
+            raise ValueError("Seed count must be a positive integer.")
+        return min(value, 128)
+
+    def _anchor_layout_basin_hops(self) -> int:
+        value = original.safe_int(self.anchor_layout_basin_hops_var.get())
+        if value is None or value < 0:
+            raise ValueError("Basin hops must be 0 or greater.")
+        return min(value, 128)
+
+    def solve_anchor_geometry(self, *, show_errors: bool = True) -> bool:
+        if not self.anchor_pair_distances:
+            self.anchor_geometry_status_var.set("No anchor-to-anchor distances are available.")
+            if show_errors:
+                messagebox.showwarning(
+                    "No anchor pairs",
+                    "Gather or add anchor-to-anchor distances before solving.",
+                    parent=self,
+                )
+            return False
+        try:
+            result = solve_anchor_layout(
+                list(self.anchor_pair_distances.values()),
+                seed_count=self._anchor_layout_seed_count(),
+                basin_hops=self._anchor_layout_basin_hops(),
+            )
+        except ValueError as exc:
+            self.anchor_geometry_status_var.set(str(exc))
+            self._write_anchor_layout_result(str(exc))
+            if show_errors:
+                messagebox.showerror("Cannot solve anchor geometry", str(exc), parent=self)
+            return False
+
+        self.anchor_layout_result = result
+        self.anchor_layout_positions = dict(result.positions_m)
+        self._update_anchor_pair_combos()
+        self._show_anchor_layout_result(result)
+        self._redraw_anchor_geometry_canvas()
+        return True
+
+    def _show_anchor_layout_result(self, result: AnchorLayoutResult) -> None:
+        lines = [
+            f"Algorithm: {ANCHOR_LAYOUT_ALGORITHM}",
+            "Units: meters",
+            "",
+            f"Anchors: {len(result.positions_m)}",
+            f"Pairs: {len(result.processed_pairs)}",
+            f"Spring energy: {result.energy:.6g}",
+            f"Pair RMSE: {result.rmse_m:.4f} m",
+            f"Max residual: {result.max_residual_m:.4f} m",
+            f"Seeds tried: {result.seed_count}",
+            f"Accepted basin hops: {result.basin_hop_count}",
+            "",
+            "Anchor coordinates:",
+        ]
+        for anchor_id, (x_m, y_m) in sorted(self.anchor_layout_positions.items()):
+            lines.append(f"- {anchor_id}: x={x_m:.3f}, y={y_m:.3f}")
+        residuals = pair_residuals(self.anchor_layout_positions, result.processed_pairs)
+        lines.extend(["", "Pair residuals:"])
+        for pair_id, residual in sorted(residuals.items()):
+            lines.append(f"- {pair_id}: {residual:.4f} m")
+        if result.warnings:
+            lines.append("")
+            lines.append("Warnings:")
+            lines.extend(f"- {warning}" for warning in result.warnings)
+        self._write_anchor_layout_result("\n".join(lines))
+        self.anchor_geometry_status_var.set(
+            f"Solved {len(result.positions_m)} anchors with RMSE {result.rmse_m:.3f} m."
+        )
+
+    def _write_anchor_layout_result(self, text: str) -> None:
+        if not hasattr(self, "anchor_layout_result_text"):
+            return
+        self.anchor_layout_result_text.configure(state=tk.NORMAL)
+        self.anchor_layout_result_text.delete("1.0", tk.END)
+        self.anchor_layout_result_text.insert("1.0", text)
+        self.anchor_layout_result_text.configure(state=tk.DISABLED)
+
+    def _current_anchor_layout_positions(self) -> dict[str, tuple[float, float]]:
+        return dict(self.anchor_layout_positions)
+
+    def _apply_anchor_layout_positions(
+        self,
+        positions: dict[str, tuple[float, float]],
+        status: str,
+    ) -> None:
+        self.anchor_layout_positions = positions
+        if self.anchor_layout_result is not None:
+            self._show_anchor_layout_result(self.anchor_layout_result)
+        self.anchor_geometry_status_var.set(status)
+        self._redraw_anchor_geometry_canvas()
+
+    def mirror_anchor_layout(self, axis: str) -> None:
+        positions = self._current_anchor_layout_positions()
+        if not positions:
+            self.anchor_geometry_status_var.set("Solve anchor geometry before mirroring.")
+            return
+        transformed = mirror_layout(positions, axis)
+        self._apply_anchor_layout_positions(transformed, f"Mirrored layout across {axis.upper()} axis.")
+
+    def rotate_anchor_layout(self, degrees: float) -> None:
+        positions = self._current_anchor_layout_positions()
+        if not positions:
+            self.anchor_geometry_status_var.set("Solve anchor geometry before rotating.")
+            return
+        transformed = rotate_layout(positions, degrees)
+        self._apply_anchor_layout_positions(transformed, f"Rotated layout by {degrees:.1f} degrees.")
+
+    def rotate_anchor_layout_from_form(self) -> None:
+        degrees = safe_float(self.anchor_layout_rotate_degrees_var.get())
+        if degrees is None:
+            messagebox.showerror("Invalid rotation", "Rotation must be numeric degrees.", parent=self)
+            return
+        self.rotate_anchor_layout(degrees)
+
+    def level_anchor_layout_pair(self) -> None:
+        positions = self._current_anchor_layout_positions()
+        if not positions:
+            self.anchor_geometry_status_var.set("Solve anchor geometry before straightening.")
+            return
+        anchor_a = self.anchor_layout_level_a_var.get().strip()
+        anchor_b = self.anchor_layout_level_b_var.get().strip()
+        if not anchor_a or not anchor_b or anchor_a == anchor_b:
+            messagebox.showerror("Invalid anchors", "Select two different anchors to straighten.", parent=self)
+            return
+        try:
+            transformed = rotate_layout_to_level(positions, anchor_a, anchor_b)
+        except ValueError as exc:
+            messagebox.showerror("Cannot straighten layout", str(exc), parent=self)
+            return
+        self._apply_anchor_layout_positions(
+            transformed,
+            f"Straightened {anchor_a}-{anchor_b}; both anchors are on the same Y.",
+        )
+
+    def _redraw_anchor_geometry_canvas(self) -> None:
+        canvas = getattr(self, "anchor_geometry_canvas", None)
+        if canvas is None:
+            return
+        try:
+            if not canvas.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        positions = self._current_anchor_layout_positions()
+        if not positions:
+            self._render_empty_anchor_geometry_plot(canvas)
+        else:
+            self._render_anchor_geometry_plot(canvas, positions)
+
+    def _render_empty_anchor_geometry_plot(self, canvas: Any) -> None:
+        canvas.delete("all")
+        canvas.create_text(
+            18,
+            18,
+            text="Anchor geometry appears after solving pair distances.",
+            anchor="nw",
+            fill="#57606a",
+        )
+
+    def _render_anchor_geometry_plot(
+        self,
+        canvas: Any,
+        positions: dict[str, tuple[float, float]],
+    ) -> None:
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), 420)
+        height = max(canvas.winfo_height(), 320)
+        xs = [x for x, _y in positions.values()]
+        ys = [y for _x, y in positions.values()]
+        min_x = min(xs)
+        max_x = max(xs)
+        min_y = min(ys)
+        max_y = max(ys)
+        if math.isclose(min_x, max_x):
+            min_x -= 1.0
+            max_x += 1.0
+        if math.isclose(min_y, max_y):
+            min_y -= 1.0
+            max_y += 1.0
+        data_width = max_x - min_x
+        data_height = max_y - min_y
+        pad_x = max(data_width * 0.12, 0.35)
+        pad_y = max(data_height * 0.12, 0.35)
+        min_x -= pad_x
+        max_x += pad_x
+        min_y -= pad_y
+        max_y += pad_y
+
+        margin = 36
+        plot_width = max(width - 2 * margin, 1)
+        plot_height = max(height - 2 * margin, 1)
+        scale = min(plot_width / max(max_x - min_x, 1e-9), plot_height / max(max_y - min_y, 1e-9))
+        center_x_m = (min_x + max_x) / 2.0
+        center_y_m = (min_y + max_y) / 2.0
+        center_x_px = width / 2.0
+        center_y_px = height / 2.0
+
+        def project(x_m: float, y_m: float) -> tuple[float, float]:
+            return (
+                center_x_px + (x_m - center_x_m) * scale,
+                center_y_px - (y_m - center_y_m) * scale,
+            )
+
+        canvas.create_rectangle(
+            margin,
+            margin,
+            width - margin,
+            height - margin,
+            outline="#d0d7de",
+        )
+        canvas.create_text(width / 2, height - 8, text="x (m)", anchor="s", fill="#57606a")
+        canvas.create_text(8, height / 2, text="y (m)", anchor="w", fill="#57606a", angle=90)
+
+        pairs = (
+            self.anchor_layout_result.processed_pairs
+            if self.anchor_layout_result is not None
+            else tuple(self.anchor_pair_distances.values())
+        )
+        residuals = pair_residuals(positions, pairs)
+        for pair in pairs:
+            if pair.anchor_a_id not in positions or pair.anchor_b_id not in positions:
+                continue
+            ax, ay = project(*positions[pair.anchor_a_id])
+            bx, by = project(*positions[pair.anchor_b_id])
+            pair_id = f"{pair.anchor_a_id}-{pair.anchor_b_id}"
+            residual = residuals.get(pair_id, 0.0)
+            color = "#cf222e" if abs(residual) > 0.10 else "#8c959f"
+            canvas.create_line(ax, ay, bx, by, fill=color, width=2)
+            canvas.create_text(
+                (ax + bx) / 2.0,
+                (ay + by) / 2.0,
+                text=f"{pair.distance_m:.2f} m",
+                anchor="s",
+                fill=color,
+            )
+
+        for anchor_id, (x_m, y_m) in sorted(positions.items()):
+            x_px, y_px = project(x_m, y_m)
+            canvas.create_oval(
+                x_px - 7,
+                y_px - 7,
+                x_px + 7,
+                y_px + 7,
+                fill="#0969da",
+                outline="",
+            )
+            canvas.create_text(
+                x_px + 9,
+                y_px - 9,
+                text=f"{anchor_id}\n({x_m:.2f}, {y_m:.2f})",
+                anchor="sw",
+                fill="#24292f",
+            )
+
+    def _start_anchor_layout_drag_rotate(self, event: Any) -> None:
+        positions = self._current_anchor_layout_positions()
+        if not positions:
+            return
+        canvas = self.anchor_geometry_canvas
+        cx = max(canvas.winfo_width(), 1) / 2.0
+        cy = max(canvas.winfo_height(), 1) / 2.0
+        self.anchor_layout_drag_start_angle = math.atan2(event.y - cy, event.x - cx)
+        self.anchor_layout_drag_positions = positions
+
+    def _drag_anchor_layout_rotate(self, event: Any) -> None:
+        if self.anchor_layout_drag_start_angle is None or self.anchor_layout_drag_positions is None:
+            return
+        canvas = self.anchor_geometry_canvas
+        cx = max(canvas.winfo_width(), 1) / 2.0
+        cy = max(canvas.winfo_height(), 1) / 2.0
+        current_angle = math.atan2(event.y - cy, event.x - cx)
+        degrees = math.degrees(current_angle - self.anchor_layout_drag_start_angle)
+        self.anchor_layout_positions = rotate_layout(self.anchor_layout_drag_positions, degrees)
+        self.anchor_geometry_status_var.set(f"Rotating layout by {degrees:.1f} degrees.")
+        self._redraw_anchor_geometry_canvas()
+
+    def _end_anchor_layout_drag_rotate(self, _event: Any) -> None:
+        if self.anchor_layout_drag_start_angle is None:
+            return
+        self.anchor_layout_drag_start_angle = None
+        self.anchor_layout_drag_positions = None
+        if self.anchor_layout_result is not None:
+            self._show_anchor_layout_result(self.anchor_layout_result)
+
     def _add_anchor_true_distance_controls(self) -> None:
         session_frame = find_labelframe(self, "Measurement Session")
         if session_frame is None:
@@ -1675,14 +2531,29 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
 
     def disconnect_transport(self) -> None:
         self.stop_live_tracking("Live tracking stopped; Bluetooth is disconnected.")
+        if self.anchor_survey_in_flight:
+            self._finish_anchor_pair_survey_window("Anchor pair survey stopped; Bluetooth is disconnected.")
         super().disconnect_transport()
+
+    def _handle_command_result(self, packet: Any) -> None:
+        super()._handle_command_result(packet)
+        self._handle_anchor_survey_command_result(packet)
 
     def handle_serial_line(self, line: str) -> None:
         super().handle_serial_line(line)
 
     def handle_records(self, records: list[Any]) -> None:
-        localization_updated = False
+        normal_records: list[Any] = []
         for record in records:
+            if str(getattr(record, "kind", "")).startswith("survey_pair"):
+                self._handle_anchor_pair_record(record)
+            else:
+                normal_records.append(record)
+        if not normal_records:
+            return
+
+        localization_updated = False
+        for record in normal_records:
             if record.anchor_id:
                 anchor_key = str(record.anchor_id).strip()
                 self._register_detected_anchor(record.anchor_id)
@@ -1697,7 +2568,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         if localization_updated and self.live_tracking_active:
             self._try_live_tracking_solve()
         self._refresh_anchor_truth_table()
-        super().handle_records(records)
+        super().handle_records(normal_records)
 
     def check_los_alert(self, record: Any) -> float | None:
         distance = record.distance_m if record.distance_m is not None else record.mean_distance_m
