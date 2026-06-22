@@ -50,12 +50,12 @@ position with the same radical-axis solver.
 ## Anchor Geometry Survey
 
 The extended GUI also includes an `Anchor Geometry` tab for anchor-to-anchor
-survey data. `Gather Anchor Distances` sends `CMD_SURVEY_START_PAIR` to the
-clicker, then waits for the configured collection window while incoming
-`SURVEY_PAIR_RESULT` packets populate the pair table. The final firmware TLV
-shape is still expected to settle; the parser accepts repeated `ANCHOR_ID` TLVs
-and provisional pair-specific TLVs for anchor A, anchor B, pair distance, and
-pair status.
+survey data. `Gather Anchor Distances` sends
+`CMD_ML_START_ANCHOR_PAIR_SURVEY` (`0x8002`) to the clicker with an optional
+2..8 discovery-slot count. The clicker discovers anchors, schedules all
+anchor-to-anchor pairs, emits one diagnostic `CLICK_REPORT` row per reported
+pair, then finishes with a command result. Pair rows are recognized by
+`TLV_INITIATOR_ID` and `TLV_RESPONDER_ID`.
 
 Pair distances can also be added manually. `Solve Layout` treats each pair
 distance as a spring and optimizes the lowest-energy 2D anchor layout with a
@@ -74,11 +74,10 @@ local capture session; they do not send text commands such as `START` or `STOP`.
 The measurement/export workflow expects these incoming IMEC binary messages:
 
 ```text
-0x20 CLICK_REPORT           normal click distance measurements
+0x20 CLICK_REPORT           normal click measurements and diagnostic anchor-pair rows
 0x22 ANCHOR_HEARTBEAT       device health/status telemetry
 0x41 COMMAND_RESULT         result for a GUI command
 0x51 SURVEY_REACH_REPORT    anchor reachability survey output
-0x53 SURVEY_PAIR_RESULT     anchor-to-anchor distance measurements
 0x7F MSG_ERROR              protocol or firmware error
 ```
 
@@ -90,10 +89,10 @@ CMD_START_HEARTBEAT     0x0009
 CMD_STOP_HEARTBEAT      0x000A
 CMD_SURVEY_REACHABILITY 0x0100
 CMD_SURVEY_PREPARE_PAIR 0x0101
-CMD_SURVEY_START_PAIR   0x0102
 CMD_SURVEY_ABORT        0x0103
 CMD_ML_START_COLLECTION 0x8000
 CMD_ML_START_FAST_RANGING 0x8001
+CMD_ML_START_ANCHOR_PAIR_SURVEY 0x8002
 ```
 
 The command packets use the shared IMEC binary envelope and TLV payloads from

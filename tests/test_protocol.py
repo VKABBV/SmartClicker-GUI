@@ -10,8 +10,8 @@ from uwb_capture.protocol import (
     ProtocolError,
     TlvId,
     build_ml_start_collection_packet,
-    build_survey_start_pair_packet,
     build_ml_start_fast_ranging_packet,
+    build_ml_start_anchor_pair_survey_packet,
     cobs_decode,
     cobs_encode,
     command_result_summary,
@@ -152,13 +152,12 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(frame[-1], 0x00)
         self.assertEqual(cobs_decode(frame[:-1]), proto_packet)
 
-    def test_build_survey_start_pair_packet(self) -> None:
-        raw = build_survey_start_pair_packet(
+    def test_build_anchor_pair_survey_packet(self) -> None:
+        raw = build_ml_start_anchor_pair_survey_packet(
             source_id=0x100,
             destination_id=0x200,
             session_id=44,
             sequence=9,
-            sample_count=10,
             discovery_slot_count=4,
         )
         packet = decode_packet(raw)
@@ -168,9 +167,19 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(packet.destination_id, 0x200)
         self.assertEqual(packet.session_id, 44)
         self.assertEqual(packet.sequence, 9)
-        self.assertIn(bytes([TlvId.COMMAND_ID, 2, 0x02, 0x01]), packet.payload)
-        self.assertIn(bytes([TlvId.SAMPLE_COUNT, 1, 10]), packet.payload)
+        self.assertIn(bytes([TlvId.COMMAND_ID, 2, 0x02, 0x80]), packet.payload)
         self.assertIn(bytes([TlvId.DISCOVERY_SLOT_COUNT, 1, 4]), packet.payload)
+        self.assertNotIn(bytes([TlvId.SAMPLE_COUNT]), packet.payload)
+
+    def test_anchor_pair_survey_rejects_invalid_discovery_slots(self) -> None:
+        with self.assertRaises(ProtocolError):
+            build_ml_start_anchor_pair_survey_packet(
+                source_id=0x100,
+                destination_id=0x200,
+                session_id=44,
+                sequence=9,
+                discovery_slot_count=1,
+            )
 
 
 class StreamTests(unittest.TestCase):
@@ -337,9 +346,9 @@ class MlSampleTests(unittest.TestCase):
 
 
 class SurveyPairResultTests(unittest.TestCase):
-    def test_repeated_anchor_id_tlvs_become_survey_pair_record(self) -> None:
+    def test_diagnostic_click_report_with_initiator_responder_becomes_survey_pair_record(self) -> None:
         packet = ImecPacket(
-            msg_type=MessageType.SURVEY_PAIR_RESULT,
+            msg_type=MessageType.CLICK_REPORT,
             flags=FLAG_DIAGNOSTIC,
             source_id=0xA1,
             destination_id=0,
@@ -349,11 +358,18 @@ class SurveyPairResultTests(unittest.TestCase):
             message_age_ms=0,
             payload=encode_tlvs(
                 [
-                    (TlvId.ANCHOR_ID, u64(0xA1)),
-                    (TlvId.ANCHOR_ID, u64(0xB2)),
-                    (TlvId.DISTANCE_MM, i32(3456)),
-                    (TlvId.RANGE_STATUS, u8(0)),
+                    (TlvId.CLICKER_ID, u64(0x1111)),
+                    (TlvId.SURVEY_ID, u32(88)),
+                    (TlvId.EVENT_SEQ, u32(99)),
+                    (TlvId.TIMESTAMP_MS, u64(123456)),
+                    (TlvId.INITIATOR_ID, u64(0xA1)),
+                    (TlvId.RESPONDER_ID, u64(0xB2)),
+                    (TlvId.SAMPLE_INDEX, u16(2)),
                     (TlvId.SAMPLE_COUNT, u16(6)),
+                    (TlvId.DISTANCE_MM, i32(3456)),
+                    (TlvId.QUALITY, u8(93)),
+                    (TlvId.RANGE_STATUS, u8(0)),
+                    (TlvId.UWB_RSL_DBM, u8(-75 & 0xFF)),
                 ]
             ),
         )
@@ -365,14 +381,21 @@ class SurveyPairResultTests(unittest.TestCase):
         self.assertEqual(record.kind, "survey_pair")
         self.assertEqual(record.anchor_id, "0x00000000000000A1")
         self.assertEqual(record.peer_anchor_id, "0x00000000000000B2")
+        self.assertEqual(record.clicker_id, "0x0000000000001111")
+        self.assertEqual(record.sample_index, 2)
         self.assertEqual(record.distance_m, 3.456)
         self.assertEqual(record.scheduled_sample_count, 6)
+        self.assertEqual(record.event_seq, 99)
+        self.assertEqual(record.firmware_timestamp_ms, 123456)
+        self.assertEqual(record.quality, 93)
+        self.assertEqual(record.rx_power_dbm, -75.0)
         self.assertEqual(record.status, "ok")
-        self.assertEqual(record.source, "survey_pair_result")
+        self.assertEqual(record.source, "anchor_pair_survey")
+        self.assertIn("SURVEY_ID", record.tlv_json)
 
-    def test_pair_specific_tlvs_become_survey_pair_failure(self) -> None:
+    def test_diagnostic_click_report_with_failed_pair_status_becomes_survey_pair_failure(self) -> None:
         packet = ImecPacket(
-            msg_type=MessageType.SURVEY_PAIR_RESULT,
+            msg_type=MessageType.CLICK_REPORT,
             flags=FLAG_DIAGNOSTIC,
             source_id=0xA1,
             destination_id=0,
@@ -382,10 +405,12 @@ class SurveyPairResultTests(unittest.TestCase):
             message_age_ms=0,
             payload=encode_tlvs(
                 [
-                    (TlvId.SURVEY_ANCHOR_A_ID, u64(0xA1)),
-                    (TlvId.SURVEY_ANCHOR_B_ID, u64(0xB2)),
-                    (TlvId.SURVEY_PAIR_DISTANCE_MM, i32(-1)),
-                    (TlvId.SURVEY_PAIR_STATUS, u8(1)),
+                    (TlvId.INITIATOR_ID, u64(0xA1)),
+                    (TlvId.RESPONDER_ID, u64(0xB2)),
+                    (TlvId.SAMPLE_INDEX, u16(1)),
+                    (TlvId.SAMPLE_COUNT, u16(6)),
+                    (TlvId.DISTANCE_MM, i32(-1)),
+                    (TlvId.RANGE_STATUS, u8(1)),
                 ]
             ),
         )

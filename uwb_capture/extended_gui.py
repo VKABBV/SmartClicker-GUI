@@ -39,7 +39,7 @@ from .localization import (
 from .protocol import (
     CommandStatus,
     ProtocolError,
-    build_survey_start_pair_packet,
+    build_ml_start_anchor_pair_survey_packet,
     command_status_from_packet,
     next_sequence,
     parse_device_id,
@@ -177,8 +177,9 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self.anchor_survey_in_flight = False
         self.anchor_survey_pending_session: int | None = None
         self.anchor_survey_pending_seq: int | None = None
-        self.anchor_survey_after_id: str | None = None
-        self.anchor_survey_start_pair_count = 0
+        self.anchor_survey_expected_pair_count: int | None = None
+        self.anchor_survey_received_pair_count = 0
+        self.anchor_survey_successful_pair_count = 0
         self.live_tracking_active = False
         self.live_tracking_after_id: str | None = None
         self._pyth_updating = False
@@ -1116,7 +1117,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self.anchor_geometry_status_var = tk.StringVar(
             value="Send a survey command or add anchor-to-anchor distances manually."
         )
-        self.anchor_survey_wait_var = tk.StringVar(value="6")
+        self.anchor_survey_discovery_slot_count_var = tk.StringVar(value="8")
         self.anchor_layout_seed_count_var = tk.StringVar(value="24")
         self.anchor_layout_basin_hops_var = tk.StringVar(value="10")
         self.anchor_pair_a_var = tk.StringVar()
@@ -1127,8 +1128,8 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self.anchor_layout_level_b_var = tk.StringVar()
         self.anchor_layout_rotate_degrees_var = tk.StringVar(value="15")
 
-        ttk.Label(header, text="Collect window s").grid(row=0, column=0, sticky="w")
-        ttk.Entry(header, textvariable=self.anchor_survey_wait_var, width=8).grid(
+        ttk.Label(header, text="Discovery slots").grid(row=0, column=0, sticky="w")
+        ttk.Entry(header, textvariable=self.anchor_survey_discovery_slot_count_var, width=8).grid(
             row=0,
             column=1,
             sticky="ew",
@@ -1143,7 +1144,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self.anchor_survey_button.grid(row=0, column=2, columnspan=2, sticky="ew", padx=(0, 5))
         self.anchor_survey_stop_button = ttk.Button(
             header,
-            text="Stop Waiting",
+            text="Reset Wait",
             command=self.stop_anchor_pair_survey_wait,
         )
         self.anchor_survey_stop_button.grid(row=0, column=4, sticky="ew", padx=5)
@@ -1508,21 +1509,18 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             self.anchor_geometry_status_var.set("Anchor pair survey is already waiting for results.")
             return False
         try:
-            wait_ms = self._anchor_survey_wait_ms()
-            sample_count = self._ml_sample_count()
-            discovery_slots = self._ml_discovery_slot_count()
+            discovery_slots = self._anchor_survey_discovery_slot_count()
             session_id = self._ml_session_id()
             source_id = parse_device_id(self.host_id_var.get(), default=0)
             if source_id == 0:
                 raise ProtocolError("Host ID must be a stable non-zero device ID.")
             destination_id = parse_device_id(self.clicker_id_var.get(), default=0)
             self.protocol_sequence = next_sequence(self.protocol_sequence)
-            packet = build_survey_start_pair_packet(
+            packet = build_ml_start_anchor_pair_survey_packet(
                 source_id=source_id,
                 destination_id=destination_id,
                 session_id=session_id,
                 sequence=self.protocol_sequence,
-                sample_count=sample_count,
                 discovery_slot_count=discovery_slots,
             )
         except ProtocolError as exc:
@@ -1538,24 +1536,27 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self.anchor_survey_in_flight = True
         self.anchor_survey_pending_session = session_id
         self.anchor_survey_pending_seq = self.protocol_sequence
-        self.anchor_survey_start_pair_count = len(self.anchor_pair_distances)
+        self.anchor_survey_expected_pair_count = None
+        self.anchor_survey_received_pair_count = 0
+        self.anchor_survey_successful_pair_count = 0
         self._set_anchor_survey_state(True)
-        self._cancel_anchor_survey_timer()
-        self.anchor_survey_after_id = self.after(wait_ms, self._finish_anchor_pair_survey_window)
         self.anchor_geometry_status_var.set(
-            f"Anchor pair survey sent; collecting results for {wait_ms / 1000:.1f} s."
+            "Anchor pair survey sent; waiting for pair rows and final command result."
         )
         self.log_raw(
-            f"# Queued SURVEY_START_PAIR to {self.clicker_id_var.get().strip() or 'broadcast'} "
+            f"# Queued ML_START_ANCHOR_PAIR_SURVEY to {self.clicker_id_var.get().strip() or 'broadcast'} "
             f"(session={session_id} seq={self.protocol_sequence})"
         )
         return True
 
-    def _anchor_survey_wait_ms(self) -> int:
-        seconds = safe_float(self.anchor_survey_wait_var.get())
-        if seconds is None or seconds <= 0:
-            raise ProtocolError("Collect window must be greater than 0 seconds.")
-        return max(int(seconds * 1000), 250)
+    def _anchor_survey_discovery_slot_count(self) -> int | None:
+        text = self.anchor_survey_discovery_slot_count_var.get().strip()
+        if not text:
+            return None
+        value = original.safe_int(text)
+        if value is None or not (2 <= value <= 8):
+            raise ProtocolError("Anchor pair survey discovery slots must be from 2 to 8.")
+        return value
 
     def _set_anchor_survey_state(self, in_flight: bool) -> None:
         if hasattr(self, "anchor_survey_button"):
@@ -1563,31 +1564,31 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         if hasattr(self, "anchor_survey_stop_button"):
             self.anchor_survey_stop_button.configure(state="normal" if in_flight else "disabled")
 
-    def _cancel_anchor_survey_timer(self) -> None:
-        after_id = self.anchor_survey_after_id
-        self.anchor_survey_after_id = None
-        if after_id is None:
-            return
-        try:
-            self.after_cancel(after_id)
-        except Exception:
-            pass
-
     def stop_anchor_pair_survey_wait(self) -> None:
         if not self.anchor_survey_in_flight:
             return
-        self._finish_anchor_pair_survey_window("Anchor pair survey wait stopped.")
+        self._finish_anchor_pair_survey("Anchor pair survey wait reset.")
 
-    def _finish_anchor_pair_survey_window(self, reason: str | None = None) -> None:
-        self._cancel_anchor_survey_timer()
-        new_count = max(len(self.anchor_pair_distances) - self.anchor_survey_start_pair_count, 0)
+    def _anchor_survey_progress_text(self) -> str:
+        received = self.anchor_survey_received_pair_count
+        expected = self.anchor_survey_expected_pair_count
+        if expected is None:
+            return f"{received} pair row(s) received"
+        return f"{received}/{expected} pair row(s) received"
+
+    def _finish_anchor_pair_survey(self, reason: str | None = None) -> None:
+        progress = self._anchor_survey_progress_text()
         self.anchor_survey_in_flight = False
         self.anchor_survey_pending_session = None
         self.anchor_survey_pending_seq = None
+        self.anchor_survey_expected_pair_count = None
+        self.anchor_survey_received_pair_count = 0
+        successful_pair_count = self.anchor_survey_successful_pair_count
+        self.anchor_survey_successful_pair_count = 0
         self._set_anchor_survey_state(False)
-        message = reason or f"Anchor pair survey window ended; {new_count} new pair(s) received."
+        message = reason or f"Anchor pair survey ended; {progress}."
         self.anchor_geometry_status_var.set(message)
-        if self.anchor_pair_distances:
+        if successful_pair_count > 0 and self.anchor_pair_distances:
             self.solve_anchor_geometry(show_errors=False)
 
     def _handle_anchor_survey_command_result(self, packet: Any) -> None:
@@ -1599,15 +1600,18 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             return
         status = command_status_from_packet(packet)
         if status is None or status == CommandStatus.COMMAND_OK:
-            self.anchor_geometry_status_var.set("Survey command accepted; waiting for pair results.")
+            self._finish_anchor_pair_survey(
+                f"Anchor pair survey complete; {self._anchor_survey_progress_text()}."
+            )
             return
 
-        self._cancel_anchor_survey_timer()
-        self.anchor_survey_in_flight = False
-        self.anchor_survey_pending_session = None
-        self.anchor_survey_pending_seq = None
-        self._set_anchor_survey_state(False)
-        self.anchor_geometry_status_var.set(f"Survey command result: {original._command_status_name(status)}")
+        status_name = original._command_status_name(status)
+        if status == CommandStatus.COMMAND_TIMEOUT:
+            self._finish_anchor_pair_survey(
+                f"Anchor pair survey timed out; {self._anchor_survey_progress_text()}."
+            )
+        else:
+            self._finish_anchor_pair_survey(f"Anchor pair survey result: {status_name}.")
 
     def _handle_anchor_pair_record(self, record: Any) -> None:
         anchor_a = str(record.anchor_id or "").strip()
@@ -1616,9 +1620,15 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             return
         self._register_detected_anchor(anchor_a)
         self._register_detected_anchor(anchor_b)
+        if self.anchor_survey_in_flight:
+            self.anchor_survey_received_pair_count += 1
+            if record.scheduled_sample_count is not None:
+                self.anchor_survey_expected_pair_count = int(record.scheduled_sample_count)
         if record.kind == "survey_pair_failure" or record.distance_m is None:
             self.anchor_geometry_status_var.set(
-                f"Anchor pair {anchor_a}-{anchor_b} failed: {record.status or record.error_code or 'unknown'}"
+                f"Anchor pair {anchor_a}-{anchor_b} failed: "
+                f"{record.status or record.error_code or 'unknown'} "
+                f"({self._anchor_survey_progress_text()})."
             )
             self.log_raw(
                 f"# Anchor pair survey failure {anchor_a}-{anchor_b}: "
@@ -1637,8 +1647,11 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             source,
             record.status or "ok",
         )
+        if self.anchor_survey_in_flight:
+            self.anchor_survey_successful_pair_count += 1
         self.anchor_geometry_status_var.set(
-            f"Received pair {anchor_a}-{anchor_b}: {float(record.distance_m):.3f} m."
+            f"Received pair {anchor_a}-{anchor_b}: {float(record.distance_m):.3f} m "
+            f"({self._anchor_survey_progress_text()})."
         )
         self._redraw_anchor_geometry_canvas()
 
@@ -2532,7 +2545,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
     def disconnect_transport(self) -> None:
         self.stop_live_tracking("Live tracking stopped; Bluetooth is disconnected.")
         if self.anchor_survey_in_flight:
-            self._finish_anchor_pair_survey_window("Anchor pair survey stopped; Bluetooth is disconnected.")
+            self._finish_anchor_pair_survey("Anchor pair survey stopped; Bluetooth is disconnected.")
         super().disconnect_transport()
 
     def _handle_command_result(self, packet: Any) -> None:
