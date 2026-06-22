@@ -7,6 +7,7 @@ from uwb_capture.protocol import (
     ImecPacket,
     ImecPacketStream,
     MessageType,
+    ProtocolError,
     TlvId,
     build_ml_start_collection_packet,
     cobs_decode,
@@ -71,7 +72,7 @@ class CommandTests(unittest.TestCase):
             session_id=1234,
             sequence=7,
             sample_count=12,
-            discovery_slot_count=20,
+            discovery_slot_count=8,
         )
         packet = decode_packet(raw)
 
@@ -86,7 +87,40 @@ class CommandTests(unittest.TestCase):
         self.assertIn(bytes([TlvId.COMMAND_ID, 2, 0x00, 0x80]), packet.payload)
         # Sample count and discovery slot count TLVs.
         self.assertIn(bytes([TlvId.SAMPLE_COUNT, 1, 12]), packet.payload)
-        self.assertIn(bytes([TlvId.DISCOVERY_SLOT_COUNT, 1, 20]), packet.payload)
+        self.assertIn(bytes([TlvId.DISCOVERY_SLOT_COUNT, 1, 8]), packet.payload)
+
+    def test_ml_start_collection_packet_accepts_current_limits(self) -> None:
+        packet = decode_packet(
+            build_ml_start_collection_packet(
+                source_id=0x100,
+                destination_id=0,
+                session_id=1234,
+                sequence=7,
+                sample_count=100,
+                discovery_slot_count=8,
+            )
+        )
+
+        self.assertIn(bytes([TlvId.SAMPLE_COUNT, 1, 100]), packet.payload)
+        self.assertIn(bytes([TlvId.DISCOVERY_SLOT_COUNT, 1, 8]), packet.payload)
+
+    def test_ml_start_collection_packet_rejects_out_of_range_limits(self) -> None:
+        with self.assertRaises(ProtocolError):
+            build_ml_start_collection_packet(
+                source_id=0x100,
+                destination_id=0,
+                session_id=1234,
+                sequence=7,
+                sample_count=101,
+            )
+        with self.assertRaises(ProtocolError):
+            build_ml_start_collection_packet(
+                source_id=0x100,
+                destination_id=0,
+                session_id=1234,
+                sequence=7,
+                discovery_slot_count=9,
+            )
 
     def test_ml_command_uses_cobs_on_the_wire(self) -> None:
         proto_packet = build_ml_start_collection_packet(
@@ -218,6 +252,50 @@ class MlSampleTests(unittest.TestCase):
         record = records_from_packet(decode_packet(encode_packet(packet)))[0]
         self.assertIn("0xAA", record.tlv_json)
         self.assertIn("dead", record.tlv_json)
+
+    def test_post_burst_diagnostic_is_not_training_row(self) -> None:
+        payload = encode_tlvs(
+            [
+                (TlvId.CLICKER_ID, u64(0x1111)),
+                (TlvId.ANCHOR_ID, u64(0xAABBCCDD)),
+                (TlvId.EVENT_SEQ, u32(99)),
+                (TlvId.TIMESTAMP_MS, u64(1_000_100)),
+                (TlvId.DISTANCE_MM, i32(1260)),
+                (TlvId.QUALITY, u8(80)),
+                (TlvId.RANGE_STATUS, u8(0)),
+                (TlvId.BURST_ID, u32(0xBEEF)),
+                (TlvId.DIAG_SOURCE, u8(3)),
+                (TlvId.UWB_CIR_BYTE_OFFSET, u16(0)),
+                (TlvId.UWB_CIR_TOTAL_BYTES, u16(6)),
+                (TlvId.UWB_CIR_FIRST_PATH_INDEX, u16(700)),
+                (TlvId.UWB_CIR_START_INDEX, u16(640)),
+                (TlvId.UWB_CIR_FULL_CHUNK, b"\x01\x00\x00\x02\x00\x00"),
+            ]
+        )
+        packet = ImecPacket(
+            msg_type=MessageType.CLICK_REPORT,
+            flags=FLAG_DIAGNOSTIC,
+            source_id=0xAABBCCDD,
+            destination_id=0,
+            session_id=99,
+            sequence=1,
+            ttl=1,
+            message_age_ms=0,
+            payload=payload,
+        )
+
+        records = records_from_packet(decode_packet(encode_packet(packet)))
+
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record.kind, "diagnostic_fragment")
+        self.assertEqual(record.anchor_id, "0x00000000AABBCCDD")
+        self.assertEqual(record.event_seq, 99)
+        self.assertEqual(record.burst_id, 0xBEEF)
+        self.assertEqual(record.cir_first_path_index, 700)
+        self.assertEqual(record.cir_start_index, 640)
+        self.assertEqual(record.diag_source, 3)
+        self.assertIn("UWB_CIR_FULL_CHUNK", record.tlv_json)
 
 
 class CommandResultTests(unittest.TestCase):
