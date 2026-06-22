@@ -959,28 +959,25 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         canvas.delete("all")
         width = max(canvas.winfo_width(), 420)
         height = max(canvas.winfo_height(), 260)
-        points = [(reading.x_m, reading.y_m) for reading in result.processed_readings]
-        points.append((result.x_m, result.y_m))
-        for reading in result.processed_readings:
-            radius = reading.corrected_range_m
-            points.extend(
-                [
-                    (reading.x_m - radius, reading.y_m - radius),
-                    (reading.x_m + radius, reading.y_m + radius),
-                ]
-            )
-        min_x = min(x for x, _ in points)
-        max_x = max(x for x, _ in points)
-        min_y = min(y for _, y in points)
-        max_y = max(y for _, y in points)
+        anchor_points = [(reading.x_m, reading.y_m) for reading in result.processed_readings]
+        anchor_min_x = min(x for x, _ in anchor_points)
+        anchor_max_x = max(x for x, _ in anchor_points)
+        anchor_min_y = min(y for _, y in anchor_points)
+        anchor_max_y = max(y for _, y in anchor_points)
+        min_x = min(anchor_min_x, result.x_m)
+        max_x = max(anchor_max_x, result.x_m)
+        min_y = min(anchor_min_y, result.y_m)
+        max_y = max(anchor_max_y, result.y_m)
         if math.isclose(min_x, max_x):
             min_x -= 1.0
             max_x += 1.0
         if math.isclose(min_y, max_y):
             min_y -= 1.0
             max_y += 1.0
-        pad_x = max((max_x - min_x) * 0.15, 0.5)
-        pad_y = max((max_y - min_y) * 0.15, 0.5)
+        anchor_width = max(anchor_max_x - anchor_min_x, max_x - min_x)
+        anchor_height = max(anchor_max_y - anchor_min_y, max_y - min_y)
+        pad_x = max(anchor_width * 0.04, 0.15)
+        pad_y = max(anchor_height * 0.04, 0.15)
         min_x -= pad_x
         max_x += pad_x
         min_y -= pad_y
