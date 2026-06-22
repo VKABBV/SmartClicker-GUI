@@ -36,7 +36,6 @@ from .bluetooth_io import (
     BluetoothWorker,
 )
 from .protocol import (
-    FLAG_DIAGNOSTIC,
     CommandStatus,
     ImecPacket,
     MessageType,
@@ -787,13 +786,13 @@ class UwbCaptureApp(tk.Tk):
             self.session_status_var.set(f"Stopped: {counts['samples']} samples, {counts['alerts']} alerts")
             self.log_raw(f"# Stopped session {self.current_session_id}")
 
-    def send_ml_start_collection(self) -> None:
+    def send_ml_start_collection(self) -> bool:
         if self.bluetooth_worker is None:
             self.log_raw("# Did not send ML collection; Bluetooth is not connected.")
-            return
+            return False
         if self.ml_command_in_flight:
             self.log_raw("# ML collection already in flight; wait for the command result before retrying.")
-            return
+            return False
         try:
             sample_count = self._ml_sample_count()
             discovery_slots = self._ml_discovery_slot_count()
@@ -813,11 +812,11 @@ class UwbCaptureApp(tk.Tk):
             )
         except ProtocolError as exc:
             messagebox.showerror("Invalid ML collection command", str(exc), parent=self)
-            return
+            return False
         sent = self.bluetooth_worker.send_packet(packet)
         if not sent:
             self.log_raw("# Did not send ML collection; Bluetooth is not ready.")
-            return
+            return False
         self._reset_trigger_collection_state()
         self.ml_command_in_flight = True
         self.ml_pending_session = session_id
@@ -827,6 +826,7 @@ class UwbCaptureApp(tk.Tk):
             f"# Queued ML_START_COLLECTION to {self.clicker_id_var.get().strip() or 'broadcast'} "
             f"(session={session_id} seq={self.protocol_sequence})"
         )
+        return True
 
     def _ml_sample_count(self) -> int | None:
         text = self.ml_sample_count_var.get().strip()
@@ -871,10 +871,7 @@ class UwbCaptureApp(tk.Tk):
         self.log_raw(f"# RX {summary}")
         try:
             self.log_protocol_message(packet)
-            if packet.msg_type == MessageType.CLICK_REPORT and not (packet.flags & FLAG_DIAGNOSTIC):
-                records = []
-            else:
-                records = records_from_packet(packet)
+            records = records_from_packet(packet)
         except ProtocolError as exc:
             self.log_alert(f"Could not parse {summary}: {exc}")
             records = []
@@ -884,9 +881,8 @@ class UwbCaptureApp(tk.Tk):
 
         if self.capture_active and self.store is not None and self.current_session_id is not None:
             self.store.insert_raw_line(self.current_session_id, f"{summary} {data.hex(' ')}", bool(records))
-        if not self.capture_active:
-            return
-        self.handle_records(records)
+        if records:
+            self.handle_records(records)
 
     def _handle_command_result(self, packet: ImecPacket) -> None:
         matches = (

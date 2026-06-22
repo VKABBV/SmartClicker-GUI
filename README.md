@@ -24,6 +24,28 @@ After a capture, select each responder ID and save its own LOS/NLOS label before
 exporting; the per-anchor workbooks and measurement-list workbook use those
 independent labels.
 
+## Localization And Simulation
+
+The extended GUI includes a `Localization` tab for anchor coordinates and tag
+position solving. Enter each anchor's X/Y coordinates in meters, load the latest
+captured ranges, then solve. The solver subtracts squared anchor-range equations
+to form radical-axis lines, then performs least squares on those lines. Any
+common height term cancels during the subtraction. Results report the estimated
+X/Y point, radical-axis RMSE in meters, confidence, and line residuals.
+
+Use `Run Square Simulation` to fill a four-anchor square/floor-plan test with
+fake ranges, solve it, and plot the estimated clicker point. The anchor X/Y
+fields are the known anchor placements; the clicker X/Y is not entered by the
+operator and is always estimated from anchor ranges. The visible simulation
+controls only set the floor-plan width and height. The plot can be opened in
+fullscreen from the `Fullscreen` button beside the layout preview.
+
+Use `Start Live Tracking` to send `CMD_ML_START_COLLECTION` to the clicker every
+configured number of seconds. Returned anchors are added to the localization
+table as their ranges arrive. Enter each returned anchor's real X/Y coordinate;
+after at least three anchors have coordinates and ranges, the GUI updates the
+estimated clicker position with the same radical-axis solver.
+
 ## Bluetooth Protocol Workflow
 
 The GUI now treats Connect and Disconnect as BLE transport actions. Enter or
@@ -80,6 +102,7 @@ PHY,channel,prf_mhz,preamble_code,preamble_symbols,data_rate_kbps,pac_size,ntm_1
 uwb_capture/common.py       shared helpers and ParsedRecord model
 uwb_capture/protocol.py     IMEC binary packet/TLV codec
 uwb_capture/bluetooth_io.py BLE scanner, connector, and packet writer
+uwb_capture/localization.py 2D radical-axis line least-squares solver
 uwb_capture/parser.py       legacy text line parser
 uwb_capture/store.py        SQLite persistence and base workbook export
 uwb_capture/base_gui.py     base capture GUI
