@@ -210,6 +210,9 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
     def _build_variables(self) -> None:
         super()._build_variables()
         self.range_static_offset_var = tk.StringVar(value="0")
+        self.localization_view_center_x_var = tk.StringVar()
+        self.localization_view_center_y_var = tk.StringVar()
+        self.localization_view_scale_var = tk.StringVar()
 
     def _build_layout(self) -> None:
         root = ttk.Frame(self, padding=10)
@@ -495,12 +498,46 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         plot_frame.rowconfigure(1, weight=1)
         plot_toolbar = ttk.Frame(plot_frame)
         plot_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        plot_toolbar.columnconfigure(0, weight=1)
+        for column in (1, 3, 5):
+            plot_toolbar.columnconfigure(column, weight=1)
+        ttk.Label(plot_toolbar, text="Center X").grid(row=0, column=0, sticky="w")
+        ttk.Entry(
+            plot_toolbar,
+            textvariable=self.localization_view_center_x_var,
+            width=8,
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 8))
+        ttk.Label(plot_toolbar, text="Center Y").grid(row=0, column=2, sticky="w")
+        ttk.Entry(
+            plot_toolbar,
+            textvariable=self.localization_view_center_y_var,
+            width=8,
+        ).grid(row=0, column=3, sticky="ew", padx=(4, 8))
+        ttk.Label(plot_toolbar, text="Scale px/m").grid(row=0, column=4, sticky="w")
+        ttk.Entry(
+            plot_toolbar,
+            textvariable=self.localization_view_scale_var,
+            width=8,
+        ).grid(row=0, column=5, sticky="ew", padx=(4, 8))
+        ttk.Button(
+            plot_toolbar,
+            text="Apply View",
+            command=self.apply_localization_view_controls,
+        ).grid(row=0, column=6, sticky="ew", padx=(0, 4))
+        ttk.Button(
+            plot_toolbar,
+            text="Auto View",
+            command=self.reset_localization_view_controls,
+        ).grid(row=0, column=7, sticky="ew", padx=(0, 4))
+        ttk.Button(
+            plot_toolbar,
+            text="Use Solved Layout",
+            command=self.populate_localization_from_anchor_layout,
+        ).grid(row=0, column=8, sticky="ew", padx=(0, 4))
         ttk.Button(
             plot_toolbar,
             text="Fullscreen",
             command=self.open_localization_plot_fullscreen,
-        ).grid(row=0, column=1, sticky="e")
+        ).grid(row=0, column=9, sticky="e")
         self.localization_canvas = tk.Canvas(
             plot_frame,
             height=280,
@@ -514,6 +551,39 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             lambda _event: self._redraw_localization_canvas(self.localization_canvas),
         )
         self._draw_empty_localization_plot()
+
+    def populate_localization_from_anchor_layout(self) -> bool:
+        positions = self._current_anchor_layout_positions()
+        if not positions:
+            self.localization_status_var.set("Solve anchor geometry before loading anchor positions.")
+            messagebox.showwarning(
+                "No solved anchor layout",
+                "Solve anchor geometry before loading anchor positions.",
+                parent=self,
+            )
+            return False
+
+        self._remember_localization_positions()
+        for anchor_id, (x_m, y_m) in sorted(positions.items()):
+            row = self._ensure_localization_row(anchor_id)
+            row["enabled_var"].set(True)
+            row["anchor_var"].set(anchor_id)
+            row["x_var"].set(format_meter(x_m, ""))
+            row["y_var"].set(format_meter(y_m, ""))
+            self.localization_anchor_positions[anchor_id] = (
+                row["x_var"].get().strip(),
+                row["y_var"].get().strip(),
+            )
+
+        notebook = self.__dict__.get("right_notebook")
+        tab = self.__dict__.get("localization_tab")
+        if notebook is not None and tab is not None:
+            notebook.select(tab)
+        self.localization_status_var.set(
+            f"Loaded {len(positions)} anchor coordinate(s) from solved anchor layout."
+        )
+        self._redraw_localization_views()
+        return True
 
     def _ensure_localization_row(self, anchor_id: str) -> dict[str, Any]:
         anchor_key = anchor_id.strip()
@@ -1017,6 +1087,9 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self._draw_empty_localization_plot()
 
     def _draw_empty_localization_plot(self) -> None:
+        self._redraw_localization_views()
+
+    def _redraw_localization_views(self) -> None:
         self._redraw_localization_canvas(getattr(self, "localization_canvas", None))
         self._redraw_localization_canvas(getattr(self, "localization_fullscreen_canvas", None))
 
@@ -1107,6 +1180,77 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         if fullscreen_canvas is not None:
             self._redraw_localization_canvas(fullscreen_canvas)
 
+    def _localization_view_number(self, attr_name: str) -> float | None:
+        variable = getattr(self, attr_name, None)
+        if variable is None:
+            return None
+        return safe_float(variable.get())
+
+    def _localization_plot_view(
+        self,
+        result: LocalizationResult,
+        width: int,
+        height: int,
+        margin: int,
+    ) -> tuple[float, float, float, float, float, float, float]:
+        min_x, max_x, min_y, max_y = self._localization_plot_bounds(result)
+        plot_width = max(width - 2 * margin, 1)
+        plot_height = max(height - 2 * margin, 1)
+        data_width = max(max_x - min_x, 1e-9)
+        data_height = max(max_y - min_y, 1e-9)
+        auto_scale = min(plot_width / data_width, plot_height / data_height)
+        auto_center_x_m = (min_x + max_x) / 2.0
+        auto_center_y_m = (min_y + max_y) / 2.0
+
+        manual_scale = self._localization_view_number("localization_view_scale_var")
+        scale = manual_scale if manual_scale is not None and manual_scale > 0 else auto_scale
+        center_x_m = self._localization_view_number("localization_view_center_x_var")
+        center_y_m = self._localization_view_number("localization_view_center_y_var")
+        if center_x_m is None:
+            center_x_m = auto_center_x_m
+        if center_y_m is None:
+            center_y_m = auto_center_y_m
+
+        view_width_m = plot_width / max(scale, 1e-9)
+        view_height_m = plot_height / max(scale, 1e-9)
+        view_min_x = center_x_m - view_width_m / 2.0
+        view_max_x = center_x_m + view_width_m / 2.0
+        view_min_y = center_y_m - view_height_m / 2.0
+        view_max_y = center_y_m + view_height_m / 2.0
+        return center_x_m, center_y_m, scale, view_min_x, view_max_x, view_min_y, view_max_y
+
+    def _localization_view_controls_valid(self) -> bool:
+        fields = (
+            ("View center X", self.localization_view_center_x_var, False),
+            ("View center Y", self.localization_view_center_y_var, False),
+            ("View scale", self.localization_view_scale_var, True),
+        )
+        for label, variable, positive in fields:
+            text = str(variable.get()).strip()
+            if not text:
+                continue
+            value = safe_float(text)
+            if value is None:
+                self.localization_status_var.set(f"{label} must be numeric or blank.")
+                return False
+            if positive and value <= 0:
+                self.localization_status_var.set(f"{label} must be greater than 0 or blank.")
+                return False
+        return True
+
+    def apply_localization_view_controls(self) -> None:
+        if not self._localization_view_controls_valid():
+            return
+        self._redraw_localization_views()
+        self.localization_status_var.set("Applied localization plot view.")
+
+    def reset_localization_view_controls(self) -> None:
+        self.localization_view_center_x_var.set("")
+        self.localization_view_center_y_var.set("")
+        self.localization_view_scale_var.set("")
+        self._redraw_localization_views()
+        self.localization_status_var.set("Using automatic localization plot view.")
+
     def _localization_plot_bounds(self, result: LocalizationResult) -> tuple[float, float, float, float]:
         anchor_points = [(reading.x_m, reading.y_m) for reading in result.processed_readings]
         room_width = safe_float(self.sim_width_var.get()) if hasattr(self, "sim_width_var") else None
@@ -1144,21 +1288,16 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         canvas.delete("all")
         width = max(canvas.winfo_width(), 420)
         height = max(canvas.winfo_height(), 260)
-        min_x, max_x, min_y, max_y = self._localization_plot_bounds(result)
         margin = 32
-        plot_width = width - 2 * margin
-        plot_height = height - 2 * margin
-        data_width = max(max_x - min_x, 1e-9)
-        data_height = max(max_y - min_y, 1e-9)
-        scale = min(plot_width / data_width, plot_height / data_height)
-        center_x_m = (min_x + max_x) / 2.0
-        center_y_m = (min_y + max_y) / 2.0
-        view_width_m = plot_width / scale
-        view_height_m = plot_height / scale
-        view_min_x = center_x_m - view_width_m / 2.0
-        view_max_x = center_x_m + view_width_m / 2.0
-        view_min_y = center_y_m - view_height_m / 2.0
-        view_max_y = center_y_m + view_height_m / 2.0
+        (
+            center_x_m,
+            center_y_m,
+            scale,
+            view_min_x,
+            view_max_x,
+            view_min_y,
+            view_max_y,
+        ) = self._localization_plot_view(result, width, height, margin)
         center_x_px = width / 2.0
         center_y_px = height / 2.0
 
@@ -1292,6 +1431,11 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             padx=(6, 10),
             pady=(8, 0),
         )
+        ttk.Button(
+            header,
+            text="Use In Localization",
+            command=self.populate_localization_from_anchor_layout,
+        ).grid(row=1, column=4, columnspan=2, sticky="ew", pady=(8, 0))
         ttk.Label(header, textvariable=self.anchor_geometry_status_var, style="Status.TLabel").grid(
             row=2,
             column=0,

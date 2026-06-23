@@ -44,6 +44,77 @@ class LocalizationGuiTests(unittest.TestCase):
             (-0.28, 7.28, -0.28, 7.28),
         )
 
+    def test_manual_plot_view_uses_requested_center_and_scale(self) -> None:
+        app = ExtendedUwbCaptureApp.__new__(ExtendedUwbCaptureApp)
+        app.sim_width_var = FakeVar("7")
+        app.sim_height_var = FakeVar("7")
+        app.localization_view_center_x_var = FakeVar("2")
+        app.localization_view_center_y_var = FakeVar("3")
+        app.localization_view_scale_var = FakeVar("50")
+        result = solve_position(
+            [
+                LocalizationReading("A1", 0.0, 0.0, math.hypot(1.0, 1.0)),
+                LocalizationReading("A2", 0.3, 0.8, math.hypot(0.7, 0.2)),
+                LocalizationReading("A3", 1.5, 1.0, 0.5),
+            ]
+        )
+
+        center_x, center_y, scale, min_x, max_x, min_y, max_y = app._localization_plot_view(
+            result,
+            width=500,
+            height=300,
+            margin=32,
+        )
+
+        self.assertEqual(center_x, 2.0)
+        self.assertEqual(center_y, 3.0)
+        self.assertEqual(scale, 50.0)
+        self.assertAlmostEqual(min_x, -2.36)
+        self.assertAlmostEqual(max_x, 6.36)
+        self.assertAlmostEqual(min_y, 0.64)
+        self.assertAlmostEqual(max_y, 5.36)
+
+    def test_solved_anchor_layout_populates_localization_coordinates(self) -> None:
+        app = ExtendedUwbCaptureApp.__new__(ExtendedUwbCaptureApp)
+        app.anchor_layout_positions = {
+            "A2": (1.234, 5.678),
+            "A1": (-0.5, 0.25),
+        }
+        app.localization_rows = {}
+        app.localization_row_order = []
+        app.localization_anchor_positions = {}
+        app.localization_status_var = FakeStatusVar()
+        app.redraw_count = 0
+
+        def ensure_row(anchor_id: str) -> dict[str, FakeVar]:
+            if anchor_id not in app.localization_rows:
+                app.localization_rows[anchor_id] = {
+                    "enabled_var": FakeVar(False),
+                    "anchor_var": FakeVar(anchor_id),
+                    "x_var": FakeVar(""),
+                    "y_var": FakeVar(""),
+                    "range_var": FakeVar(""),
+                    "offset_var": FakeVar("0"),
+                    "sigma_var": FakeVar("0.05"),
+                }
+                app.localization_row_order.append(anchor_id)
+            return app.localization_rows[anchor_id]
+
+        app._ensure_localization_row = ensure_row
+        app._redraw_localization_views = lambda: setattr(app, "redraw_count", app.redraw_count + 1)
+
+        self.assertTrue(app.populate_localization_from_anchor_layout())
+
+        self.assertEqual(app.localization_row_order, ["A1", "A2"])
+        self.assertTrue(app.localization_rows["A1"]["enabled_var"].get())
+        self.assertEqual(app.localization_rows["A1"]["x_var"].get(), "-0.5")
+        self.assertEqual(app.localization_rows["A1"]["y_var"].get(), "0.25")
+        self.assertEqual(app.localization_rows["A2"]["x_var"].get(), "1.234")
+        self.assertEqual(app.localization_rows["A2"]["y_var"].get(), "5.678")
+        self.assertEqual(app.localization_anchor_positions["A2"], ("1.234", "5.678"))
+        self.assertEqual(app.redraw_count, 1)
+        self.assertIn("Loaded 2 anchor coordinate", app.localization_status_var.value)
+
     def make_live_tracking_app(self) -> ExtendedUwbCaptureApp:
         app = ExtendedUwbCaptureApp.__new__(ExtendedUwbCaptureApp)
         app.live_tracking_event_seq = None
