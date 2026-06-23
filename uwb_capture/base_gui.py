@@ -851,6 +851,20 @@ class UwbCaptureApp(tk.Tk):
         if hasattr(self, "ml_status_var"):
             self.ml_status_var.set(f"{label} timed out ({progress})")
 
+    def _abort_ml_command(self, reason: str) -> None:
+        if not self.ml_command_in_flight and self.ml_timeout_after_id is None:
+            return
+        mode = self.ml_pending_mode or ML_COLLECTION_MODE_FULL
+        label = ML_COLLECTION_MODE_LABELS[mode]
+        self._cancel_ml_command_timeout()
+        self._flush_diagnostics_to_all_samples()
+        self._clear_ml_command_tracking()
+        self._set_ml_collect_state(False)
+        self._reset_trigger_collection_state()
+        self.log_raw(f"# {label} canceled: {reason}")
+        if hasattr(self, "ml_status_var"):
+            self.ml_status_var.set(f"{label} canceled: {reason}")
+
     def choose_output_dir(self) -> None:
         path = filedialog.askdirectory(initialdir=self.output_dir_var.get(), parent=self)
         if not path:
@@ -883,6 +897,7 @@ class UwbCaptureApp(tk.Tk):
         self.status_var.set(f"Connecting to {device}...")
 
     def disconnect_transport(self) -> None:
+        self._abort_ml_command("Bluetooth disconnected")
         if self.bluetooth_worker is not None:
             self.bluetooth_worker.stop()
             self.bluetooth_worker = None
@@ -1151,11 +1166,13 @@ class UwbCaptureApp(tk.Tk):
                     self.status_var.set(f"Connected to {payload}")
                     self.log_raw(f"# Connected to {payload}")
                 elif event == "disconnected":
+                    self._abort_ml_command("Bluetooth disconnected")
                     self.bluetooth_worker = None
                     self.connected_device = None
                     self.status_var.set("Disconnected")
                     self.log_raw("# Disconnected")
                 elif event == "error":
+                    self._abort_ml_command("Bluetooth error")
                     self.status_var.set(str(payload))
                     self.log_alert(str(payload))
                     self.bluetooth_worker = None

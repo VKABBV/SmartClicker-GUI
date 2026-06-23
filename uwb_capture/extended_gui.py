@@ -821,6 +821,11 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             return
         self.live_tracking_active = False
         self._cancel_live_tracking_timer()
+        if (
+            self.ml_command_in_flight
+            and self.ml_pending_mode == original.ML_COLLECTION_MODE_FAST
+        ):
+            self._abort_ml_command("Live tracking stopped")
         self._reset_live_tracking_batch()
         if hasattr(self, "live_tracking_status_var"):
             self.live_tracking_status_var.set(reason)
