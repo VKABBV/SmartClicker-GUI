@@ -564,6 +564,8 @@ def command_sample_count_from_packet(packet: ImecPacket) -> int | None:
 def records_from_packet(packet: ImecPacket) -> list[ParsedRecord]:
     if packet.msg_type == MessageType.CLICK_REPORT:
         return _ml_sample_records(packet)
+    if packet.msg_type == MessageType.SURVEY_REACH_REPORT:
+        return _anchor_pair_survey_records(packet, decode_tlvs(packet.payload))
     return []
 
 

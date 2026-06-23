@@ -393,6 +393,42 @@ class SurveyPairResultTests(unittest.TestCase):
         self.assertEqual(record.source, "anchor_pair_survey")
         self.assertIn("SURVEY_ID", record.tlv_json)
 
+    def test_survey_reach_report_with_initiator_responder_becomes_survey_pair_record(self) -> None:
+        packet = ImecPacket(
+            msg_type=MessageType.SURVEY_REACH_REPORT,
+            flags=0,
+            source_id=0xA1,
+            destination_id=0,
+            session_id=55,
+            sequence=3,
+            ttl=1,
+            message_age_ms=0,
+            payload=encode_tlvs(
+                [
+                    (TlvId.SURVEY_ID, u32(88)),
+                    (TlvId.INITIATOR_ID, u64(0xA1)),
+                    (TlvId.RESPONDER_ID, u64(0xB2)),
+                    (TlvId.SAMPLE_INDEX, u16(2)),
+                    (TlvId.SAMPLE_COUNT, u16(3)),
+                    (TlvId.DISTANCE_MM, i32(3456)),
+                    (TlvId.RANGE_STATUS, u8(0)),
+                ]
+            ),
+        )
+
+        records = records_from_packet(decode_packet(encode_packet(packet)))
+
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record.kind, "survey_pair")
+        self.assertEqual(record.anchor_id, "0x00000000000000A1")
+        self.assertEqual(record.peer_anchor_id, "0x00000000000000B2")
+        self.assertEqual(record.distance_m, 3.456)
+        self.assertEqual(record.scheduled_sample_count, 3)
+        self.assertEqual(record.status, "ok")
+        self.assertEqual(record.source, "anchor_pair_survey")
+        self.assertIn("SURVEY_REACH_REPORT", record.raw_line or "")
+
     def test_diagnostic_click_report_with_failed_pair_status_becomes_survey_pair_failure(self) -> None:
         packet = ImecPacket(
             msg_type=MessageType.CLICK_REPORT,

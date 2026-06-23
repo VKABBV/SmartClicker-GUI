@@ -53,9 +53,10 @@ The extended GUI also includes an `Anchor Geometry` tab for anchor-to-anchor
 survey data. `Gather Anchor Distances` sends
 `CMD_ML_START_ANCHOR_PAIR_SURVEY` (`0x8002`) to the clicker with an optional
 2..8 discovery-slot count. The clicker discovers anchors, schedules all
-anchor-to-anchor pairs, emits one diagnostic `CLICK_REPORT` row per reported
-pair, then finishes with a command result. Pair rows are recognized by
-`TLV_INITIATOR_ID` and `TLV_RESPONDER_ID`.
+anchor-to-anchor pairs, emits one diagnostic `CLICK_REPORT` or
+`SURVEY_REACH_REPORT` row per reported pair, then finishes with a command
+result. Pair rows are recognized by `TLV_INITIATOR_ID` and
+`TLV_RESPONDER_ID`.
 
 Pair distances can also be added manually. `Solve Layout` treats each pair
 distance as a spring and optimizes the lowest-energy 2D anchor layout with a
