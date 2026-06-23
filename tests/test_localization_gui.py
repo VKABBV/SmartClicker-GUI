@@ -25,6 +25,18 @@ class FakeVar:
         self.value = value
 
 
+class FakeCanvas:
+    def __init__(self, width: int, height: int) -> None:
+        self.width = width
+        self.height = height
+
+    def winfo_width(self) -> int:
+        return self.width
+
+    def winfo_height(self) -> int:
+        return self.height
+
+
 class LocalizationGuiTests(unittest.TestCase):
     def test_plot_bounds_use_room_size_not_estimated_position(self) -> None:
         app = ExtendedUwbCaptureApp.__new__(ExtendedUwbCaptureApp)
@@ -73,6 +85,47 @@ class LocalizationGuiTests(unittest.TestCase):
         self.assertAlmostEqual(max_x, 6.36)
         self.assertAlmostEqual(min_y, 0.64)
         self.assertAlmostEqual(max_y, 5.36)
+
+    def test_relative_plot_controls_pan_and_zoom_from_current_view(self) -> None:
+        app = ExtendedUwbCaptureApp.__new__(ExtendedUwbCaptureApp)
+        app.sim_width_var = FakeVar("7")
+        app.sim_height_var = FakeVar("7")
+        app.localization_view_center_x_var = FakeVar("")
+        app.localization_view_center_y_var = FakeVar("")
+        app.localization_view_scale_var = FakeVar("")
+        app.localization_status_var = FakeStatusVar()
+        app.localization_canvas = FakeCanvas(500, 300)
+        app.redraw_count = 0
+        app._redraw_localization_views = lambda: setattr(app, "redraw_count", app.redraw_count + 1)
+        app.localization_result = solve_position(
+            [
+                LocalizationReading("A1", 0.0, 0.0, math.hypot(1.0, 1.0)),
+                LocalizationReading("A2", 0.3, 0.8, math.hypot(0.7, 0.2)),
+                LocalizationReading("A3", 1.5, 1.0, 0.5),
+            ]
+        )
+        auto_center_x, auto_center_y, auto_scale, min_x, max_x, min_y, max_y = app._localization_plot_view(
+            app.localization_result,
+            width=500,
+            height=300,
+            margin=32,
+        )
+
+        app.pan_localization_view(1.0, -1.0)
+
+        expected_center_x = auto_center_x + (max_x - min_x) * 0.15
+        expected_center_y = auto_center_y - (max_y - min_y) * 0.15
+        self.assertAlmostEqual(float(app.localization_view_center_x_var.get()), expected_center_x, places=5)
+        self.assertAlmostEqual(float(app.localization_view_center_y_var.get()), expected_center_y, places=5)
+        self.assertAlmostEqual(float(app.localization_view_scale_var.get()), auto_scale, delta=1e-4)
+        self.assertEqual(app.redraw_count, 1)
+
+        app.zoom_localization_view(1.25)
+
+        self.assertAlmostEqual(float(app.localization_view_center_x_var.get()), expected_center_x, places=5)
+        self.assertAlmostEqual(float(app.localization_view_center_y_var.get()), expected_center_y, places=5)
+        self.assertAlmostEqual(float(app.localization_view_scale_var.get()), auto_scale * 1.25, delta=1e-4)
+        self.assertEqual(app.redraw_count, 2)
 
     def test_solved_anchor_layout_populates_localization_coordinates(self) -> None:
         app = ExtendedUwbCaptureApp.__new__(ExtendedUwbCaptureApp)
