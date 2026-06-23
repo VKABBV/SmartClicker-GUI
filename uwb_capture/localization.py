@@ -10,7 +10,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 
-LOCALIZATION_ALGORITHM = "Radical-axis line least squares (range-difference LS)"
+LOCALIZATION_ALGORITHM = "Radical-axis line least squares with range-LS fallback"
+RANGE_LS_TRIGGER_RMSE_M = 0.5
+RANGE_LS_MIN_IMPROVEMENT_M = 0.01
 
 
 @dataclass(frozen=True)
@@ -69,12 +71,16 @@ def solve_position(
     *,
     min_sigma_m: float = 0.01,
     min_range_m: float = 0.05,
+    range_ls_trigger_rmse_m: float = RANGE_LS_TRIGGER_RMSE_M,
+    range_ls_min_improvement_m: float = RANGE_LS_MIN_IMPROVEMENT_M,
 ) -> LocalizationResult:
     """Solve a 2D position from radical-axis line least squares.
 
     Subtracting squared range equations turns each anchor pair into a line. A
     common vertical height term appears in every squared range, so it cancels
-    before the least-squares solve.
+    before the initial least-squares solve. If the resulting range fit is poor,
+    a bounded range least-squares refinement is tried and used only when it
+    improves the range RMSE.
     """
 
     processed = _preprocess_readings(
@@ -83,16 +89,43 @@ def solve_position(
         min_range_m=min_range_m,
     )
     x, y = _solve_radical_axis_lines(processed)
+    seed_x, seed_y = x, y
     line_residuals, line_rmse, line_warnings = _analyze_radical_axis_residuals(processed, x, y)
     range_residuals, range_rmse, common_height_m, range_warnings = _analyze_range_fit(processed, x, y)
+    refinement_warnings: list[str] = []
+    if range_rmse >= range_ls_trigger_rmse_m:
+        original_range_rmse = range_rmse
+        refined_x, refined_y = _solve_range_least_squares(processed, x, y)
+        (
+            refined_range_residuals,
+            refined_range_rmse,
+            refined_common_height_m,
+            refined_range_warnings,
+        ) = _analyze_range_fit(processed, refined_x, refined_y)
+        if refined_range_rmse <= original_range_rmse - range_ls_min_improvement_m:
+            x = refined_x
+            y = refined_y
+            line_residuals, line_rmse, line_warnings = _analyze_radical_axis_residuals(processed, x, y)
+            range_residuals = refined_range_residuals
+            range_rmse = refined_range_rmse
+            common_height_m = refined_common_height_m
+            range_warnings = refined_range_warnings
+            refinement_warnings.append(
+                "Range least-squares refinement improved RMSE "
+                f"from {original_range_rmse:.3f} m to {range_rmse:.3f} m."
+            )
+        else:
+            refinement_warnings.append(
+                "Range least-squares refinement did not improve the range fit enough to use."
+            )
     confidence, confidence_warnings = _localization_confidence(
         line_rmse=line_rmse,
         range_rmse=range_rmse,
         common_height_m=common_height_m,
     )
     return LocalizationResult(
-        seed_x_m=x,
-        seed_y_m=y,
+        seed_x_m=seed_x,
+        seed_y_m=seed_y,
         x_m=x,
         y_m=y,
         radical_axis_rmse_m=line_rmse,
@@ -102,7 +135,7 @@ def solve_position(
         residuals_m=line_residuals,
         range_residuals_m=range_residuals,
         common_height_m=common_height_m,
-        warnings=tuple(line_warnings + range_warnings + confidence_warnings),
+        warnings=tuple(line_warnings + range_warnings + refinement_warnings + confidence_warnings),
     )
 
 
@@ -289,6 +322,84 @@ def _analyze_range_fit(
         weighted_residual_sum += reading.weight * residual * residual
     rmse = math.sqrt(weighted_residual_sum / weight_total)
     return residuals, rmse, common_height_m, warnings
+
+
+def _solve_range_least_squares(
+    readings: list[ProcessedReading],
+    seed_x_m: float,
+    seed_y_m: float,
+    *,
+    max_iterations: int = 60,
+    initial_damping: float = 1e-3,
+) -> tuple[float, float]:
+    x_m = seed_x_m
+    y_m = seed_y_m
+    best_x_m = x_m
+    best_y_m = y_m
+    best_cost = _range_least_squares_cost(readings, x_m, y_m)
+    damping = initial_damping
+
+    for _iteration in range(max_iterations):
+        a11 = a12 = a22 = 0.0
+        g1 = g2 = 0.0
+        for reading in readings:
+            dx = x_m - reading.x_m
+            dy = y_m - reading.y_m
+            modeled_range = max(math.hypot(dx, dy), 1e-9)
+            residual = modeled_range - reading.corrected_range_m
+            jx = dx / modeled_range
+            jy = dy / modeled_range
+            weight = reading.weight
+            a11 += weight * jx * jx
+            a12 += weight * jx * jy
+            a22 += weight * jy * jy
+            g1 += weight * jx * residual
+            g2 += weight * jy * residual
+
+        try:
+            step_x, step_y = _solve_2x2(
+                a11 + damping,
+                a12,
+                a22 + damping,
+                -g1,
+                -g2,
+                "range least-squares matrix is singular",
+            )
+        except ValueError:
+            break
+        if not (math.isfinite(step_x) and math.isfinite(step_y)):
+            break
+
+        candidate_x = x_m + step_x
+        candidate_y = y_m + step_y
+        candidate_cost = _range_least_squares_cost(readings, candidate_x, candidate_y)
+        if candidate_cost < best_cost:
+            x_m = candidate_x
+            y_m = candidate_y
+            best_x_m = candidate_x
+            best_y_m = candidate_y
+            best_cost = candidate_cost
+            damping = max(damping * 0.3, 1e-9)
+            if math.hypot(step_x, step_y) < 1e-6:
+                break
+        else:
+            damping *= 10.0
+            if damping > 1e12:
+                break
+    return best_x_m, best_y_m
+
+
+def _range_least_squares_cost(
+    readings: list[ProcessedReading],
+    x_m: float,
+    y_m: float,
+) -> float:
+    cost = 0.0
+    for reading in readings:
+        modeled_range = math.hypot(x_m - reading.x_m, y_m - reading.y_m)
+        residual = modeled_range - reading.corrected_range_m
+        cost += reading.weight * residual * residual
+    return cost
 
 
 def _localization_confidence(

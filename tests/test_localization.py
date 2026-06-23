@@ -108,11 +108,14 @@ class LocalizationSolverTests(unittest.TestCase):
             LocalizationReading("A3", 1.5, 1.0, 2.314),
         ]
 
+        radical_only = solve_position(readings, range_ls_trigger_rmse_m=999.0)
         result = solve_position(readings)
 
         self.assertEqual(result.confidence, "Low")
-        self.assertGreater(result.rmse_m, 1.0)
-        self.assertTrue(any("shorter than the solved XY distances" in warning for warning in result.warnings))
+        self.assertGreater(radical_only.rmse_m, 1.0)
+        self.assertLess(result.rmse_m, radical_only.rmse_m - 0.5)
+        self.assertNotAlmostEqual(result.x_m, result.seed_x_m)
+        self.assertTrue(any("least-squares refinement improved" in warning for warning in result.warnings))
 
     def test_square_simulation_solves_inside_floor_plan(self) -> None:
         scenario = build_square_simulation(
