@@ -121,11 +121,15 @@ class LocalizationGuiTests(unittest.TestCase):
         app.live_tracking_expected_sample_count = None
         app.live_tracking_received_sample_count = 0
         app.live_tracking_ranges_by_anchor = {}
+        app.live_tracking_finish_pending = False
+        app.live_tracking_finish_after_id = None
         app.anchor_measured_distances = {}
         app.anchor_distance_history = {}
         app.live_tracking_status_var = FakeStatusVar()
         app.applied_ranges = {}
         app.solve_count = 0
+        app.after_idle_callbacks = []
+        app.after_idle = lambda callback: app.after_idle_callbacks.append(callback) or "idle1"
         app._update_localization_range = lambda anchor_id, distance_m: app.applied_ranges.__setitem__(
             anchor_id, distance_m
         )
@@ -211,6 +215,48 @@ class LocalizationGuiTests(unittest.TestCase):
 
         self.assertEqual(app.applied_ranges, {"A1": 1.0, "A2": 2.0, "A3": 3.0})
         self.assertEqual(app.solve_count, 1)
+
+    def test_live_tracking_pending_finish_waits_for_failure_row_from_result_packet(self) -> None:
+        app = self.make_live_tracking_app()
+        records = [
+            ParsedRecord(
+                kind="sample",
+                anchor_id="A1",
+                distance_m=1.0,
+                scheduled_sample_count=4,
+            ),
+            ParsedRecord(
+                kind="sample",
+                anchor_id="A2",
+                distance_m=2.0,
+                scheduled_sample_count=4,
+            ),
+            ParsedRecord(
+                kind="sample",
+                anchor_id="A3",
+                distance_m=3.0,
+                scheduled_sample_count=4,
+            ),
+            ParsedRecord(
+                kind="failure",
+                anchor_id="A4",
+                scheduled_sample_count=4,
+            ),
+        ]
+
+        app._request_live_tracking_batch_finish()
+        self.assertTrue(app.live_tracking_finish_pending)
+        self.assertEqual(app.solve_count, 0)
+
+        for record in records:
+            self.assertFalse(app._record_live_tracking_sample(record))
+
+        self.assertTrue(app._finish_pending_live_tracking_batch())
+
+        self.assertEqual(app.applied_ranges, {"A1": 1.0, "A2": 2.0, "A3": 3.0})
+        self.assertEqual(app.solve_count, 1)
+        self.assertFalse(app.live_tracking_finish_pending)
+        self.assertEqual(app.live_tracking_received_sample_count, 0)
 
     def test_static_range_offset_is_added_to_each_anchor_offset(self) -> None:
         app = ExtendedUwbCaptureApp.__new__(ExtendedUwbCaptureApp)

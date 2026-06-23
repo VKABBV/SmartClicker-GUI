@@ -203,6 +203,8 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self.live_tracking_expected_sample_count: int | None = None
         self.live_tracking_received_sample_count = 0
         self.live_tracking_ranges_by_anchor: dict[str, list[float]] = {}
+        self.live_tracking_finish_pending = False
+        self.live_tracking_finish_after_id: str | None = None
         self._pyth_updating = False
         super().__init__()
         self._install_extensions()
@@ -851,10 +853,30 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         return max(int(value * 1000), 100)
 
     def _reset_live_tracking_batch(self) -> None:
+        self.live_tracking_finish_pending = False
+        self.live_tracking_finish_after_id = None
         self.live_tracking_event_seq = None
         self.live_tracking_expected_sample_count = None
         self.live_tracking_received_sample_count = 0
         self.live_tracking_ranges_by_anchor.clear()
+
+    def _request_live_tracking_batch_finish(self) -> None:
+        self.live_tracking_finish_pending = True
+        if self.live_tracking_finish_after_id is not None:
+            return
+        try:
+            self.live_tracking_finish_after_id = self.after_idle(
+                self._finish_pending_live_tracking_batch
+            )
+        except Exception:
+            self.live_tracking_finish_after_id = None
+
+    def _finish_pending_live_tracking_batch(self) -> bool:
+        self.live_tracking_finish_after_id = None
+        if not self.live_tracking_finish_pending:
+            return False
+        self.live_tracking_finish_pending = False
+        return self._finish_live_tracking_batch(force=True)
 
     def _record_live_tracking_sample(self, record: Any) -> bool:
         if record.kind not in ("sample", "failure", "summary"):
@@ -2875,7 +2897,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         )
         super()._handle_command_result(packet)
         if live_fast_result:
-            self._finish_live_tracking_batch(force=True)
+            self._request_live_tracking_batch_finish()
         self._handle_anchor_survey_command_result(packet)
 
     def handle_serial_line(self, line: str) -> None:
@@ -2896,7 +2918,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             if record.anchor_id:
                 anchor_key = str(record.anchor_id).strip()
                 self._register_detected_anchor(record.anchor_id)
-                if self.live_tracking_active and record.kind in ("sample", "failure"):
+                if self.live_tracking_active and record.kind in ("sample", "failure", "summary"):
                     self._record_live_tracking_sample(record)
                     continue
                 if record.distance_m is not None:
@@ -2907,6 +2929,8 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
                         del history[: len(history) - 200]
                     self._update_localization_range(anchor_key, float(record.distance_m))
                     localization_updated = True
+        if self.live_tracking_finish_pending:
+            self._finish_pending_live_tracking_batch()
         if localization_updated and self.live_tracking_active:
             self._try_live_tracking_solve()
         self._refresh_anchor_truth_table()
