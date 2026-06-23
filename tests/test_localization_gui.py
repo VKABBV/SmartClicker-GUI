@@ -37,6 +37,19 @@ class FakeCanvas:
         return self.height
 
 
+class FakeStopEvent:
+    def __init__(self, stopped: bool) -> None:
+        self.stopped = stopped
+
+    def is_set(self) -> bool:
+        return self.stopped
+
+
+class FakeWorker:
+    def __init__(self, stopped: bool = False) -> None:
+        self.stop_event = FakeStopEvent(stopped)
+
+
 class LocalizationGuiTests(unittest.TestCase):
     def test_plot_bounds_use_room_size_not_estimated_position(self) -> None:
         app = ExtendedUwbCaptureApp.__new__(ExtendedUwbCaptureApp)
@@ -310,6 +323,51 @@ class LocalizationGuiTests(unittest.TestCase):
         self.assertEqual(app.solve_count, 1)
         self.assertFalse(app.live_tracking_finish_pending)
         self.assertEqual(app.live_tracking_received_sample_count, 0)
+
+    def make_live_tick_app(self) -> ExtendedUwbCaptureApp:
+        app = ExtendedUwbCaptureApp.__new__(ExtendedUwbCaptureApp)
+        app.live_tracking_active = True
+        app.live_tracking_after_id = None
+        app.live_tracking_interval_var = FakeVar("2")
+        app.live_tracking_status_var = FakeStatusVar()
+        app.ml_command_in_flight = False
+        app.after_calls = []
+        app.after = lambda interval_ms, callback: app.after_calls.append((interval_ms, callback)) or "after1"
+        app._set_live_tracking_button_state = lambda: None
+        app._reset_live_tracking_batch = lambda: None
+        return app
+
+    def test_live_tracking_retries_when_bluetooth_is_temporarily_missing(self) -> None:
+        app = self.make_live_tick_app()
+        app.bluetooth_worker = None
+
+        app._live_tracking_tick()
+
+        self.assertTrue(app.live_tracking_active)
+        self.assertEqual(app.live_tracking_after_id, "after1")
+        self.assertEqual(app.after_calls[0][0], 2000)
+        self.assertIn("retrying", app.live_tracking_status_var.value)
+
+    def test_live_tracking_retries_when_worker_is_stopping(self) -> None:
+        app = self.make_live_tick_app()
+        app.bluetooth_worker = FakeWorker(stopped=True)
+
+        app._live_tracking_tick()
+
+        self.assertTrue(app.live_tracking_active)
+        self.assertEqual(app.live_tracking_after_id, "after1")
+        self.assertIn("reconnecting", app.live_tracking_status_var.value)
+
+    def test_live_tracking_retries_when_range_request_is_not_sent(self) -> None:
+        app = self.make_live_tick_app()
+        app.bluetooth_worker = FakeWorker()
+        app.send_ml_start_collection = lambda collection_mode=None: False
+
+        app._live_tracking_tick()
+
+        self.assertTrue(app.live_tracking_active)
+        self.assertEqual(app.live_tracking_after_id, "after1")
+        self.assertIn("not sent, retrying", app.live_tracking_status_var.value)
 
     def test_static_range_offset_is_added_to_each_anchor_offset(self) -> None:
         app = ExtendedUwbCaptureApp.__new__(ExtendedUwbCaptureApp)

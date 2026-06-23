@@ -956,12 +956,31 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             return
         self.live_tracking_after_id = self.after(interval_ms, self._live_tracking_tick)
 
+    def _live_tracking_worker_stopped(self) -> bool:
+        worker = getattr(self, "bluetooth_worker", None)
+        stop_event = getattr(worker, "stop_event", None)
+        is_set = getattr(stop_event, "is_set", None)
+        if callable(is_set):
+            return bool(is_set())
+        return False
+
+    def _retry_live_tracking_later(self, status: str) -> None:
+        self.live_tracking_status_var.set(status)
+        self._schedule_live_tracking_tick()
+
     def _live_tracking_tick(self) -> None:
         self.live_tracking_after_id = None
         if not self.live_tracking_active:
             return
         if self.bluetooth_worker is None:
-            self.stop_live_tracking("Live tracking stopped; Bluetooth is disconnected.")
+            self._retry_live_tracking_later(
+                "Live tracking active; Bluetooth disconnected, retrying."
+            )
+            return
+        if self._live_tracking_worker_stopped():
+            self._retry_live_tracking_later(
+                "Live tracking active; Bluetooth reconnecting, retrying."
+            )
             return
 
         if self.ml_command_in_flight:
@@ -972,7 +991,9 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
                 self._reset_live_tracking_batch()
                 self.live_tracking_status_var.set("Fast range request sent; waiting for anchor replies.")
             else:
-                self.stop_live_tracking("Live tracking stopped; range request was not sent.")
+                self._retry_live_tracking_later(
+                    "Live tracking active; range request was not sent, retrying."
+                )
                 return
         self._schedule_live_tracking_tick()
 
