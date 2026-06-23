@@ -156,6 +156,7 @@ class UwbCaptureApp(tk.Tk):
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.bluetooth_worker: BluetoothWorker | None = None
         self.connected_device: str | None = None
+        self.bluetooth_manual_disconnect_pending = False
         self.device_infos: dict[str, BluetoothDeviceInfo] = {}
         self.protocol_sequence = 0
         self.protocol_session_seed = int(time.time()) & 0xFFFFFFFF
@@ -896,13 +897,27 @@ class UwbCaptureApp(tk.Tk):
         self.bluetooth_worker.start()
         self.status_var.set(f"Connecting to {device}...")
 
+    def _reconnect_bluetooth_immediately(self, reason: str) -> None:
+        if self.bluetooth_manual_disconnect_pending or self.bluetooth_worker is not None:
+            return
+        device = self.selected_device()
+        if not device:
+            self.log_raw(f"# Bluetooth {reason}; no selected device to reconnect.")
+            return
+        self.log_raw(f"# Bluetooth {reason}; reconnecting immediately to {device}.")
+        self.connect_selected_device()
+
     def disconnect_transport(self) -> None:
+        worker = self.bluetooth_worker
+        self.bluetooth_manual_disconnect_pending = worker is not None
         self._abort_ml_command("Bluetooth disconnected")
-        if self.bluetooth_worker is not None:
-            self.bluetooth_worker.stop()
+        if worker is not None:
+            worker.stop()
             self.bluetooth_worker = None
         self.connected_device = None
         self.status_var.set("Disconnected")
+        if worker is None:
+            self.bluetooth_manual_disconnect_pending = False
 
     def start_capture(self) -> None:
         if self.capture_active:
@@ -1162,20 +1177,32 @@ class UwbCaptureApp(tk.Tk):
                     if self.auto_connect_var.get() and values and self.bluetooth_worker is None:
                         self.connect_selected_device()
                 elif event == "connected":
+                    self.bluetooth_manual_disconnect_pending = False
                     self.connected_device = str(payload)
                     self.status_var.set(f"Connected to {payload}")
                     self.log_raw(f"# Connected to {payload}")
                 elif event == "disconnected":
+                    manual_disconnect = self.bluetooth_manual_disconnect_pending
                     self._abort_ml_command("Bluetooth disconnected")
                     self.bluetooth_worker = None
                     self.connected_device = None
                     self.status_var.set("Disconnected")
                     self.log_raw("# Disconnected")
+                    if manual_disconnect:
+                        self.bluetooth_manual_disconnect_pending = False
+                    else:
+                        self._reconnect_bluetooth_immediately("disconnected")
                 elif event == "error":
+                    manual_disconnect = self.bluetooth_manual_disconnect_pending
+                    was_connected = self.connected_device is not None
                     self._abort_ml_command("Bluetooth error")
                     self.status_var.set(str(payload))
                     self.log_alert(str(payload))
                     self.bluetooth_worker = None
+                    if manual_disconnect:
+                        self.bluetooth_manual_disconnect_pending = False
+                    elif was_connected:
+                        self._reconnect_bluetooth_immediately("error")
                 elif event == "command_sent":
                     self.log_raw(f"# TX {payload}")
                 elif event == "packet":

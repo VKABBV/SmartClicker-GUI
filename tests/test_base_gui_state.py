@@ -1,3 +1,4 @@
+import queue
 import unittest
 
 from uwb_capture import base_gui
@@ -38,6 +39,7 @@ def make_command_app() -> base_gui.UwbCaptureApp:
     app.ml_timeout_after_id = "timeout1"
     app.ml_expected_sample_notifications = 4
     app.ml_received_sample_notifications = 2
+    app.bluetooth_manual_disconnect_pending = False
     app.ml_collect_button = FakeButton()
     app.ml_status_var = FakeStatusVar()
     app.cancelled_after_ids = []
@@ -90,6 +92,46 @@ class CommandStateTests(unittest.TestCase):
         self.assertIsNone(app.connected_device)
         self.assertEqual(app.status_var.value, "Disconnected")
         self.assertFalse(app.ml_command_in_flight)
+
+    def test_unexpected_disconnected_event_reconnects_immediately(self) -> None:
+        app = make_command_app()
+        app.events = queue.Queue()
+        app.events.put(("disconnected", "clicker-address"))
+        app.bluetooth_worker = FakeWorker()
+        app.connected_device = "clicker-address"
+        app.status_var = FakeStatusVar()
+        app.after = lambda _ms, _callback: None
+        app.reconnects = []
+        app.selected_device = lambda: "clicker-address"
+        app.connect_selected_device = lambda: app.reconnects.append("connect")
+
+        app.process_events()
+
+        self.assertIsNone(app.bluetooth_worker)
+        self.assertIsNone(app.connected_device)
+        self.assertEqual(app.reconnects, ["connect"])
+        self.assertFalse(app.bluetooth_manual_disconnect_pending)
+        self.assertIn("reconnecting immediately", app.log_lines[-1])
+
+    def test_manual_disconnected_event_does_not_reconnect(self) -> None:
+        app = make_command_app()
+        worker = FakeWorker()
+        app.bluetooth_worker = worker
+        app.connected_device = "clicker-address"
+        app.status_var = FakeStatusVar()
+        app.events = queue.Queue()
+        app.after = lambda _ms, _callback: None
+        app.reconnects = []
+        app.selected_device = lambda: "clicker-address"
+        app.connect_selected_device = lambda: app.reconnects.append("connect")
+
+        app.disconnect_transport()
+        app.events.put(("disconnected", "clicker-address"))
+        app.process_events()
+
+        self.assertTrue(worker.stopped)
+        self.assertEqual(app.reconnects, [])
+        self.assertFalse(app.bluetooth_manual_disconnect_pending)
 
     def test_stop_live_tracking_aborts_pending_fast_ranging_command(self) -> None:
         app = ExtendedUwbCaptureApp.__new__(ExtendedUwbCaptureApp)
