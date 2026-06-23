@@ -787,24 +787,21 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self.live_tracking_ranges_by_anchor.clear()
 
     def _record_live_tracking_sample(self, record: Any) -> bool:
-        if record.kind not in ("sample", "failure"):
+        if record.kind not in ("sample", "failure", "summary"):
             return False
         event_seq = record.event_seq
-        if event_seq is not None and self.live_tracking_event_seq not in (None, event_seq):
-            self._reset_live_tracking_batch()
         if self.live_tracking_event_seq is None:
             self.live_tracking_event_seq = event_seq
         if record.scheduled_sample_count is not None:
             self.live_tracking_expected_sample_count = int(record.scheduled_sample_count)
         self.live_tracking_received_sample_count += 1
-        if record.anchor_id and record.distance_m is not None:
+        distance = record.distance_m if record.distance_m is not None else record.mean_distance_m
+        if record.anchor_id and distance is not None:
             anchor_key = str(record.anchor_id).strip()
             if anchor_key:
-                self.live_tracking_ranges_by_anchor.setdefault(anchor_key, []).append(float(record.distance_m))
+                self.live_tracking_ranges_by_anchor.setdefault(anchor_key, []).append(float(distance))
 
         expected = self.live_tracking_expected_sample_count
-        if expected is not None and self.live_tracking_received_sample_count >= expected:
-            return self._finish_live_tracking_batch(force=True)
         if expected is not None:
             self.live_tracking_status_var.set(
                 f"Live tracking active; received {self.live_tracking_received_sample_count}/{expected} range rows."
