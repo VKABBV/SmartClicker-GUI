@@ -33,8 +33,13 @@ to form radical-axis lines, then performs least squares on those lines. Any
 common height term cancels during the subtraction. Results report the estimated
 X/Y point, range-fit RMSE, radical-axis RMSE, confidence, range residuals, and
 line residuals. Range sets that would put the solved X/Y point farther from the
-anchors than the measured ranges allow are rejected instead of plotted as a
-high-confidence estimate.
+anchors than the measured ranges allow are still solved, but reported with low
+confidence and range-fit warnings instead of a high-confidence estimate.
+
+Use the left-panel `Static range offset m` for a range bias that should be
+subtracted everywhere captured UWB ranges are used. The per-row `Offset m` field
+in the Localization tab remains available for anchor-specific correction; the
+solver correction is the static range offset plus that row's offset.
 
 Use `Run Square Simulation` to fill a four-anchor square/floor-plan test with
 fake ranges, solve it, and plot the estimated clicker point. The anchor X/Y

@@ -93,6 +93,13 @@ def format_meter(value: Any, unknown: str = "unknown") -> str:
     return f"{number:.3f}".rstrip("0").rstrip(".")
 
 
+def apply_range_offset(value: Any, offset_m: float) -> float | None:
+    number = safe_float(value)
+    if number is None:
+        return None
+    return max(number - offset_m, 0.0)
+
+
 def excel_cell(value: Any) -> Any:
     if isinstance(value, str):
         return ILLEGAL_EXCEL_CHARS_RE.sub("", value)
@@ -200,6 +207,10 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         super().__init__()
         self._install_extensions()
 
+    def _build_variables(self) -> None:
+        super()._build_variables()
+        self.range_static_offset_var = tk.StringVar(value="0")
+
     def _build_layout(self) -> None:
         root = ttk.Frame(self, padding=10)
         root.pack(fill=tk.BOTH, expand=True)
@@ -243,6 +254,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         frame.columnconfigure(1, weight=1)
 
         rows = [
+            ("Static range offset m", self.range_static_offset_var),
             ("LOS alert threshold m", self.threshold_var),
             ("Stability alert std m", self.instability_threshold_var),
         ]
@@ -260,10 +272,10 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             value=f"Constellation: {self.constellation_var.get().strip() or 'not set'}"
         )
 
-        self._build_serial_control(frame, 2)
+        self._build_serial_control(frame, 3)
 
         action_row = ttk.Frame(frame)
-        action_row.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        action_row.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(10, 0))
         action_row.columnconfigure(0, weight=1)
         action_row.columnconfigure(1, weight=1)
         self.start_button = ttk.Button(
@@ -282,14 +294,14 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         ttk.Label(frame, textvariable=self.constellation_status_var).grid(
-            row=4,
+            row=5,
             column=0,
             columnspan=3,
             sticky="w",
             pady=(8, 0),
         )
         ttk.Label(frame, textvariable=self.session_status_var, style="Status.TLabel").grid(
-            row=5,
+            row=6,
             column=0,
             columnspan=3,
             sticky="w",
@@ -338,6 +350,21 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             sticky="ew",
             padx=(5, 0),
         )
+
+    def _range_static_offset_m(self, *, strict: bool = False) -> float:
+        value = safe_float(self.range_static_offset_var.get())
+        if value is None:
+            if strict:
+                raise ValueError("Static range offset must be numeric.")
+            return 0.0
+        return value
+
+    def _apply_range_offset(self, value: Any, *, strict: bool = False) -> float | None:
+        return apply_range_offset(value, self._range_static_offset_m(strict=strict))
+
+    def _record_range_m(self, record: Any, *, strict: bool = False) -> float | None:
+        value = record.distance_m if record.distance_m is not None else record.mean_distance_m
+        return self._apply_range_offset(value, strict=strict)
 
     def _build_localization_panel(self, parent: Any) -> None:
         header = ttk.LabelFrame(parent, text="Position Solver", padding=8)
@@ -904,6 +931,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
     ) -> list[LocalizationReading]:
         readings: list[LocalizationReading] = []
         missing: list[str] = []
+        static_offset_m = self._range_static_offset_m(strict=True)
         for key in self.localization_row_order:
             row = self.localization_rows.get(key)
             if not row or not row["enabled_var"].get():
@@ -913,6 +941,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             y_m = safe_float(row["y_var"].get())
             range_m = safe_float(row["range_var"].get())
             offset_m = safe_float(row["offset_var"].get()) or 0.0
+            total_offset_m = static_offset_m + offset_m
             sigma_m = safe_float(row["sigma_var"].get()) or 0.05
             if x_m is None or y_m is None or range_m is None:
                 if require_complete_enabled:
@@ -925,7 +954,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
                     y_m=y_m,
                     range_m=range_m,
                     sigma_m=sigma_m,
-                    offset_m=offset_m,
+                    offset_m=total_offset_m,
                 )
             )
 
@@ -1778,10 +1807,13 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             )
             self._update_anchor_pair_combos()
             return
+        distance_m = self._apply_range_offset(record.distance_m)
+        if distance_m is None:
+            return
         self._save_anchor_pair_distance(
             anchor_a,
             anchor_b,
-            float(record.distance_m),
+            distance_m,
             0.05,
             source,
             record.status or "ok",
@@ -1789,7 +1821,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         if self.anchor_survey_in_flight:
             self.anchor_survey_successful_pair_count += 1
         self.anchor_geometry_status_var.set(
-            f"Received pair {anchor_a}-{anchor_b}: {float(record.distance_m):.3f} m "
+            f"Received pair {anchor_a}-{anchor_b}: {distance_m:.3f} m "
             f"({self._anchor_survey_progress_text()})."
         )
         self._redraw_anchor_geometry_canvas()
@@ -2408,8 +2440,14 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         for anchor_id in anchor_ids:
             data = self.anchor_true_distances.get(anchor_id)
             true_distance = data["true_distance_m"] if data else None
-            measured = self.anchor_measured_distances.get(anchor_id)
-            history = self.anchor_distance_history.get(anchor_id, [])
+            measured = self._apply_range_offset(self.anchor_measured_distances.get(anchor_id))
+            raw_history = self.anchor_distance_history.get(anchor_id, [])
+            history = [
+                corrected
+                for value in raw_history
+                for corrected in [self._apply_range_offset(value)]
+                if corrected is not None
+            ]
             std_cm = (statistics.stdev(history) * 100) if len(history) > 1 else None
             diff = abs(measured - true_distance) if measured is not None and true_distance is not None else None
             tags = ()
@@ -2734,7 +2772,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         super().handle_records(normal_records)
 
     def check_los_alert(self, record: Any) -> float | None:
-        distance = record.distance_m if record.distance_m is not None else record.mean_distance_m
+        distance = self._record_range_m(record)
         if distance is None:
             return None
 
@@ -2775,9 +2813,37 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
                 messagebox.showwarning("LOS measurement warning", message, parent=self)
         return absolute_error
 
+    def check_instability_alert(self, record: Any) -> float | None:
+        if record.kind == "summary" or record.distance_m is None:
+            return None
+        threshold = safe_float(self.instability_threshold_var.get())
+        if threshold is None or threshold <= 0:
+            return None
+        distance = self._apply_range_offset(record.distance_m)
+        if distance is None:
+            return None
+        anchor = record.anchor_id or "unknown"
+        values = self.anchor_distance_windows.setdefault(anchor, [])
+        values.append(distance)
+        if len(values) > original.INSTABILITY_WINDOW_SIZE:
+            del values[0 : len(values) - original.INSTABILITY_WINDOW_SIZE]
+        if len(values) < min(5, original.INSTABILITY_WINDOW_SIZE):
+            return None
+        mean = sum(values) / len(values)
+        std = math.sqrt(sum((value - mean) ** 2 for value in values) / len(values))
+        if std > threshold and self.store is not None and self.current_session_id is not None:
+            now = time.monotonic()
+            last = self.last_instability_prompt.get(anchor, 0.0)
+            if now - last > original.ALERT_PROMPT_COOLDOWN_SECONDS:
+                self.last_instability_prompt[anchor] = now
+                message = f"Anchor {anchor} distance is unstable: std {std:.3f} m over {len(values)} samples."
+                self.store.insert_alert(self.current_session_id, anchor, distance, None, std, message)
+                self.log_alert(message)
+        return std
+
     def add_record_to_table(self, record: Any, alert_error: float | None = None) -> None:
         display_time = datetime.now().strftime("%H:%M:%S")
-        distance = record.distance_m if record.distance_m is not None else record.mean_distance_m
+        distance = self._record_range_m(record)
         truth = self._anchor_true_distance_for(record.anchor_id)
         error = alert_error
         if error is None and truth and distance is not None:
@@ -2849,6 +2915,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
                 self.store.conn,
                 self.current_session_id,
                 Path(output_dir),
+                range_static_offset_m=self._range_static_offset_m(),
             )
         except Exception as exc:
             messagebox.showerror("Export failed", str(exc), parent=self)
@@ -2878,7 +2945,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             )
             return
 
-        rows = build_measurement_rows(db_path)
+        rows = build_measurement_rows(db_path, range_static_offset_m=self._range_static_offset_m())
         if not rows:
             messagebox.showwarning(
                 "No measurements",
@@ -2972,14 +3039,22 @@ def session_anchor_ids(con: sqlite3.Connection, session_id: str) -> list[str]:
 def measured_mean_for_anchor(
     samples: list[sqlite3.Row],
     summaries: list[sqlite3.Row],
+    *,
+    range_static_offset_m: float = 0.0,
 ) -> float | None:
-    values = [float(row["distance_m"]) for row in samples if row["distance_m"] is not None]
+    values = [
+        corrected
+        for row in samples
+        for corrected in [apply_range_offset(row["distance_m"], range_static_offset_m)]
+        if corrected is not None
+    ]
     if values:
         return statistics.fmean(values)
     summary_values = [
-        float(row["mean_distance_m"])
+        corrected
         for row in summaries
-        if row["mean_distance_m"] is not None
+        for corrected in [apply_range_offset(row["mean_distance_m"], range_static_offset_m)]
+        if corrected is not None
     ]
     if summary_values:
         return summary_values[-1]
@@ -2992,6 +3067,7 @@ def export_session_per_anchor(
     output_dir: Path,
     *,
     timestamp: str | None = None,
+    range_static_offset_m: float = 0.0,
 ) -> list[Path]:
     session = con.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
     if session is None:
@@ -3024,7 +3100,11 @@ def export_session_per_anchor(
 
         truth = truths.get(anchor_id)
         los_nlos = los_nlos_by_anchor.get(anchor_id, UNKNOWN_LOS_NLOS)
-        mean_measured = measured_mean_for_anchor(samples, summaries)
+        mean_measured = measured_mean_for_anchor(
+            samples,
+            summaries,
+            range_static_offset_m=range_static_offset_m,
+        )
 
         filename = (
             f"CONSTELLATION_{constellation}_"
@@ -3045,6 +3125,7 @@ def export_session_per_anchor(
             raw_lines,
             mean_measured,
             path,
+            range_static_offset_m=range_static_offset_m,
         )
         paths.append(path)
     return paths
@@ -3061,6 +3142,8 @@ def write_anchor_session_workbook(
     raw_lines: list[sqlite3.Row],
     mean_measured: float | None,
     path: Path,
+    *,
+    range_static_offset_m: float = 0.0,
 ) -> None:
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -3102,7 +3185,7 @@ def write_anchor_session_workbook(
     ws.append(columns)
 
     for row in samples:
-        measured = row["distance_m"]
+        measured = apply_range_offset(row["distance_m"], range_static_offset_m)
         alert_metric = (
             abs(float(measured) - float(true_distance))
             if measured is not None and true_distance is not None
@@ -3160,13 +3243,13 @@ def write_anchor_session_workbook(
             [
                 row["timestamp"],
                 row["anchor_id"],
-                row["mean_distance_m"],
+                apply_range_offset(row["mean_distance_m"], range_static_offset_m),
                 true_distance,
                 true_source,
                 side_a,
                 side_b,
                 los_nlos,
-                abs(float(row["mean_distance_m"]) - float(true_distance))
+                abs(float(apply_range_offset(row["mean_distance_m"], range_static_offset_m)) - float(true_distance))
                 if row["mean_distance_m"] is not None and true_distance is not None
                 else None,
                 row["good_count"],
@@ -3246,7 +3329,11 @@ def style_workbook(wb: openpyxl.Workbook) -> None:
             ws.column_dimensions[column_cells[0].column_letter].width = min(max(max_len + 2, 12), 42)
 
 
-def build_measurement_rows(db_path: Path) -> list[dict[str, Any]]:
+def build_measurement_rows(
+    db_path: Path,
+    *,
+    range_static_offset_m: float = 0.0,
+) -> list[dict[str, Any]]:
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
     try:
@@ -3304,7 +3391,9 @@ def build_measurement_rows(db_path: Path) -> list[dict[str, Any]]:
     for row in sample_rows:
         anchor_id = row["anchor_id"] or ""
         key = (row["session_id"], anchor_id)
-        samples_by_key.setdefault(key, []).append(float(row["distance_m"]))
+        corrected = apply_range_offset(row["distance_m"], range_static_offset_m)
+        if corrected is not None:
+            samples_by_key.setdefault(key, []).append(corrected)
 
     latest_summary_by_key: dict[tuple[str, str], sqlite3.Row] = {}
     for row in summary_rows:
@@ -3334,7 +3423,7 @@ def build_measurement_rows(db_path: Path) -> list[dict[str, Any]]:
         latest_summary = latest_summary_by_key.get((session_id, anchor_id))
         truth = truth_by_key.get((session_id, anchor_id))
         mean_distance = (
-            float(latest_summary["mean_distance_m"])
+            apply_range_offset(latest_summary["mean_distance_m"], range_static_offset_m)
             if latest_summary is not None
             else statistics.fmean(values)
             if values

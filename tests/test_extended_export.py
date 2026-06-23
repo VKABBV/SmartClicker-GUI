@@ -113,6 +113,40 @@ class ExtendedExportTests(unittest.TestCase):
         self.assertEqual(len(paths), 1)
         self.assertTrue(paths[0].name.endswith("_20260619_143015.xlsx"))
 
+    def test_measurement_rows_apply_static_range_offset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "measurements.sqlite"
+            store = MeasurementStore(db_path)
+            session_id = store.create_session({"constellation_label": "bench"})
+            self._insert_sample(store, session_id, "7", 1.25)
+            store.close()
+
+            rows = build_measurement_rows(db_path, range_static_offset_m=0.25)
+
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]["uwb_mean_distance_m"], 1.0)
+
+    def test_per_anchor_workbook_applies_static_range_offset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MeasurementStore(Path(tmp) / "measurements.sqlite")
+            session_id = store.create_session({"constellation_label": "bench"})
+            self._insert_sample(store, session_id, "7", 1.25)
+            paths = export_session_per_anchor(
+                store.conn,
+                session_id,
+                Path(tmp) / "exports",
+                range_static_offset_m=0.25,
+            )
+            store.close()
+
+            wb = load_workbook(paths[0], read_only=True)
+            ws = wb["Samples"]
+            headers = [cell.value for cell in ws[1]]
+            measured = ws.cell(row=2, column=headers.index("measured_uwb_distance_m") + 1).value
+            wb.close()
+
+        self.assertAlmostEqual(measured, 1.0)
+
     def test_measurement_list_default_filename_includes_export_timestamp(self) -> None:
         self.assertEqual(
             measurement_list_default_filename(

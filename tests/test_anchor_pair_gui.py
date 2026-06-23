@@ -12,6 +12,14 @@ class FakeStatusVar:
         self.value = value
 
 
+class FakeVar:
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+    def get(self) -> str:
+        return self.value
+
+
 class FakeTree:
     def __init__(self) -> None:
         self._rows: dict[str, tuple[str, ...]] = {}
@@ -49,6 +57,7 @@ def make_app() -> ExtendedUwbCaptureApp:
     app.anchor_survey_expected_pair_count = None
     app.anchor_survey_received_pair_count = 0
     app.anchor_survey_successful_pair_count = 0
+    app.range_static_offset_var = FakeVar("0")
     app.anchor_geometry_status_var = FakeStatusVar()
     app.anchor_pair_table = FakeTree()
     app.log_raw = lambda _message: None

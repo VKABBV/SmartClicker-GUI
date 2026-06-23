@@ -101,15 +101,18 @@ class LocalizationSolverTests(unittest.TestCase):
         self.assertAlmostEqual(result.y_m, true_y, places=4)
         self.assertAlmostEqual(result.common_height_m or 0.0, height_delta, places=4)
 
-    def test_rejects_xy_solution_farther_than_measured_ranges_allow(self) -> None:
+    def test_physically_inconsistent_ranges_still_return_low_confidence_solution(self) -> None:
         readings = [
             LocalizationReading("A1", 0.0, 0.0, 2.121),
             LocalizationReading("A2", 0.3, 0.8, 0.852),
             LocalizationReading("A3", 1.5, 1.0, 2.314),
         ]
 
-        with self.assertRaisesRegex(ValueError, "physically inconsistent"):
-            solve_position(readings)
+        result = solve_position(readings)
+
+        self.assertEqual(result.confidence, "Low")
+        self.assertGreater(result.rmse_m, 1.0)
+        self.assertTrue(any("shorter than the solved XY distances" in warning for warning in result.warnings))
 
     def test_square_simulation_solves_inside_floor_plan(self) -> None:
         scenario = build_square_simulation(

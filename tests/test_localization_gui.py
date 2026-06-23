@@ -15,11 +15,14 @@ class FakeStatusVar:
 
 
 class FakeVar:
-    def __init__(self, value: str) -> None:
+    def __init__(self, value: object) -> None:
         self.value = value
 
-    def get(self) -> str:
+    def get(self) -> object:
         return self.value
+
+    def set(self, value: object) -> None:
+        self.value = value
 
 
 class LocalizationGuiTests(unittest.TestCase):
@@ -95,6 +98,37 @@ class LocalizationGuiTests(unittest.TestCase):
         self.assertEqual(app.applied_ranges, {"A1": 1.0, "A2": 2.0, "A3": 3.0})
         self.assertEqual(app.solve_count, 1)
         self.assertEqual(app.live_tracking_received_sample_count, 0)
+
+    def test_static_range_offset_is_added_to_each_anchor_offset(self) -> None:
+        app = ExtendedUwbCaptureApp.__new__(ExtendedUwbCaptureApp)
+        app.range_static_offset_var = FakeVar("0.25")
+        app.localization_row_order = ["A1", "A2", "A3"]
+        app.localization_rows = {
+            anchor_id: {
+                "enabled_var": FakeVar(True),
+                "anchor_var": FakeVar(anchor_id),
+                "x_var": FakeVar(str(index)),
+                "y_var": FakeVar("0"),
+                "range_var": FakeVar("3"),
+                "offset_var": FakeVar("0.05"),
+                "sigma_var": FakeVar("0.05"),
+            }
+            for index, anchor_id in enumerate(app.localization_row_order)
+        }
+
+        readings = app._read_localization_form()
+
+        for reading in readings:
+            self.assertAlmostEqual(reading.offset_m, 0.30)
+
+    def test_static_range_offset_must_be_numeric(self) -> None:
+        app = ExtendedUwbCaptureApp.__new__(ExtendedUwbCaptureApp)
+        app.range_static_offset_var = FakeVar("bad")
+        app.localization_row_order = []
+        app.localization_rows = {}
+
+        with self.assertRaisesRegex(ValueError, "Static range offset"):
+            app._read_localization_form()
 
 
 if __name__ == "__main__":

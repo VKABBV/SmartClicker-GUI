@@ -256,8 +256,6 @@ def _analyze_range_fit(
     readings: list[ProcessedReading],
     x_m: float,
     y_m: float,
-    *,
-    impossible_height_squared_m2: float = -0.25,
 ) -> tuple[dict[str, float], float, float | None, list[str]]:
     height_squared_sum = 0.0
     weight_total = 0.0
@@ -274,17 +272,12 @@ def _analyze_range_fit(
     if weight_total <= 0.0:
         raise ValueError("At least three valid enabled anchor readings are required.")
     common_height_squared = height_squared_sum / weight_total
-    if common_height_squared < impossible_height_squared_m2:
-        raise ValueError(
-            "Captured ranges are physically inconsistent with the entered anchor coordinates; "
-            "the solved XY point is farther from the anchors than the measured ranges allow."
-        )
 
     modeled_height_squared = max(common_height_squared, 0.0)
     common_height_m = math.sqrt(common_height_squared) if common_height_squared >= 0.0 else None
     if common_height_squared < 0.0:
         warnings.append(
-            "Ranges are slightly shorter than the solved XY distances; check anchor coordinates or offsets."
+            "Ranges are shorter than the solved XY distances; check anchor coordinates, offsets, NLOS, or bad ranges."
         )
 
     residuals: dict[str, float] = {}
