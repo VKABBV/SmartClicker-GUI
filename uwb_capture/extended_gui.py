@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
 import re
 import sqlite3
@@ -58,6 +59,14 @@ RESPONDER_LABEL_TABLE = "responder_los_nlos_labels"
 UNKNOWN_LOS_NLOS = "Unknown"
 LOS_NLOS_OPTIONS = (UNKNOWN_LOS_NLOS, "LOS", "NLOS")
 ILLEGAL_EXCEL_CHARS_RE = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]")
+
+
+@dataclass(frozen=True)
+class AnchorPairFailure:
+    anchor_a_id: str
+    anchor_b_id: str
+    status: str
+    source: str
 
 
 def safe_float(value: Any) -> float | None:
@@ -170,6 +179,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self.localization_fullscreen_canvas: Any | None = None
         self.anchor_pair_distances: dict[tuple[str, str], AnchorPairDistance] = {}
         self.anchor_pair_status: dict[tuple[str, str], str] = {}
+        self.anchor_pair_failures: dict[tuple[str, str], AnchorPairFailure] = {}
         self.anchor_layout_result: AnchorLayoutResult | None = None
         self.anchor_layout_positions: dict[str, tuple[float, float]] = {}
         self.anchor_layout_drag_start_angle: float | None = None
@@ -1371,6 +1381,9 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         for pair in self.anchor_pair_distances.values():
             anchor_ids.add(pair.anchor_a_id)
             anchor_ids.add(pair.anchor_b_id)
+        for failure in self.anchor_pair_failures.values():
+            anchor_ids.add(failure.anchor_a_id)
+            anchor_ids.add(failure.anchor_b_id)
         for anchor_id in self.anchor_layout_positions:
             anchor_ids.add(anchor_id)
         return sorted(anchor_id for anchor_id in anchor_ids if anchor_id)
@@ -1431,10 +1444,30 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         )
         self.anchor_pair_distances[key] = pair
         self.anchor_pair_status[key] = status
+        self.anchor_pair_failures.pop(key, None)
         self._register_detected_anchor(anchor_a_key)
         self._register_detected_anchor(anchor_b_key)
         self._refresh_anchor_pair_table()
         self._update_anchor_pair_combos()
+
+    def _remember_anchor_pair_failure(
+        self,
+        anchor_a: str,
+        anchor_b: str,
+        status: str,
+        source: str,
+    ) -> None:
+        key = self._anchor_pair_key(anchor_a, anchor_b)
+        anchor_a_key, anchor_b_key = key
+        if key in self.anchor_pair_distances:
+            return
+        self.anchor_pair_failures[key] = AnchorPairFailure(
+            anchor_a_id=anchor_a_key,
+            anchor_b_id=anchor_b_key,
+            status=status,
+            source=source,
+        )
+        self._refresh_anchor_pair_table()
 
     def delete_selected_anchor_pair_distance(self) -> None:
         selected = self.anchor_pair_table.selection()
@@ -1447,6 +1480,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             key = self._anchor_pair_key(str(values[0]), str(values[1]))
             self.anchor_pair_distances.pop(key, None)
             self.anchor_pair_status.pop(key, None)
+            self.anchor_pair_failures.pop(key, None)
         self.anchor_layout_result = None
         self.anchor_layout_positions = {}
         self._refresh_anchor_pair_table()
@@ -1457,6 +1491,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
     def clear_anchor_pair_distances(self) -> None:
         self.anchor_pair_distances.clear()
         self.anchor_pair_status.clear()
+        self.anchor_pair_failures.clear()
         self.anchor_layout_result = None
         self.anchor_layout_positions = {}
         self._refresh_anchor_pair_table()
@@ -1470,17 +1505,31 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             return
         for item in self.anchor_pair_table.get_children():
             self.anchor_pair_table.delete(item)
-        for key, pair in sorted(self.anchor_pair_distances.items()):
-            self.anchor_pair_table.insert(
-                "",
-                tk.END,
-                values=(
+        keys = set(self.anchor_pair_distances)
+        keys.update(self.anchor_pair_failures)
+        for key in sorted(keys):
+            pair = self.anchor_pair_distances.get(key)
+            if pair is None:
+                failure = self.anchor_pair_failures[key]
+                values = (
+                    failure.anchor_a_id,
+                    failure.anchor_b_id,
+                    "",
+                    failure.status,
+                    failure.source,
+                )
+            else:
+                values = (
                     pair.anchor_a_id,
                     pair.anchor_b_id,
                     format_meter(pair.distance_m, ""),
                     self.anchor_pair_status.get(key, "ok"),
                     pair.source,
-                ),
+                )
+            self.anchor_pair_table.insert(
+                "",
+                tk.END,
+                values=values,
             )
 
     def on_anchor_pair_selected(self, _event: Any = None) -> None:
@@ -1572,9 +1621,11 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
     def _anchor_survey_progress_text(self) -> str:
         received = self.anchor_survey_received_pair_count
         expected = self.anchor_survey_expected_pair_count
+        successful = self.anchor_survey_successful_pair_count
+        distance_text = f"{successful} usable distance(s)"
         if expected is None:
-            return f"{received} pair row(s) received"
-        return f"{received}/{expected} pair row(s) received"
+            return f"{received} pair row(s) received, {distance_text}"
+        return f"{received}/{expected} pair row(s) received, {distance_text}"
 
     def _finish_anchor_pair_survey(self, reason: str | None = None) -> None:
         progress = self._anchor_survey_progress_text()
@@ -1624,21 +1675,23 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             self.anchor_survey_received_pair_count += 1
             if record.scheduled_sample_count is not None:
                 self.anchor_survey_expected_pair_count = int(record.scheduled_sample_count)
+        source = "survey"
+        if record.event_seq is not None:
+            source = f"survey event {record.event_seq}"
         if record.kind == "survey_pair_failure" or record.distance_m is None:
+            status = record.status or record.error_code or "unknown"
+            self._remember_anchor_pair_failure(anchor_a, anchor_b, status, source)
             self.anchor_geometry_status_var.set(
                 f"Anchor pair {anchor_a}-{anchor_b} failed: "
-                f"{record.status or record.error_code or 'unknown'} "
+                f"{status} "
                 f"({self._anchor_survey_progress_text()})."
             )
             self.log_raw(
                 f"# Anchor pair survey failure {anchor_a}-{anchor_b}: "
-                f"{record.status or record.error_code or 'unknown'}"
+                f"{status}"
             )
             self._update_anchor_pair_combos()
             return
-        source = "survey"
-        if record.event_seq is not None:
-            source = f"survey event {record.event_seq}"
         self._save_anchor_pair_distance(
             anchor_a,
             anchor_b,
