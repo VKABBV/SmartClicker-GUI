@@ -11,7 +11,10 @@ from uwb_capture.protocol import (
     TlvId,
     build_ml_start_collection_packet,
     build_ml_start_fast_ranging_packet,
+    build_ml_start_live_tracking_packet,
+    build_ml_live_tracking_heartbeat_packet,
     build_ml_start_anchor_pair_survey_packet,
+    build_ml_stop_live_tracking_packet,
     cobs_decode,
     cobs_encode,
     command_result_summary,
@@ -121,6 +124,75 @@ class CommandTests(unittest.TestCase):
         self.assertIn(bytes([TlvId.COMMAND_ID, 2, 0x01, 0x80]), packet.payload)
         self.assertIn(bytes([TlvId.SAMPLE_COUNT, 1, 12]), packet.payload)
         self.assertIn(bytes([TlvId.DISCOVERY_SLOT_COUNT, 1, 8]), packet.payload)
+
+    def test_build_ml_start_live_tracking_packet(self) -> None:
+        raw = build_ml_start_live_tracking_packet(
+            source_id=0x100,
+            destination_id=0x200,
+            session_id=1234,
+            sequence=7,
+            sample_count=100,
+            discovery_slot_count=8,
+            duration_ms=3000,
+        )
+        packet = decode_packet(raw)
+
+        self.assertEqual(packet.msg_type, MessageType.COMMAND)
+        self.assertEqual(packet.source_id, 0x100)
+        self.assertEqual(packet.destination_id, 0x200)
+        self.assertEqual(packet.session_id, 1234)
+        self.assertEqual(packet.sequence, 7)
+        self.assertIn(bytes([TlvId.COMMAND_ID, 2, 0x03, 0x80]), packet.payload)
+        self.assertIn(bytes([TlvId.SAMPLE_COUNT, 1, 100]), packet.payload)
+        self.assertIn(bytes([TlvId.DISCOVERY_SLOT_COUNT, 1, 8]), packet.payload)
+        self.assertIn(bytes([TlvId.DURATION_MS, 4, 0xB8, 0x0B, 0x00, 0x00]), packet.payload)
+
+    def test_live_tracking_heartbeat_and_stop_packets_only_include_command_id(self) -> None:
+        heartbeat = decode_packet(
+            build_ml_live_tracking_heartbeat_packet(
+                source_id=0x100,
+                destination_id=0x200,
+                session_id=1234,
+                sequence=8,
+            )
+        )
+        stop = decode_packet(
+            build_ml_stop_live_tracking_packet(
+                source_id=0x100,
+                destination_id=0x200,
+                session_id=1234,
+                sequence=9,
+            )
+        )
+
+        self.assertEqual(heartbeat.payload, bytes([TlvId.COMMAND_ID, 2, 0x04, 0x80]))
+        self.assertEqual(stop.payload, bytes([TlvId.COMMAND_ID, 2, 0x05, 0x80]))
+
+    def test_live_tracking_packet_rejects_invalid_limits(self) -> None:
+        with self.assertRaises(ProtocolError):
+            build_ml_start_live_tracking_packet(
+                source_id=0x100,
+                destination_id=0x200,
+                session_id=1234,
+                sequence=7,
+                sample_count=101,
+            )
+        with self.assertRaises(ProtocolError):
+            build_ml_start_live_tracking_packet(
+                source_id=0x100,
+                destination_id=0x200,
+                session_id=1234,
+                sequence=7,
+                discovery_slot_count=9,
+            )
+        with self.assertRaises(ProtocolError):
+            build_ml_start_live_tracking_packet(
+                source_id=0x100,
+                destination_id=0x200,
+                session_id=1234,
+                sequence=7,
+                duration_ms=499,
+            )
 
     def test_ml_start_collection_packet_rejects_out_of_range_limits(self) -> None:
         with self.assertRaises(ProtocolError):

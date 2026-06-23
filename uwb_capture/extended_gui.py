@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import random
 import re
 import sqlite3
 import statistics
@@ -39,8 +40,12 @@ from .localization import (
 )
 from .protocol import (
     CommandStatus,
+    ImecPacket,
     ProtocolError,
+    build_ml_live_tracking_heartbeat_packet,
+    build_ml_start_live_tracking_packet,
     build_ml_start_anchor_pair_survey_packet,
+    build_ml_stop_live_tracking_packet,
     command_status_from_packet,
     next_sequence,
     parse_device_id,
@@ -61,6 +66,11 @@ LOS_NLOS_OPTIONS = (UNKNOWN_LOS_NLOS, "LOS", "NLOS")
 ILLEGAL_EXCEL_CHARS_RE = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]")
 LOCALIZATION_VIEW_PAN_FRACTION = 0.15
 LOCALIZATION_VIEW_ZOOM_FACTOR = 1.25
+LIVE_TRACKING_HEARTBEAT_MS = 1000
+LIVE_TRACKING_WATCHDOG_MS = 3000
+LIVE_TRACKING_SAMPLE_COUNT = 1
+LIVE_TRACKING_MAX_RESTART_RETRIES = 3
+LIVE_TRACKING_MAX_RESTART_BACKOFF_MS = 1000
 
 
 @dataclass(frozen=True)
@@ -200,6 +210,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self.anchor_survey_received_pair_count = 0
         self.anchor_survey_successful_pair_count = 0
         self.live_tracking_active = False
+        self.live_tracking_stopping = False
         self.live_tracking_after_id: str | None = None
         self.live_tracking_event_seq: int | None = None
         self.live_tracking_expected_sample_count: int | None = None
@@ -207,6 +218,14 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self.live_tracking_ranges_by_anchor: dict[str, list[float]] = {}
         self.live_tracking_finish_pending = False
         self.live_tracking_finish_after_id: str | None = None
+        self.live_tracking_run_finish_pending = False
+        self.live_tracking_final_status: int | None = None
+        self.live_tracking_source_id: int | None = None
+        self.live_tracking_destination_id: int | None = None
+        self.live_tracking_session_id: int | None = None
+        self.live_tracking_start_sequence: int | None = None
+        self.live_tracking_last_range_monotonic: float | None = None
+        self.live_tracking_restart_retry_count = 0
         self._pyth_updating = False
         super().__init__()
         self._install_extensions()
@@ -384,7 +403,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         )
         self.sim_width_var = tk.StringVar(value="7")
         self.sim_height_var = tk.StringVar(value="7")
-        self.live_tracking_interval_var = tk.StringVar(value="2")
+        self.live_tracking_interval_var = tk.StringVar(value=str(LIVE_TRACKING_HEARTBEAT_MS))
         self.live_tracking_status_var = tk.StringVar(value="Live tracking stopped")
         ttk.Button(
             header,
@@ -436,7 +455,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         live_frame.columnconfigure(1, weight=1)
         live_frame.columnconfigure(2, weight=1)
         live_frame.columnconfigure(3, weight=1)
-        ttk.Label(live_frame, text="Live every s").grid(row=0, column=0, sticky="w", padx=(0, 4))
+        ttk.Label(live_frame, text="Heartbeat ms").grid(row=0, column=0, sticky="w", padx=(0, 4))
         ttk.Entry(live_frame, textvariable=self.live_tracking_interval_var, width=8).grid(
             row=0,
             column=1,
@@ -801,14 +820,126 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             raise ValueError(f"{label} must be greater than 0.")
         return value
 
+    def _live_tracking_command_ids(self) -> tuple[int, int, int] | None:
+        try:
+            source_id = parse_device_id(self.host_id_var.get(), default=0)
+            if source_id == 0:
+                raise ProtocolError("Host ID must be a stable non-zero device ID.")
+            destination_id = parse_device_id(self.clicker_id_var.get(), default=0)
+            session_id = self._ml_session_id()
+        except ProtocolError as exc:
+            self.live_tracking_status_var.set(str(exc))
+            messagebox.showerror("Invalid live tracking command", str(exc), parent=self)
+            return None
+        return source_id, destination_id, session_id
+
+    def _send_live_tracking_packet(
+        self,
+        packet: bytes,
+        *,
+        command_name: str,
+        sequence: int,
+    ) -> bool:
+        if self.bluetooth_worker is None:
+            self.log_raw(f"# Did not send {command_name}; Bluetooth is not connected.")
+            return False
+        if self._live_tracking_worker_stopped():
+            self.log_raw(f"# Did not send {command_name}; Bluetooth is reconnecting.")
+            return False
+        sent = self.bluetooth_worker.send_packet(packet)
+        if not sent:
+            self.log_raw(f"# Did not send {command_name}; Bluetooth is not ready.")
+            return False
+        self.log_raw(
+            f"# Queued {command_name} to {self.clicker_id_var.get().strip() or 'broadcast'} "
+            f"(session={self.live_tracking_session_id} seq={sequence})"
+        )
+        return True
+
+    def _send_live_tracking_start_command(self) -> bool:
+        command_ids = self._live_tracking_command_ids()
+        if command_ids is None:
+            return False
+        source_id, destination_id, session_id = command_ids
+        self.protocol_sequence = next_sequence(self.protocol_sequence)
+        sequence = self.protocol_sequence
+        try:
+            discovery_slots = self._ml_discovery_slot_count()
+            packet = build_ml_start_live_tracking_packet(
+                source_id=source_id,
+                destination_id=destination_id,
+                session_id=session_id,
+                sequence=sequence,
+                sample_count=LIVE_TRACKING_SAMPLE_COUNT,
+                discovery_slot_count=discovery_slots,
+                duration_ms=LIVE_TRACKING_WATCHDOG_MS,
+            )
+        except ProtocolError as exc:
+            self.live_tracking_status_var.set(str(exc))
+            messagebox.showerror("Invalid live tracking command", str(exc), parent=self)
+            return False
+
+        self.live_tracking_source_id = source_id
+        self.live_tracking_destination_id = destination_id
+        self.live_tracking_session_id = session_id
+        self.live_tracking_start_sequence = sequence
+        if not self._send_live_tracking_packet(
+            packet,
+            command_name="ML_START_LIVE_TRACKING",
+            sequence=sequence,
+        ):
+            self._clear_live_tracking_run_state()
+            return False
+
+        self._reset_trigger_collection_state()
+        self.ml_command_in_flight = True
+        self.ml_pending_session = session_id
+        self.ml_pending_seq = sequence
+        self.ml_pending_mode = original.ML_COLLECTION_MODE_LIVE
+        self.ml_expected_sample_notifications = None
+        self.ml_received_sample_notifications = 0
+        self._set_ml_collect_state(True)
+        self._update_ml_progress_status()
+        return True
+
+    def _send_live_tracking_control_command(self, command_name: str, builder: Any) -> bool:
+        source_id = self.__dict__.get("live_tracking_source_id")
+        destination_id = self.__dict__.get("live_tracking_destination_id")
+        session_id = self.__dict__.get("live_tracking_session_id")
+        if (
+            source_id is None
+            or destination_id is None
+            or session_id is None
+        ):
+            return False
+        self.protocol_sequence = next_sequence(self.protocol_sequence)
+        sequence = self.protocol_sequence
+        packet = builder(
+            source_id=source_id,
+            destination_id=destination_id,
+            session_id=session_id,
+            sequence=sequence,
+        )
+        return self._send_live_tracking_packet(
+            packet,
+            command_name=command_name,
+            sequence=sequence,
+        )
+
+    def _send_live_tracking_heartbeat_command(self) -> bool:
+        return self._send_live_tracking_control_command(
+            "ML_LIVE_TRACKING_HEARTBEAT",
+            build_ml_live_tracking_heartbeat_packet,
+        )
+
+    def _send_live_tracking_stop_command(self) -> bool:
+        return self._send_live_tracking_control_command(
+            "ML_STOP_LIVE_TRACKING",
+            build_ml_stop_live_tracking_packet,
+        )
+
     def start_live_tracking(self) -> None:
         if self.live_tracking_active:
-            return
-        try:
-            self._live_tracking_interval_ms()
-        except ValueError as exc:
-            self.live_tracking_status_var.set(str(exc))
-            messagebox.showerror("Invalid live tracking interval", str(exc), parent=self)
             return
         if self.bluetooth_worker is None:
             self.live_tracking_status_var.set("Connect to the clicker before live tracking.")
@@ -818,26 +949,36 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
                 parent=self,
             )
             return
+        if self.ml_command_in_flight:
+            self.live_tracking_status_var.set("Wait for the current ML command to finish.")
+            return
 
+        self._reset_live_tracking_batch()
+        if not self._send_live_tracking_start_command():
+            return
         self.live_tracking_active = True
-        self.live_tracking_status_var.set("Live tracking active; waiting for ranges.")
+        self.live_tracking_stopping = False
+        self.live_tracking_restart_retry_count = 0
+        self.live_tracking_last_range_monotonic = time.monotonic()
+        self.live_tracking_status_var.set("Live tracking started; waiting for range chunks.")
         self._set_live_tracking_button_state()
         self._cancel_live_tracking_timer()
-        self._live_tracking_tick()
+        self._schedule_live_tracking_tick()
 
     def stop_live_tracking(self, reason: str = "Live tracking stopped.") -> None:
         if not self.live_tracking_active and self.live_tracking_after_id is None:
             return
-        self.live_tracking_active = False
+        self.live_tracking_stopping = True
         self._cancel_live_tracking_timer()
-        if (
-            self.ml_command_in_flight
-            and self.ml_pending_mode == original.ML_COLLECTION_MODE_FAST
-        ):
-            self._abort_ml_command("Live tracking stopped")
-        self._reset_live_tracking_batch()
+        sent = self._send_live_tracking_stop_command()
+        if not sent and self.__dict__.get("bluetooth_worker") is None:
+            self._complete_live_tracking_run("Live tracking stopped locally; Bluetooth is disconnected.")
+            return
         if hasattr(self, "live_tracking_status_var"):
-            self.live_tracking_status_var.set(reason)
+            if sent:
+                self.live_tracking_status_var.set("Stop sent; waiting for final live-tracking result.")
+            else:
+                self.live_tracking_status_var.set(f"{reason} Waiting for firmware watchdog.")
         self._set_live_tracking_button_state()
 
     def _set_live_tracking_button_state(self) -> None:
@@ -847,7 +988,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             )
         if hasattr(self, "live_tracking_stop_button"):
             self.live_tracking_stop_button.configure(
-                state="normal" if self.live_tracking_active else "disabled"
+                state="normal" if self.live_tracking_active and not self.live_tracking_stopping else "disabled"
             )
 
     def _cancel_live_tracking_timer(self) -> None:
@@ -861,18 +1002,28 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             pass
 
     def _live_tracking_interval_ms(self) -> int:
-        value = safe_float(self.live_tracking_interval_var.get())
-        if value is None or value <= 0:
-            raise ValueError("Live tracking interval must be greater than 0 seconds.")
-        return max(int(value * 1000), 100)
+        return LIVE_TRACKING_HEARTBEAT_MS
 
     def _reset_live_tracking_batch(self) -> None:
         self.live_tracking_finish_pending = False
         self.live_tracking_finish_after_id = None
+        self._reset_live_tracking_chunk()
+
+    def _reset_live_tracking_chunk(self) -> None:
         self.live_tracking_event_seq = None
         self.live_tracking_expected_sample_count = None
         self.live_tracking_received_sample_count = 0
         self.live_tracking_ranges_by_anchor.clear()
+
+    def _clear_live_tracking_run_state(self) -> None:
+        self.live_tracking_stopping = False
+        self.live_tracking_run_finish_pending = False
+        self.live_tracking_final_status = None
+        self.live_tracking_source_id = None
+        self.live_tracking_destination_id = None
+        self.live_tracking_session_id = None
+        self.live_tracking_start_sequence = None
+        self.live_tracking_last_range_monotonic = None
 
     def _request_live_tracking_batch_finish(self) -> None:
         self.live_tracking_finish_pending = True
@@ -890,12 +1041,92 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         if not self.live_tracking_finish_pending:
             return False
         self.live_tracking_finish_pending = False
-        return self._finish_live_tracking_batch(force=True)
+        solved = self._finish_live_tracking_batch(force=True)
+        if self.live_tracking_run_finish_pending:
+            self._complete_live_tracking_run(self._live_tracking_final_status_text())
+        return solved
+
+    def _complete_live_tracking_run(self, status: str) -> None:
+        self.live_tracking_active = False
+        self._cancel_live_tracking_timer()
+        self._reset_live_tracking_batch()
+        self._clear_live_tracking_run_state()
+        self.live_tracking_restart_retry_count = 0
+        if (
+            self.ml_command_in_flight
+            and self.ml_pending_mode == original.ML_COLLECTION_MODE_LIVE
+        ):
+            self._abort_ml_command(status)
+        if hasattr(self, "live_tracking_status_var"):
+            self.live_tracking_status_var.set(status)
+        self._set_live_tracking_button_state()
+
+    def _restart_live_tracking_now(self, reason: str) -> bool:
+        if not self.live_tracking_active or self.live_tracking_stopping:
+            return False
+        self._cancel_live_tracking_timer()
+        self._send_live_tracking_stop_command()
+        if (
+            self.ml_command_in_flight
+            and self.ml_pending_mode == original.ML_COLLECTION_MODE_LIVE
+        ):
+            self._abort_ml_command("Live tracking restarting")
+        self._reset_live_tracking_batch()
+        self._clear_live_tracking_run_state()
+        if not self._send_live_tracking_start_command():
+            self._request_live_tracking_restart("live start was not sent")
+            return False
+        self.live_tracking_last_range_monotonic = time.monotonic()
+        self.live_tracking_status_var.set(f"Live tracking restarted: {reason}")
+        self._set_live_tracking_button_state()
+        self._schedule_live_tracking_tick()
+        return True
+
+    def _request_live_tracking_restart(self, reason: str) -> None:
+        if not self.live_tracking_active or self.live_tracking_stopping:
+            return
+        if self.live_tracking_restart_retry_count >= LIVE_TRACKING_MAX_RESTART_RETRIES:
+            self._complete_live_tracking_run(
+                f"Live tracking stopped after {LIVE_TRACKING_MAX_RESTART_RETRIES} restart retries: {reason}"
+            )
+            return
+
+        retry_index = self.live_tracking_restart_retry_count
+        self.live_tracking_restart_retry_count += 1
+        delay_ms = 0 if retry_index == 0 else random.randint(0, LIVE_TRACKING_MAX_RESTART_BACKOFF_MS)
+        self._cancel_live_tracking_timer()
+        if delay_ms <= 0:
+            self._restart_live_tracking_now(reason)
+            return
+        self.live_tracking_status_var.set(f"Live tracking restarting in {delay_ms} ms: {reason}")
+        self.live_tracking_after_id = self.after(
+            delay_ms,
+            lambda: self._restart_live_tracking_now(reason),
+        )
+
+    def _live_tracking_final_status_text(self) -> str:
+        status = self.live_tracking_final_status
+        if status == CommandStatus.COMMAND_TIMEOUT:
+            return "Live tracking ended by firmware watchdog timeout."
+        if status is None or status == CommandStatus.COMMAND_OK:
+            return "Live tracking stopped."
+        try:
+            name = CommandStatus(status).name
+        except ValueError:
+            name = str(status)
+        return f"Live tracking ended with command result {name}."
 
     def _record_live_tracking_sample(self, record: Any) -> bool:
         if record.kind not in ("sample", "failure", "summary"):
             return False
         event_seq = record.event_seq
+        if (
+            event_seq is not None
+            and self.live_tracking_event_seq is not None
+            and event_seq != self.live_tracking_event_seq
+            and self.live_tracking_received_sample_count > 0
+        ):
+            self._reset_live_tracking_chunk()
         if self.live_tracking_event_seq is None:
             self.live_tracking_event_seq = event_seq
         if record.scheduled_sample_count is not None:
@@ -905,7 +1136,20 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         if record.anchor_id and distance is not None:
             anchor_key = str(record.anchor_id).strip()
             if anchor_key:
-                self.live_tracking_ranges_by_anchor.setdefault(anchor_key, []).append(float(distance))
+                distance_m = float(distance)
+                self.live_tracking_last_range_monotonic = time.monotonic()
+                self.live_tracking_restart_retry_count = 0
+                self.anchor_measured_distances[anchor_key] = distance_m
+                history = self.anchor_distance_history.setdefault(anchor_key, [])
+                history.append(distance_m)
+                if len(history) > 200:
+                    del history[: len(history) - 200]
+                self._update_localization_range(anchor_key, distance_m)
+                solved = self._try_live_tracking_solve()
+                self.live_tracking_status_var.set(
+                    f"Live tracking active; latest range from {anchor_key}."
+                )
+                return solved
 
         expected = self.live_tracking_expected_sample_count
         if expected is not None:
@@ -970,7 +1214,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
 
     def _live_tracking_tick(self) -> None:
         self.live_tracking_after_id = None
-        if not self.live_tracking_active:
+        if not self.live_tracking_active or self.live_tracking_stopping:
             return
         if self.bluetooth_worker is None:
             self._retry_live_tracking_later(
@@ -982,19 +1226,17 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
                 "Live tracking active; Bluetooth reconnecting, retrying."
             )
             return
+        last_range = self.live_tracking_last_range_monotonic
+        if last_range is not None and (time.monotonic() - last_range) * 1000.0 > LIVE_TRACKING_WATCHDOG_MS:
+            self._request_live_tracking_restart("no live ranges received")
+            return
 
-        if self.ml_command_in_flight:
-            self.live_tracking_status_var.set("Waiting for the current range request to finish.")
+        sent = self._send_live_tracking_heartbeat_command()
+        if sent:
+            self.live_tracking_status_var.set("Live tracking heartbeat sent; waiting for ranges.")
         else:
-            sent = self.send_ml_start_collection(collection_mode=original.ML_COLLECTION_MODE_FAST)
-            if sent:
-                self._reset_live_tracking_batch()
-                self.live_tracking_status_var.set("Fast range request sent; waiting for anchor replies.")
-            else:
-                self._retry_live_tracking_later(
-                    "Live tracking active; range request was not sent, retrying."
-                )
-                return
+            self._request_live_tracking_restart("live heartbeat was not sent")
+            return
         self._schedule_live_tracking_tick()
 
     def _try_live_tracking_solve(self) -> bool:
@@ -1987,8 +2229,8 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
 
     def _handle_anchor_survey_command_result(self, packet: Any) -> None:
         matches = (
-            self.anchor_survey_pending_session == packet.session_id
-            and self.anchor_survey_pending_seq == packet.sequence
+            self.__dict__.get("anchor_survey_pending_session") == packet.session_id
+            and self.__dict__.get("anchor_survey_pending_seq") == packet.sequence
         )
         if not matches:
             return
@@ -2948,21 +3190,37 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self._persist_all_anchor_los_nlos()
 
     def disconnect_transport(self) -> None:
-        self.stop_live_tracking("Live tracking stopped; Bluetooth is disconnected.")
+        if self.live_tracking_active:
+            self.stop_live_tracking("Live tracking stopped; Bluetooth is disconnected.")
+            self._complete_live_tracking_run("Live tracking stopped; Bluetooth is disconnected.")
         if self.anchor_survey_in_flight:
             self._finish_anchor_pair_survey("Anchor pair survey stopped; Bluetooth is disconnected.")
         super().disconnect_transport()
 
-    def _handle_command_result(self, packet: Any) -> None:
-        live_fast_result = (
-            self.live_tracking_active
+    def _is_live_tracking_start_result(self, packet: ImecPacket) -> bool:
+        return (
+            self.live_tracking_session_id == packet.session_id
+            and self.live_tracking_start_sequence == packet.sequence
+        ) or (
+            self.ml_pending_mode == original.ML_COLLECTION_MODE_LIVE
             and self.ml_pending_session == packet.session_id
             and self.ml_pending_seq == packet.sequence
-            and self.ml_pending_mode == original.ML_COLLECTION_MODE_FAST
         )
+
+    def _handle_live_tracking_start_result(self, packet: ImecPacket) -> None:
+        self.live_tracking_final_status = command_status_from_packet(packet)
+        if self.live_tracking_active and not self.live_tracking_stopping:
+            self._request_live_tracking_restart(self._live_tracking_final_status_text())
+            return
+        self.live_tracking_run_finish_pending = True
+        self._cancel_live_tracking_timer()
+        self._request_live_tracking_batch_finish()
+
+    def _handle_command_result(self, packet: Any) -> None:
+        live_start_result = self._is_live_tracking_start_result(packet)
         super()._handle_command_result(packet)
-        if live_fast_result:
-            self._request_live_tracking_batch_finish()
+        if live_start_result:
+            self._handle_live_tracking_start_result(packet)
         self._handle_anchor_survey_command_result(packet)
 
     def handle_serial_line(self, line: str) -> None:

@@ -58,9 +58,11 @@ APP_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT_DIR = APP_DIR / "Measurements" / "GUI_Captures"
 ML_COLLECTION_MODE_FULL = "full_diagnostics"
 ML_COLLECTION_MODE_FAST = "fast_ranging"
+ML_COLLECTION_MODE_LIVE = "live_tracking"
 ML_COLLECTION_MODE_LABELS = {
     ML_COLLECTION_MODE_FULL: "Full diagnostics / CIR",
     ML_COLLECTION_MODE_FAST: "Fast ranging only",
+    ML_COLLECTION_MODE_LIVE: "Live tracking",
 }
 ML_COLLECTION_MODE_DETAILS = {
     ML_COLLECTION_MODE_FULL: (
@@ -68,6 +70,9 @@ ML_COLLECTION_MODE_DETAILS = {
     ),
     ML_COLLECTION_MODE_FAST: (
         "Fast ranging only sends 0x8001, stores range rows only, and expects no post-burst CIR."
+    ),
+    ML_COLLECTION_MODE_LIVE: (
+        "Live tracking sends 0x8003, keeps a watchdog heartbeat alive, and stores range rows only."
     ),
 }
 FULL_DIAGNOSTICS_COMMAND_TIMEOUT_MS = 75_000
@@ -768,6 +773,8 @@ class UwbCaptureApp(tk.Tk):
 
     @staticmethod
     def _ml_command_name(mode: str) -> str:
+        if mode == ML_COLLECTION_MODE_LIVE:
+            return "ML_START_LIVE_TRACKING"
         if mode == ML_COLLECTION_MODE_FAST:
             return "ML_START_FAST_RANGING"
         return "ML_START_COLLECTION"
@@ -803,7 +810,7 @@ class UwbCaptureApp(tk.Tk):
     def _note_ml_sample_notification(self, record: ParsedRecord) -> None:
         if not self.ml_command_in_flight:
             return
-        if record.scheduled_sample_count is not None:
+        if self.ml_pending_mode != ML_COLLECTION_MODE_LIVE and record.scheduled_sample_count is not None:
             self.ml_expected_sample_notifications = record.scheduled_sample_count
         self.ml_received_sample_notifications += 1
         self._update_ml_progress_status()
@@ -1096,14 +1103,18 @@ class UwbCaptureApp(tk.Tk):
         self._reset_trigger_collection_state()
         samples_text = f" ({sample_count} sample notifications)" if sample_count is not None else ""
         if status == CommandStatus.COMMAND_BUSY:
-            if mode == ML_COLLECTION_MODE_FAST:
+            if mode == ML_COLLECTION_MODE_LIVE:
+                self.log_raw("# Live tracking rejected as BUSY; stop the prior live run or wait for timeout.")
+            elif mode == ML_COLLECTION_MODE_FAST:
                 self.log_raw("# Fast ranging rejected as BUSY; wait for the prior request to finish, then retry.")
             else:
                 self.log_raw("# ML collection rejected as BUSY; wait for the prior collection to finish, then retry.")
             if hasattr(self, "ml_status_var"):
                 self.ml_status_var.set("Busy - retry after prior collection finishes")
         elif status == CommandStatus.COMMAND_TIMEOUT:
-            if mode == ML_COLLECTION_MODE_FAST:
+            if mode == ML_COLLECTION_MODE_LIVE:
+                self.log_raw(f"# Live tracking ended by watchdog timeout{samples_text}.")
+            elif mode == ML_COLLECTION_MODE_FAST:
                 self.log_raw(
                     f"# Fast ranging timed out with no anchor replies{samples_text}. "
                     "Firmware may have attempted fresh discovery; check anchor placement/power and retry."
@@ -1114,23 +1125,32 @@ class UwbCaptureApp(tk.Tk):
                     "Check anchor placement/power and retry."
                 )
             if hasattr(self, "ml_status_var"):
-                self.ml_status_var.set("Timeout - no anchors replied")
+                if mode == ML_COLLECTION_MODE_LIVE:
+                    self.ml_status_var.set(f"Live tracking watchdog timeout{samples_text}")
+                else:
+                    self.ml_status_var.set("Timeout - no anchors replied")
         elif status is None or status == CommandStatus.COMMAND_OK:
-            if mode == ML_COLLECTION_MODE_FAST:
+            if mode == ML_COLLECTION_MODE_LIVE:
+                self.log_raw(f"# Live tracking command result: OK{samples_text}")
+            elif mode == ML_COLLECTION_MODE_FAST:
                 self.log_raw(
                     f"# Fast ranging command result: OK{samples_text}; no post-burst CIR expected."
                 )
             else:
                 self.log_raw(f"# ML collection command result: OK{samples_text}")
             if hasattr(self, "ml_status_var"):
-                if mode == ML_COLLECTION_MODE_FAST:
+                if mode == ML_COLLECTION_MODE_LIVE:
+                    self.ml_status_var.set(f"Live tracking complete{samples_text}")
+                elif mode == ML_COLLECTION_MODE_FAST:
                     suffix = samples_text or f" ({progress})"
                     self.ml_status_var.set(f"Fast ranging complete{suffix}")
                 else:
                     self.ml_status_var.set(f"Collection complete{samples_text}")
         else:
             name = _command_status_name(status)
-            if mode == ML_COLLECTION_MODE_FAST:
+            if mode == ML_COLLECTION_MODE_LIVE:
+                self.log_raw(f"# Live tracking command result: {name}{samples_text}")
+            elif mode == ML_COLLECTION_MODE_FAST:
                 self.log_raw(f"# Fast ranging command result: {name}{samples_text}")
             else:
                 self.log_raw(f"# ML collection command result: {name}{samples_text}")

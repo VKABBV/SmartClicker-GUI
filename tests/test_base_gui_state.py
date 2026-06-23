@@ -133,9 +133,10 @@ class CommandStateTests(unittest.TestCase):
         self.assertEqual(app.reconnects, [])
         self.assertFalse(app.bluetooth_manual_disconnect_pending)
 
-    def test_stop_live_tracking_aborts_pending_fast_ranging_command(self) -> None:
+    def test_stop_live_tracking_completes_locally_without_bluetooth(self) -> None:
         app = ExtendedUwbCaptureApp.__new__(ExtendedUwbCaptureApp)
         app.live_tracking_active = True
+        app.live_tracking_stopping = False
         app.live_tracking_after_id = "live1"
         app.live_tracking_event_seq = 1
         app.live_tracking_expected_sample_count = 4
@@ -143,9 +144,19 @@ class CommandStateTests(unittest.TestCase):
         app.live_tracking_ranges_by_anchor = {"A1": [1.0]}
         app.live_tracking_finish_pending = True
         app.live_tracking_finish_after_id = "idle1"
+        app.live_tracking_run_finish_pending = False
+        app.live_tracking_final_status = None
+        app.live_tracking_source_id = None
+        app.live_tracking_destination_id = None
+        app.live_tracking_session_id = None
+        app.live_tracking_start_sequence = None
+        app.live_tracking_last_range_monotonic = None
+        app.live_tracking_restart_retry_count = 0
         app.live_tracking_status_var = FakeStatusVar()
+        app.bluetooth_worker = None
         app.ml_command_in_flight = True
         app.ml_pending_mode = base_gui.ML_COLLECTION_MODE_FAST
+        app.ml_timeout_after_id = None
         app.aborted_reasons = []
         app.cancelled_live_after_ids = []
         app._abort_ml_command = lambda reason: app.aborted_reasons.append(reason)
@@ -155,9 +166,12 @@ class CommandStateTests(unittest.TestCase):
         app.stop_live_tracking("Stopped by test.")
 
         self.assertFalse(app.live_tracking_active)
-        self.assertEqual(app.aborted_reasons, ["Live tracking stopped"])
+        self.assertEqual(app.aborted_reasons, [])
         self.assertEqual(app.cancelled_live_after_ids, ["live1"])
-        self.assertEqual(app.live_tracking_status_var.value, "Stopped by test.")
+        self.assertEqual(
+            app.live_tracking_status_var.value,
+            "Live tracking stopped locally; Bluetooth is disconnected.",
+        )
         self.assertEqual(app.live_tracking_ranges_by_anchor, {})
         self.assertFalse(app.live_tracking_finish_pending)
 

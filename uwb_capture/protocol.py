@@ -54,6 +54,9 @@ class CommandId(IntEnum):
     ML_START_COLLECTION = 0x8000
     ML_START_FAST_RANGING = 0x8001
     ML_START_ANCHOR_PAIR_SURVEY = 0x8002
+    ML_START_LIVE_TRACKING = 0x8003
+    ML_LIVE_TRACKING_HEARTBEAT = 0x8004
+    ML_STOP_LIVE_TRACKING = 0x8005
 
 
 class CommandStatus(IntEnum):
@@ -92,6 +95,7 @@ class TlvId(IntEnum):
     COMMAND_ID = 0x10
     COMMAND_STATUS = 0x11
     SURVEY_ID = 0x15
+    DURATION_MS = 0x1A
     REASON = 0x1E
     INITIATOR_ID = 0x1F
     RESPONDER_ID = 0x20
@@ -484,6 +488,77 @@ def build_ml_start_fast_ranging_packet(
         sequence=sequence,
         sample_count=sample_count,
         discovery_slot_count=discovery_slot_count,
+    )
+
+
+def build_ml_start_live_tracking_packet(
+    *,
+    source_id: int,
+    destination_id: int,
+    session_id: int,
+    sequence: int,
+    sample_count: int | None = None,
+    discovery_slot_count: int | None = None,
+    duration_ms: int | None = None,
+) -> bytes:
+    """Build a ``CMD_ML_START_LIVE_TRACKING`` command proto_packet."""
+
+    extra: list[tuple[int | TlvId, bytes]] = []
+    if sample_count is not None:
+        if not (1 <= sample_count <= 100):
+            raise ProtocolError("Live tracking sample count must be from 1 to 100.")
+        extra.append((TlvId.SAMPLE_COUNT, u8(sample_count)))
+    if discovery_slot_count is not None:
+        if not (1 <= discovery_slot_count <= 8):
+            raise ProtocolError("Live tracking discovery slots must be from 1 to 8.")
+        extra.append((TlvId.DISCOVERY_SLOT_COUNT, u8(discovery_slot_count)))
+    if duration_ms is not None:
+        if not (500 <= duration_ms <= 10000):
+            raise ProtocolError("Live tracking watchdog duration must be from 500 to 10000 ms.")
+        extra.append((TlvId.DURATION_MS, u32(duration_ms)))
+    return build_command_packet(
+        command_id=CommandId.ML_START_LIVE_TRACKING,
+        source_id=source_id,
+        destination_id=destination_id,
+        session_id=session_id,
+        sequence=sequence,
+        extra_tlvs=extra,
+    )
+
+
+def build_ml_live_tracking_heartbeat_packet(
+    *,
+    source_id: int,
+    destination_id: int,
+    session_id: int,
+    sequence: int,
+) -> bytes:
+    """Build a ``CMD_ML_LIVE_TRACKING_HEARTBEAT`` command proto_packet."""
+
+    return build_command_packet(
+        command_id=CommandId.ML_LIVE_TRACKING_HEARTBEAT,
+        source_id=source_id,
+        destination_id=destination_id,
+        session_id=session_id,
+        sequence=sequence,
+    )
+
+
+def build_ml_stop_live_tracking_packet(
+    *,
+    source_id: int,
+    destination_id: int,
+    session_id: int,
+    sequence: int,
+) -> bytes:
+    """Build a ``CMD_ML_STOP_LIVE_TRACKING`` command proto_packet."""
+
+    return build_command_packet(
+        command_id=CommandId.ML_STOP_LIVE_TRACKING,
+        source_id=source_id,
+        destination_id=destination_id,
+        session_id=session_id,
+        sequence=sequence,
     )
 
 
