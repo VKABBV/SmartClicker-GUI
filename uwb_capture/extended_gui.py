@@ -192,6 +192,10 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self.anchor_survey_successful_pair_count = 0
         self.live_tracking_active = False
         self.live_tracking_after_id: str | None = None
+        self.live_tracking_event_seq: int | None = None
+        self.live_tracking_expected_sample_count: int | None = None
+        self.live_tracking_received_sample_count = 0
+        self.live_tracking_ranges_by_anchor: dict[str, list[float]] = {}
         self._pyth_updating = False
         super().__init__()
         self._install_extensions()
@@ -718,6 +722,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             return
         self.live_tracking_active = False
         self._cancel_live_tracking_timer()
+        self._reset_live_tracking_batch()
         if hasattr(self, "live_tracking_status_var"):
             self.live_tracking_status_var.set(reason)
         self._set_live_tracking_button_state()
@@ -748,6 +753,69 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             raise ValueError("Live tracking interval must be greater than 0 seconds.")
         return max(int(value * 1000), 100)
 
+    def _reset_live_tracking_batch(self) -> None:
+        self.live_tracking_event_seq = None
+        self.live_tracking_expected_sample_count = None
+        self.live_tracking_received_sample_count = 0
+        self.live_tracking_ranges_by_anchor.clear()
+
+    def _record_live_tracking_sample(self, record: Any) -> bool:
+        if record.kind not in ("sample", "failure"):
+            return False
+        event_seq = record.event_seq
+        if event_seq is not None and self.live_tracking_event_seq not in (None, event_seq):
+            self._reset_live_tracking_batch()
+        if self.live_tracking_event_seq is None:
+            self.live_tracking_event_seq = event_seq
+        if record.scheduled_sample_count is not None:
+            self.live_tracking_expected_sample_count = int(record.scheduled_sample_count)
+        self.live_tracking_received_sample_count += 1
+        if record.anchor_id and record.distance_m is not None:
+            anchor_key = str(record.anchor_id).strip()
+            if anchor_key:
+                self.live_tracking_ranges_by_anchor.setdefault(anchor_key, []).append(float(record.distance_m))
+
+        expected = self.live_tracking_expected_sample_count
+        if expected is not None and self.live_tracking_received_sample_count >= expected:
+            return self._finish_live_tracking_batch(force=True)
+        if expected is not None:
+            self.live_tracking_status_var.set(
+                f"Live tracking active; received {self.live_tracking_received_sample_count}/{expected} range rows."
+            )
+        return False
+
+    def _finish_live_tracking_batch(self, *, force: bool = False) -> bool:
+        expected = self.live_tracking_expected_sample_count
+        if (
+            not force
+            and expected is not None
+            and self.live_tracking_received_sample_count < expected
+        ):
+            return False
+
+        ranges_by_anchor = {
+            anchor_id: sum(values) / len(values)
+            for anchor_id, values in self.live_tracking_ranges_by_anchor.items()
+            if values
+        }
+        received = self.live_tracking_received_sample_count
+        self._reset_live_tracking_batch()
+        if len(ranges_by_anchor) < 3:
+            self.live_tracking_status_var.set(
+                f"Live tracking active; received {received} row(s), "
+                f"{len(ranges_by_anchor)} usable anchor range(s)."
+            )
+            return False
+
+        for anchor_key, distance_m in ranges_by_anchor.items():
+            self.anchor_measured_distances[anchor_key] = distance_m
+            history = self.anchor_distance_history.setdefault(anchor_key, [])
+            history.append(distance_m)
+            if len(history) > 200:
+                del history[: len(history) - 200]
+            self._update_localization_range(anchor_key, distance_m)
+        return self._try_live_tracking_solve()
+
     def _schedule_live_tracking_tick(self) -> None:
         if not self.live_tracking_active:
             return
@@ -771,6 +839,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         else:
             sent = self.send_ml_start_collection(collection_mode=original.ML_COLLECTION_MODE_FAST)
             if sent:
+                self._reset_live_tracking_batch()
                 self.live_tracking_status_var.set("Fast range request sent; waiting for anchor replies.")
             else:
                 self.stop_live_tracking("Live tracking stopped; range request was not sent.")
@@ -875,9 +944,17 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             "Units: meters",
             "",
             f"Estimated position: x={result.x_m:.3f} m, y={result.y_m:.3f} m",
-            f"Radical-axis RMSE: {result.rmse_m:.3f} m",
+            f"Range fit RMSE: {result.rmse_m:.3f} m",
+            f"Radical-axis RMSE: {result.radical_axis_rmse_m:.3f} m",
             f"Confidence: {result.confidence}",
         ]
+        if result.common_height_m is not None:
+            lines.append(f"Common height component: {result.common_height_m:.3f} m")
+        lines.extend(["", "Range residuals:"])
+        for anchor_id, residual in sorted(result.range_residuals_m.items()):
+            lines.append(
+                f"- {anchor_id}: residual={residual:.3f} m"
+            )
         lines.extend(["", "Radical-axis line residuals:"])
         for pair_id, residual in sorted(result.residuals_m.items()):
             lines.append(
@@ -1004,35 +1081,44 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         if fullscreen_canvas is not None:
             self._redraw_localization_canvas(fullscreen_canvas)
 
-    def _render_localization_plot(self, canvas: Any, result: LocalizationResult) -> None:
-        if not hasattr(self, "localization_canvas"):
-            return
-        canvas.delete("all")
-        width = max(canvas.winfo_width(), 420)
-        height = max(canvas.winfo_height(), 260)
+    def _localization_plot_bounds(self, result: LocalizationResult) -> tuple[float, float, float, float]:
         anchor_points = [(reading.x_m, reading.y_m) for reading in result.processed_readings]
-        anchor_min_x = min(x for x, _ in anchor_points)
-        anchor_max_x = max(x for x, _ in anchor_points)
-        anchor_min_y = min(y for _, y in anchor_points)
-        anchor_max_y = max(y for _, y in anchor_points)
-        min_x = min(anchor_min_x, result.x_m)
-        max_x = max(anchor_max_x, result.x_m)
-        min_y = min(anchor_min_y, result.y_m)
-        max_y = max(anchor_max_y, result.y_m)
+        room_width = safe_float(self.sim_width_var.get()) if hasattr(self, "sim_width_var") else None
+        room_height = safe_float(self.sim_height_var.get()) if hasattr(self, "sim_height_var") else None
+        if room_width is not None and room_width > 0 and room_height is not None and room_height > 0:
+            min_x = 0.0
+            max_x = room_width
+            min_y = 0.0
+            max_y = room_height
+        else:
+            min_x = min(x for x, _ in anchor_points)
+            max_x = max(x for x, _ in anchor_points)
+            min_y = min(y for _, y in anchor_points)
+            max_y = max(y for _, y in anchor_points)
+
+        for x_m, y_m in anchor_points:
+            min_x = min(min_x, x_m)
+            max_x = max(max_x, x_m)
+            min_y = min(min_y, y_m)
+            max_y = max(max_y, y_m)
         if math.isclose(min_x, max_x):
             min_x -= 1.0
             max_x += 1.0
         if math.isclose(min_y, max_y):
             min_y -= 1.0
             max_y += 1.0
-        anchor_width = max(anchor_max_x - anchor_min_x, max_x - min_x)
-        anchor_height = max(anchor_max_y - anchor_min_y, max_y - min_y)
-        pad_x = max(anchor_width * 0.04, 0.15)
-        pad_y = max(anchor_height * 0.04, 0.15)
-        min_x -= pad_x
-        max_x += pad_x
-        min_y -= pad_y
-        max_y += pad_y
+        data_width = max(max_x - min_x, 1e-9)
+        data_height = max(max_y - min_y, 1e-9)
+        pad = max(max(data_width, data_height) * 0.04, 0.15)
+        return min_x - pad, max_x + pad, min_y - pad, max_y + pad
+
+    def _render_localization_plot(self, canvas: Any, result: LocalizationResult) -> None:
+        if not hasattr(self, "localization_canvas"):
+            return
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), 420)
+        height = max(canvas.winfo_height(), 260)
+        min_x, max_x, min_y, max_y = self._localization_plot_bounds(result)
         margin = 32
         plot_width = width - 2 * margin
         plot_height = height - 2 * margin
@@ -2602,7 +2688,15 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         super().disconnect_transport()
 
     def _handle_command_result(self, packet: Any) -> None:
+        live_fast_result = (
+            self.live_tracking_active
+            and self.ml_pending_session == packet.session_id
+            and self.ml_pending_seq == packet.sequence
+            and self.ml_pending_mode == original.ML_COLLECTION_MODE_FAST
+        )
         super()._handle_command_result(packet)
+        if live_fast_result:
+            self._finish_live_tracking_batch(force=True)
         self._handle_anchor_survey_command_result(packet)
 
     def handle_serial_line(self, line: str) -> None:
@@ -2623,6 +2717,9 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             if record.anchor_id:
                 anchor_key = str(record.anchor_id).strip()
                 self._register_detected_anchor(record.anchor_id)
+                if self.live_tracking_active and record.kind in ("sample", "failure"):
+                    self._record_live_tracking_sample(record)
+                    continue
                 if record.distance_m is not None:
                     self.anchor_measured_distances[anchor_key] = float(record.distance_m)
                     history = self.anchor_distance_history.setdefault(anchor_key, [])

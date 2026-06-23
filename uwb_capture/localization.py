@@ -47,10 +47,13 @@ class LocalizationResult:
     seed_y_m: float
     x_m: float
     y_m: float
+    radical_axis_rmse_m: float
     rmse_m: float
     confidence: str
     processed_readings: tuple[ProcessedReading, ...]
     residuals_m: dict[str, float]
+    range_residuals_m: dict[str, float]
+    common_height_m: float | None
     warnings: tuple[str, ...]
 
 
@@ -80,17 +83,26 @@ def solve_position(
         min_range_m=min_range_m,
     )
     x, y = _solve_radical_axis_lines(processed)
-    residuals, rmse, confidence, warnings = _analyze_radical_axis_residuals(processed, x, y)
+    line_residuals, line_rmse, line_warnings = _analyze_radical_axis_residuals(processed, x, y)
+    range_residuals, range_rmse, common_height_m, range_warnings = _analyze_range_fit(processed, x, y)
+    confidence, confidence_warnings = _localization_confidence(
+        line_rmse=line_rmse,
+        range_rmse=range_rmse,
+        common_height_m=common_height_m,
+    )
     return LocalizationResult(
         seed_x_m=x,
         seed_y_m=y,
         x_m=x,
         y_m=y,
-        rmse_m=rmse,
+        radical_axis_rmse_m=line_rmse,
+        rmse_m=range_rmse,
         confidence=confidence,
         processed_readings=tuple(processed),
-        residuals_m=residuals,
-        warnings=tuple(warnings),
+        residuals_m=line_residuals,
+        range_residuals_m=range_residuals,
+        common_height_m=common_height_m,
+        warnings=tuple(line_warnings + range_warnings + confidence_warnings),
     )
 
 
@@ -216,9 +228,8 @@ def _analyze_radical_axis_residuals(
     x_m: float,
     y_m: float,
     *,
-    good_rmse_m: float = 0.15,
     weak_rmse_m: float = 0.35,
-) -> tuple[dict[str, float], float, str, list[str]]:
+) -> tuple[dict[str, float], float, list[str]]:
     residuals: dict[str, float] = {}
     weighted_residual_sum = 0.0
     weight_total = 0.0
@@ -236,14 +247,79 @@ def _analyze_radical_axis_residuals(
     if weight_total <= 0.0:
         raise ValueError("At least two independent anchor pairs are required.")
     rmse = math.sqrt(weighted_residual_sum / weight_total)
-    if rmse <= good_rmse_m:
+    if rmse > weak_rmse_m:
+        warnings.append("Radical-axis RMSE is high; check anchor positions, NLOS, or bad ranges.")
+    return residuals, rmse, warnings
+
+
+def _analyze_range_fit(
+    readings: list[ProcessedReading],
+    x_m: float,
+    y_m: float,
+    *,
+    impossible_height_squared_m2: float = -0.25,
+) -> tuple[dict[str, float], float, float | None, list[str]]:
+    height_squared_sum = 0.0
+    weight_total = 0.0
+    warnings: list[str] = []
+    horizontal_distances: dict[str, float] = {}
+
+    for reading in readings:
+        horizontal = math.hypot(x_m - reading.x_m, y_m - reading.y_m)
+        horizontal_distances[reading.anchor_id] = horizontal
+        height_squared = reading.corrected_range_m**2 - horizontal**2
+        height_squared_sum += reading.weight * height_squared
+        weight_total += reading.weight
+
+    if weight_total <= 0.0:
+        raise ValueError("At least three valid enabled anchor readings are required.")
+    common_height_squared = height_squared_sum / weight_total
+    if common_height_squared < impossible_height_squared_m2:
+        raise ValueError(
+            "Captured ranges are physically inconsistent with the entered anchor coordinates; "
+            "the solved XY point is farther from the anchors than the measured ranges allow."
+        )
+
+    modeled_height_squared = max(common_height_squared, 0.0)
+    common_height_m = math.sqrt(common_height_squared) if common_height_squared >= 0.0 else None
+    if common_height_squared < 0.0:
+        warnings.append(
+            "Ranges are slightly shorter than the solved XY distances; check anchor coordinates or offsets."
+        )
+
+    residuals: dict[str, float] = {}
+    weighted_residual_sum = 0.0
+    for reading in readings:
+        modeled_range = math.hypot(horizontal_distances[reading.anchor_id], math.sqrt(modeled_height_squared))
+        residual = modeled_range - reading.corrected_range_m
+        residuals[reading.anchor_id] = residual
+        weighted_residual_sum += reading.weight * residual * residual
+    rmse = math.sqrt(weighted_residual_sum / weight_total)
+    return residuals, rmse, common_height_m, warnings
+
+
+def _localization_confidence(
+    *,
+    line_rmse: float,
+    range_rmse: float,
+    common_height_m: float | None,
+    good_rmse_m: float = 0.15,
+    weak_rmse_m: float = 0.35,
+) -> tuple[str, list[str]]:
+    warnings: list[str] = []
+    combined_rmse = max(line_rmse, range_rmse)
+    if combined_rmse <= good_rmse_m:
         confidence = "High"
-    elif rmse <= weak_rmse_m:
+    elif combined_rmse <= weak_rmse_m:
         confidence = "Medium"
     else:
         confidence = "Low"
-        warnings.append("Radical-axis RMSE is high; check anchor positions, NLOS, or bad ranges.")
-    return residuals, rmse, confidence, warnings
+        warnings.append("Range fit RMSE is high; check anchor positions, NLOS, offsets, or bad ranges.")
+    if common_height_m is not None and common_height_m > 3.0:
+        warnings.append(
+            f"Estimated common height component is {common_height_m:.2f} m; check whether ranges are 3D distances."
+        )
+    return confidence, warnings
 
 
 def _solve_2x2(

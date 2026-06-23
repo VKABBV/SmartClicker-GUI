@@ -31,21 +31,25 @@ position solving. Enter each anchor's X/Y coordinates in meters, load the latest
 captured ranges, then solve. The solver subtracts squared anchor-range equations
 to form radical-axis lines, then performs least squares on those lines. Any
 common height term cancels during the subtraction. Results report the estimated
-X/Y point, radical-axis RMSE in meters, confidence, and line residuals.
+X/Y point, range-fit RMSE, radical-axis RMSE, confidence, range residuals, and
+line residuals. Range sets that would put the solved X/Y point farther from the
+anchors than the measured ranges allow are rejected instead of plotted as a
+high-confidence estimate.
 
 Use `Run Square Simulation` to fill a four-anchor square/floor-plan test with
 fake ranges, solve it, and plot the estimated clicker point. The anchor X/Y
 fields are the known anchor placements; the clicker X/Y is not entered by the
-operator and is always estimated from anchor ranges. The visible simulation
-controls only set the floor-plan width and height. The plot can be opened in
+operator and is always estimated from anchor ranges. The visible width/height
+controls set the stable floor-plan bounds used by the preview. The plot can be opened in
 fullscreen from the `Fullscreen` button beside the layout preview.
 
 Use `Start Live Tracking` to send range-data-only
 `CMD_ML_START_FAST_RANGING` requests to the clicker every configured number of
-seconds. Returned anchors are added to the localization table as their ranges
-arrive. Enter each returned anchor's real X/Y coordinate; after at least three
+seconds. The GUI waits for each fast-ranging batch to finish, averages usable
+ranges per anchor in that batch, then updates the localization table and solves
+once. Enter each returned anchor's real X/Y coordinate; after at least three
 anchors have coordinates and ranges, the GUI updates the estimated clicker
-position with the same radical-axis solver.
+position with the same solver.
 
 ## Anchor Geometry Survey
 

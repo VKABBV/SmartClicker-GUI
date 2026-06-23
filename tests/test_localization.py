@@ -99,6 +99,17 @@ class LocalizationSolverTests(unittest.TestCase):
         self.assertIn("least squares", LOCALIZATION_ALGORITHM.lower())
         self.assertAlmostEqual(result.x_m, true_x, places=4)
         self.assertAlmostEqual(result.y_m, true_y, places=4)
+        self.assertAlmostEqual(result.common_height_m or 0.0, height_delta, places=4)
+
+    def test_rejects_xy_solution_farther_than_measured_ranges_allow(self) -> None:
+        readings = [
+            LocalizationReading("A1", 0.0, 0.0, 2.121),
+            LocalizationReading("A2", 0.3, 0.8, 0.852),
+            LocalizationReading("A3", 1.5, 1.0, 2.314),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "physically inconsistent"):
+            solve_position(readings)
 
     def test_square_simulation_solves_inside_floor_plan(self) -> None:
         scenario = build_square_simulation(
