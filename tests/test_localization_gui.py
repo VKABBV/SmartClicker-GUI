@@ -4,7 +4,11 @@ import unittest
 from unittest import mock
 
 from uwb_capture.common import ParsedRecord
-from uwb_capture.extended_gui import ExtendedUwbCaptureApp
+from uwb_capture.extended_gui import (
+    ExtendedUwbCaptureApp,
+    LIVE_TRACKING_MAX_RESTART_BACKOFF_MS,
+    LIVE_TRACKING_MAX_RESTART_RETRIES,
+)
 from uwb_capture.localization import LocalizationReading, solve_position
 from uwb_capture.protocol import (
     CommandId,
@@ -624,21 +628,24 @@ class LocalizationGuiTests(unittest.TestCase):
         self.assertEqual(app.restart_now_reasons, ["timeout"])
         self.assertEqual(app.after_calls, [])
 
-        with mock.patch("uwb_capture.extended_gui.random.randint", return_value=742):
+        self.assertEqual(LIVE_TRACKING_MAX_RESTART_BACKOFF_MS, 1000)
+        with mock.patch("uwb_capture.extended_gui.random.randint", return_value=742) as randint_mock:
             app._request_live_tracking_restart("radio error")
 
         self.assertEqual(app.live_tracking_restart_retry_count, 2)
         self.assertEqual(app.restart_now_reasons, ["timeout"])
         self.assertEqual(app.live_tracking_after_id, "after1")
         self.assertEqual(app.after_calls[-1][0], 742)
+        randint_mock.assert_called_once_with(0, 1000)
 
         app.after_calls[-1][1]()
 
         self.assertEqual(app.restart_now_reasons, ["timeout", "radio error"])
 
-    def test_live_tracking_restart_stops_after_three_retries(self) -> None:
+    def test_live_tracking_restart_stops_after_fifty_retries(self) -> None:
         app = self.make_live_tick_app()
-        app.live_tracking_restart_retry_count = 3
+        self.assertEqual(LIVE_TRACKING_MAX_RESTART_RETRIES, 50)
+        app.live_tracking_restart_retry_count = LIVE_TRACKING_MAX_RESTART_RETRIES
         app.completed_statuses = []
         app._complete_live_tracking_run = lambda status: app.completed_statuses.append(status)
 
@@ -646,7 +653,7 @@ class LocalizationGuiTests(unittest.TestCase):
 
         self.assertEqual(
             app.completed_statuses,
-            ["Live tracking stopped after 3 restart retries: still failing"],
+            ["Live tracking stopped after 50 restart retries: still failing"],
         )
 
     def test_static_range_offset_is_added_to_each_anchor_offset(self) -> None:
