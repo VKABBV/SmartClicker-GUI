@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import queue
+import re
+import subprocess
 import threading
 from dataclasses import dataclass
 from typing import Any
@@ -22,6 +24,7 @@ DEFAULT_SERVICE_UUID = "494d4543-0001-4757-8000-000000000001"
 DEFAULT_PACKET_TX_UUID = "494d4543-0001-4757-8000-000000000002"
 DEFAULT_PACKET_RX_UUID = "494d4543-0001-4757-8000-000000000003"
 DEFAULT_LOG_TX_UUID = "494d4543-0001-4757-8000-000000000004"
+_BLUEZ_DEVICE_RE = re.compile(r"^Device\s+([0-9A-Fa-f:]{17})\s*(.*)$")
 
 
 class BluetoothError(Exception):
@@ -55,7 +58,10 @@ class BluetoothScanner(threading.Thread):
             self.events.put(("error", "bleak is not installed. Install it with: pip install bleak"))
             return
         try:
-            devices = asyncio.run(BleakScanner.discover(timeout=self.timeout_s))
+            try:
+                devices = asyncio.run(BleakScanner.discover(timeout=self.timeout_s))
+            except Exception:
+                devices = []
             infos = [
                 BluetoothDeviceInfo(
                     address=str(getattr(device, "address", "")),
@@ -64,8 +70,15 @@ class BluetoothScanner(threading.Thread):
                 for device in devices
                 if getattr(device, "address", "")
             ]
+            infos.extend(_connected_bluez_devices())
+            infos.extend(_known_bluez_devices())
+            infos = _dedupe_device_infos(infos)
             if self.name_filter:
-                infos = [info for info in infos if self.name_filter in info.name.lower()]
+                infos = [
+                    info
+                    for info in infos
+                    if self.name_filter in info.name.lower() or _is_clicker_name_or_service(info)
+                ]
             self.events.put(("devices", infos))
         except Exception as exc:
             self.events.put(("error", f"Bluetooth scan failed: {exc}"))
@@ -179,3 +192,102 @@ class BluetoothWorker(threading.Thread):
 
     def stop(self) -> None:
         self.stop_event.set()
+
+
+def _dedupe_device_infos(infos: list[BluetoothDeviceInfo]) -> list[BluetoothDeviceInfo]:
+    merged: dict[str, BluetoothDeviceInfo] = {}
+    order: list[str] = []
+    for info in infos:
+        if not info.address:
+            continue
+        if info.address not in order:
+            order.append(info.address)
+        existing = merged.get(info.address)
+        if existing is None or (not existing.name and info.name):
+            merged[info.address] = info
+    return [merged[address] for address in order if address in merged]
+
+
+def _connected_bluez_devices() -> list[BluetoothDeviceInfo]:
+    return _bluez_devices(["bluetoothctl", "devices", "Connected"], connected=True)
+
+
+def _known_bluez_devices() -> list[BluetoothDeviceInfo]:
+    return _bluez_devices(["bluetoothctl", "devices"], connected=False)
+
+
+def _bluez_devices(command: list[str], *, connected: bool) -> list[BluetoothDeviceInfo]:
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0:
+        return []
+
+    infos: list[BluetoothDeviceInfo] = []
+    for line in result.stdout.splitlines():
+        match = _BLUEZ_DEVICE_RE.match(line.strip())
+        if not match:
+            continue
+        address, name = match.groups()
+        info = _bluez_device_info(address, name.strip(), connected=connected)
+        infos.append(info)
+    return infos
+
+
+def _bluez_device_info(address: str, fallback_name: str, *, connected: bool) -> BluetoothDeviceInfo:
+    name = fallback_name
+    info_connected = connected
+    service_match = False
+    try:
+        result = subprocess.run(
+            ["bluetoothctl", "info", address],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        result = None
+    if result is not None and result.returncode == 0:
+        for line in result.stdout.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Name:"):
+                name = stripped.split(":", 1)[1].strip() or name
+            elif stripped.startswith("Alias:") and not name:
+                name = stripped.split(":", 1)[1].strip()
+            elif stripped.startswith("Connected:"):
+                info_connected = stripped.split(":", 1)[1].strip().lower() == "yes"
+            elif DEFAULT_SERVICE_UUID.lower() in stripped.lower():
+                service_match = True
+    if not name and service_match:
+        name = DEFAULT_DEVICE_NAME
+    if not info_connected:
+        return BluetoothDeviceInfo(address=address, name=name)
+    suffix = " (connected)"
+    if name.endswith(suffix):
+        return BluetoothDeviceInfo(address=address, name=name)
+    return BluetoothDeviceInfo(address=address, name=f"{name or DEFAULT_DEVICE_NAME}{suffix}")
+
+
+def _is_clicker_name_or_service(info: BluetoothDeviceInfo) -> bool:
+    name = info.name.lower()
+    if DEFAULT_DEVICE_NAME.lower() in name or "clicker" in name:
+        return True
+    try:
+        result = subprocess.run(
+            ["bluetoothctl", "info", info.address],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and DEFAULT_SERVICE_UUID.lower() in result.stdout.lower()

@@ -547,7 +547,7 @@ class UwbCaptureApp(tk.Tk):
         ttk.Label(header, text="Current Live Table", style="Status.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Button(header, text="Clear", command=self.clear_live_view).grid(row=0, column=1, sticky="e")
 
-        columns = ("time", "anchor", "sample", "distance", "error", "rx", "fp", "cir", "status", "source")
+        columns = ("time", "anchor", "sample", "distance", "error", "rx", "fp", "cir", "status", "source", "real", "label")
         self.sample_table = ttk.Treeview(frame, columns=columns, show="headings", height=14)
         headings = {
             "time": "Time",
@@ -560,6 +560,8 @@ class UwbCaptureApp(tk.Tk):
             "cir": "CIR power",
             "status": "Status",
             "source": "Source",
+            "real": "Real m",
+            "label": "LOS/NLOS",
         }
         widths = {
             "time": 80,
@@ -572,6 +574,8 @@ class UwbCaptureApp(tk.Tk):
             "cir": 95,
             "status": 120,
             "source": 110,
+            "real": 90,
+            "label": 90,
         }
         for column in columns:
             self.sample_table.heading(column, text=headings[column])
@@ -889,6 +893,11 @@ class UwbCaptureApp(tk.Tk):
 
     def connect_selected_device(self) -> None:
         if self.bluetooth_worker is not None:
+            info = self._connected_device_info()
+            if info is not None:
+                self._select_device_info(info)
+                self.status_var.set(f"Already connected to {info.address}")
+                self.log_raw(f"# Already connected to {info.label}")
             return
         device = self.selected_device()
         if not device:
@@ -903,6 +912,55 @@ class UwbCaptureApp(tk.Tk):
         )
         self.bluetooth_worker.start()
         self.status_var.set(f"Connecting to {device}...")
+
+    def _handle_device_scan_results(self, infos: list[BluetoothDeviceInfo]) -> None:
+        infos = self._merge_connected_device_info(infos)
+        self.device_infos = {info.address: info for info in infos}
+        values = [info.label for info in infos]
+        self.device_combo.configure(values=values)
+        selected = self.selected_device()
+        if values and (not selected or selected not in self.device_infos):
+            self.device_var.set(values[0])
+        connected_suffix = " including active connection" if self.connected_device else ""
+        self.status_var.set(f"Found {len(values)} Bluetooth device(s){connected_suffix}")
+        if self.auto_connect_var.get() and values and self.bluetooth_worker is None:
+            self.connect_selected_device()
+
+    def _merge_connected_device_info(self, infos: list[BluetoothDeviceInfo]) -> list[BluetoothDeviceInfo]:
+        connected = self._connected_device_info()
+        if connected is None:
+            return infos
+        merged: dict[str, BluetoothDeviceInfo] = {info.address: info for info in infos}
+        merged[connected.address] = connected
+        ordered = [connected]
+        ordered.extend(info for info in infos if info.address != connected.address)
+        for info in merged.values():
+            if info.address not in {item.address for item in ordered}:
+                ordered.append(info)
+        return ordered
+
+    def _connected_device_info(self) -> BluetoothDeviceInfo | None:
+        address = (self.connected_device or "").strip()
+        if not address:
+            return None
+        existing = self.device_infos.get(address)
+        name = existing.name if existing is not None else ""
+        selected = self.device_var.get().strip()
+        if not name and selected.split(" - ", 1)[0].strip() == address and " - " in selected:
+            name = selected.split(" - ", 1)[1].strip()
+        if name.endswith(" (connected)"):
+            name = name[: -len(" (connected)")]
+        if not name:
+            name = DEFAULT_DEVICE_NAME
+        return BluetoothDeviceInfo(address=address, name=f"{name} (connected)")
+
+    def _select_device_info(self, info: BluetoothDeviceInfo) -> None:
+        self.device_infos[info.address] = info
+        values = list(self.device_combo.cget("values"))
+        if info.label not in values:
+            values.insert(0, info.label)
+            self.device_combo.configure(values=values)
+        self.device_var.set(info.label)
 
     def _reconnect_bluetooth_immediately(self, reason: str) -> None:
         if self.bluetooth_manual_disconnect_pending or self.bluetooth_worker is not None:
@@ -1187,18 +1245,13 @@ class UwbCaptureApp(tk.Tk):
             while True:
                 event, payload = self.events.get_nowait()
                 if event == "devices":
-                    infos = list(payload)
-                    self.device_infos = {info.address: info for info in infos}
-                    values = [info.label for info in infos]
-                    self.device_combo.configure(values=values)
-                    if values and not self.device_var.get().strip():
-                        self.device_var.set(values[0])
-                    self.status_var.set(f"Found {len(values)} Bluetooth device(s)")
-                    if self.auto_connect_var.get() and values and self.bluetooth_worker is None:
-                        self.connect_selected_device()
+                    self._handle_device_scan_results(list(payload))
                 elif event == "connected":
                     self.bluetooth_manual_disconnect_pending = False
                     self.connected_device = str(payload)
+                    info = self._connected_device_info()
+                    if info is not None:
+                        self._select_device_info(info)
                     self.status_var.set(f"Connected to {payload}")
                     self.log_raw(f"# Connected to {payload}")
                 elif event == "disconnected":
@@ -1249,34 +1302,43 @@ class UwbCaptureApp(tk.Tk):
                 continue
             if record.kind in ("sample", "failure"):
                 self._note_ml_sample_notification(record)
-            if self.store is not None and self.current_session_id is not None:
+            if self.capture_active and self.store is not None and self.current_session_id is not None:
                 if record.kind == "summary":
                     self.store.insert_summary(self.current_session_id, record)
                     alert_error = self.check_los_alert(record)
                     self.add_record_to_table(record, alert_error)
                 else:
                     row_id = self.store.insert_sample(self.current_session_id, record)
-                    if record.event_seq is not None:
-                        self.collection_event_seq = record.event_seq
-                    self.collection_sample_rows.append(row_id)
-                    if record.anchor_id:
-                        self.last_sample_row_by_anchor[record.anchor_id] = row_id
-                        self.collection_sample_rows_by_anchor.setdefault(record.anchor_id, []).append(row_id)
                     alert_error = self.check_los_alert(record)
                     self.check_instability_alert(record)
                     self.add_record_to_table(record, alert_error)
                     self._add_cir_sample(record)
-                    if record.anchor_id:
-                        self.collection_cir_records_by_anchor.setdefault(record.anchor_id, []).append(record)
-                    if self.collection_sample_rows:
-                        item = self.sample_table.get_children()[-1]
-                        self.collection_table_items.append(item)
-                        if record.anchor_id:
-                            self.collection_table_items_by_anchor.setdefault(record.anchor_id, []).append(item)
+                    self._track_collection_sample(record, row_id)
             else:
                 self.add_record_to_table(record)
                 self._add_cir_sample(record)
+                self._track_collection_sample(record)
         self.update_counts()
+
+    def _track_collection_sample(self, record: ParsedRecord, row_id: int | None = None) -> None:
+        if record.kind not in ("sample", "failure"):
+            return
+        if record.event_seq is not None:
+            self.collection_event_seq = record.event_seq
+        if row_id is not None:
+            self.collection_sample_rows.append(row_id)
+            if record.anchor_id:
+                self.last_sample_row_by_anchor[record.anchor_id] = row_id
+                self.collection_sample_rows_by_anchor.setdefault(record.anchor_id, []).append(row_id)
+        if record.anchor_id:
+            self.collection_cir_records_by_anchor.setdefault(record.anchor_id, []).append(record)
+        children = self.sample_table.get_children()
+        if not children:
+            return
+        item = children[-1]
+        self.collection_table_items.append(item)
+        if record.anchor_id:
+            self.collection_table_items_by_anchor.setdefault(record.anchor_id, []).append(item)
 
     def _buffer_diagnostic_fragment(self, record: ParsedRecord) -> None:
         self.pending_diagnostics.append(record)
@@ -1337,7 +1399,13 @@ class UwbCaptureApp(tk.Tk):
             reassembly[offset:end] = chunk
 
     def _flush_diagnostics_to_all_samples(self) -> None:
-        if not self.pending_diagnostics or not self.collection_sample_rows:
+        if not self.pending_diagnostics:
+            return
+        if not (
+            self.collection_sample_rows
+            or self.collection_table_items
+            or self.collection_cir_records_by_anchor
+        ):
             self._clear_pending_diagnostics()
             return
 
@@ -1348,7 +1416,9 @@ class UwbCaptureApp(tk.Tk):
 
         for anchor_id, diagnostics in diagnostics_by_anchor.items():
             row_ids = self.collection_sample_rows_by_anchor.get(anchor_id, [])
-            if not row_ids:
+            table_items = self.collection_table_items_by_anchor.get(anchor_id, [])
+            cir_records = self.collection_cir_records_by_anchor.get(anchor_id, [])
+            if not row_ids and not table_items and not cir_records:
                 continue
             reassembled_cir = self._best_reassembled_cir_for_anchor(anchor_id, diagnostics)
             merged_diag = self._merge_fragments(diagnostics, reassembled_cir)
@@ -1361,7 +1431,7 @@ class UwbCaptureApp(tk.Tk):
                 for row_id in row_ids:
                     self.store.update_sample_cir_full(row_id, cir_hex)
 
-            for item_id in self.collection_table_items_by_anchor.get(anchor_id, []):
+            for item_id in table_items:
                 self._update_table_row_with_diag(item_id, merged_diag)
 
             self._apply_diag_to_cir_history(anchor_id, merged_diag)
@@ -1555,6 +1625,8 @@ class UwbCaptureApp(tk.Tk):
             "" if record.cir_power is None else f"{float(record.cir_power):.2f}",
             record.status or "",
             record.source or "",
+            "" if record.true_distance_m is None else f"{float(record.true_distance_m):.3f}",
+            getattr(record, "los_nlos", None) or "",
         )
         tags: tuple[str, ...] = ()
         threshold = safe_float(self.threshold_var.get())

@@ -30,7 +30,8 @@ from .anchor_geometry import (
     rotate_layout_to_level,
     solve_anchor_layout,
 )
-from .common import export_timestamp
+from .cir_export import CIR_EXPORT_COLUMNS, build_cir_export_rows
+from .common import ParsedRecord, export_timestamp
 from .localization import (
     LOCALIZATION_ALGORITHM,
     LocalizationReading,
@@ -71,6 +72,7 @@ LIVE_TRACKING_WATCHDOG_MS = 3000
 LIVE_TRACKING_SAMPLE_COUNT = 1
 LIVE_TRACKING_MAX_RESTART_RETRIES = 50
 LIVE_TRACKING_MAX_RESTART_BACKOFF_MS = 1000
+LIVE_TABLE_TRUE_DISTANCE_INDEX = 10
 
 
 @dataclass(frozen=True)
@@ -260,9 +262,13 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self.anchor_geometry_tab = ttk.Frame(right_notebook, padding=8)
         self.anchor_geometry_tab.columnconfigure(0, weight=1)
         self.anchor_geometry_tab.rowconfigure(1, weight=1)
+        self.db_manager_tab = ttk.Frame(right_notebook, padding=8)
+        self.db_manager_tab.columnconfigure(0, weight=1)
+        self.db_manager_tab.rowconfigure(1, weight=1)
         right_notebook.add(self.capture_tab, text="Capture Data")
         right_notebook.add(self.localization_tab, text="Localization")
         right_notebook.add(self.anchor_geometry_tab, text="Anchor Geometry")
+        right_notebook.add(self.db_manager_tab, text="DB Manager")
         self.right_notebook = right_notebook
 
         self._build_connection_panel(left)
@@ -273,6 +279,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self._build_log_panel(self.capture_tab)
         self._build_localization_panel(self.localization_tab)
         self._build_anchor_geometry_panel(self.anchor_geometry_tab)
+        self._build_db_manager_panel(self.db_manager_tab)
 
     def _build_session_panel(self, parent: Any) -> None:
         frame = ttk.LabelFrame(parent, text="Measurement Session", padding=8)
@@ -349,7 +356,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         parent.columnconfigure(2, weight=1)
         self.constellation_changed_button = ttk.Button(
             parent,
-            text="Constellation",
+            text="New Constellation",
             command=self.open_constellation_dialog,
         )
         self.constellation_changed_button.grid(
@@ -953,6 +960,8 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             self.live_tracking_status_var.set("Wait for the current ML command to finish.")
             return
 
+        if not self._begin_measurement_session(autosave=True):
+            return
         self._reset_live_tracking_batch()
         if not self._send_live_tracking_start_command():
             return
@@ -2696,6 +2705,15 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             command=self.use_pythagorean_distance_for_anchor,
         ).grid(row=2, column=2, columnspan=4, sticky="ew", padx=(8, 0), pady=(8, 0))
 
+        clear_row = ttk.Frame(container)
+        clear_row.grid(row=3, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+        clear_row.columnconfigure(0, weight=1)
+        ttk.Button(
+            clear_row,
+            text="Clear true distances",
+            command=self.clear_anchor_true_distances,
+        ).grid(row=0, column=1, sticky="e")
+
         self.anchor_truth_table = ttk.Treeview(
             container,
             columns=("anchor_id", "measured_m", "std_cm", "true_distance_m", "diff_m", "los_nlos"),
@@ -2714,7 +2732,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self.anchor_truth_table.column("true_distance_m", width=100, anchor="center")
         self.anchor_truth_table.column("diff_m", width=70, anchor="center")
         self.anchor_truth_table.column("los_nlos", width=80, anchor="center")
-        self.anchor_truth_table.grid(row=3, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+        self.anchor_truth_table.grid(row=4, column=0, columnspan=5, sticky="ew", pady=(8, 0))
         self.anchor_truth_table.tag_configure("mismatch", background="#f8d7da")
         self.anchor_truth_table.bind("<<TreeviewSelect>>", self.on_anchor_truth_selected)
 
@@ -2738,6 +2756,89 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             sticky="ew",
             pady=(8, 0),
         )
+
+    def _build_db_manager_panel(self, parent: Any) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+
+        button_row = ttk.Frame(parent)
+        button_row.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        for column in range(5):
+            button_row.columnconfigure(column, weight=1)
+
+        ttk.Button(button_row, text="Refresh", command=self._refresh_db_manager_sessions).grid(
+            row=0,
+            column=0,
+            sticky="ew",
+            padx=(0, 4),
+        )
+        ttk.Button(button_row, text="Load in Live Table", command=self._load_selected_db_session).grid(
+            row=0,
+            column=1,
+            sticky="ew",
+            padx=4,
+        )
+        ttk.Button(button_row, text="Export Excel", command=self._export_selected_db_session_excel).grid(
+            row=0,
+            column=2,
+            sticky="ew",
+            padx=4,
+        )
+        ttk.Button(button_row, text="Export SQLite", command=self._export_selected_db_session_sqlite).grid(
+            row=0,
+            column=3,
+            sticky="ew",
+            padx=4,
+        )
+        ttk.Button(button_row, text="Delete Session", command=self._delete_selected_db_session).grid(
+            row=0,
+            column=4,
+            sticky="ew",
+            padx=(4, 0),
+        )
+
+        columns = ("id", "started_at", "stopped_at", "constellation", "samples", "anchors")
+        self.db_session_table = ttk.Treeview(
+            parent,
+            columns=columns,
+            show="headings",
+            height=12,
+            selectmode="extended",
+        )
+        headings = {
+            "id": "Session",
+            "started_at": "Started",
+            "stopped_at": "Stopped",
+            "constellation": "Constellation",
+            "samples": "Samples",
+            "anchors": "Anchors",
+        }
+        widths = {
+            "id": 120,
+            "started_at": 170,
+            "stopped_at": 170,
+            "constellation": 160,
+            "samples": 80,
+            "anchors": 80,
+        }
+        for column in columns:
+            self.db_session_table.heading(column, text=headings[column])
+            self.db_session_table.column(column, width=widths[column], anchor="center")
+        self.db_session_table.grid(row=1, column=0, sticky="nsew")
+        self.db_session_table.bind("<Double-1>", lambda _event: self._load_selected_db_session())
+
+        yscroll = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=self.db_session_table.yview)
+        self.db_session_table.configure(yscrollcommand=yscroll.set)
+        yscroll.grid(row=1, column=1, sticky="ns")
+
+        self.db_manager_status_var = tk.StringVar(value="Refresh to list saved sessions.")
+        ttk.Label(parent, textvariable=self.db_manager_status_var, style="Status.TLabel").grid(
+            row=2,
+            column=0,
+            sticky="w",
+            pady=(8, 0),
+        )
+        self._refresh_db_manager_sessions()
 
     def _selected_anchor_id(self) -> str | None:
         anchor_id = self.anchor_id_var.get().strip()
@@ -2864,9 +2965,74 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         self._register_detected_anchor(anchor_id)
         self._refresh_anchor_truth_table()
         self._persist_anchor_true_distance(anchor_id)
+        self._refresh_visible_true_distance(anchor_id, distance)
         self.log_raw(
             f"# True distance saved for anchor {anchor_id}: {format_meter(distance)} m ({source})"
         )
+
+    def _refresh_visible_true_distance(self, anchor_id: str, distance: float) -> None:
+        if not hasattr(self, "sample_table"):
+            return
+        anchor_key = str(anchor_id).strip()
+        display_distance = f"{float(distance):.3f}"
+        for item in self.sample_table.get_children():
+            values = list(self.sample_table.item(item, "values"))
+            if len(values) <= LIVE_TABLE_TRUE_DISTANCE_INDEX:
+                continue
+            if str(values[1]).strip() != anchor_key:
+                continue
+            if values[LIVE_TABLE_TRUE_DISTANCE_INDEX]:
+                continue
+            values[LIVE_TABLE_TRUE_DISTANCE_INDEX] = display_distance
+            measured = safe_float(values[3])
+            if measured is not None and not values[4]:
+                values[4] = f"{abs(float(measured) - float(distance)):.3f}"
+            self.sample_table.item(item, values=values)
+
+    def clear_anchor_true_distances(self) -> None:
+        self.anchor_true_distances.clear()
+        self.anchor_true_distance_var.set("")
+        self.pyth_side_a_var.set("")
+        self.pyth_side_b_var.set("")
+        self.pyth_result_var.set("")
+        session_id = getattr(self, "current_session_id", None)
+        store, should_close = self._open_db_manager_store()
+        try:
+            if store is not None and session_id and table_exists(store.conn, ANCHOR_TRUTH_TABLE):
+                store.conn.execute(
+                    f"DELETE FROM {ANCHOR_TRUTH_TABLE} WHERE session_id = ?",
+                    (session_id,),
+                )
+                store.conn.commit()
+        finally:
+            if should_close:
+                store.close()
+        self._refresh_anchor_truth_table()
+        self.log_raw("# Cleared true distances for this constellation.")
+
+    def _reset_constellation_live_state(self, *, keep_true_distances: bool) -> None:
+        self.clear_live_view()
+        self._reset_trigger_collection_state()
+        self.anchor_measured_distances.clear()
+        self.anchor_distance_history.clear()
+        self.anchor_distance_windows.clear()
+        self.detected_anchor_ids.clear()
+        self.anchor_los_nlos.clear()
+        if hasattr(self, "anchor_id_combo"):
+            self.anchor_id_combo.configure(values=[])
+        if not keep_true_distances:
+            self.anchor_true_distances.clear()
+            if hasattr(self, "anchor_true_distance_var"):
+                self.anchor_true_distance_var.set("")
+            if hasattr(self, "pyth_side_a_var"):
+                self.pyth_side_a_var.set("")
+            if hasattr(self, "pyth_side_b_var"):
+                self.pyth_side_b_var.set("")
+            if hasattr(self, "pyth_result_var"):
+                self.pyth_result_var.set("")
+        if hasattr(self, "clear_localization_inputs"):
+            self.clear_localization_inputs()
+        self._refresh_anchor_truth_table()
 
     def on_anchor_truth_selected(self, _event: Any = None) -> None:
         selected = self.anchor_truth_table.selection()
@@ -2958,71 +3124,44 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
     def open_constellation_dialog(self) -> None:
         current = self.constellation_var.get().strip()
         window = tk.Toplevel(self)
-        window.title("Constellation")
+        window.title("New Constellation")
         window.transient(self)
         window.grab_set()
         window.columnconfigure(0, weight=1)
 
-        notebook = ttk.Notebook(window)
-        notebook.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
-        tab = ttk.Frame(notebook, padding=10)
-        tab.columnconfigure(1, weight=1)
-        notebook.add(tab, text="Constellation label")
+        frame = ttk.Frame(window, padding=10)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(1, weight=1)
 
-        mode_var = tk.StringVar(value="same" if current else "new")
-        label_var = tk.StringVar(value=current or "constellation_1")
+        label_var = tk.StringVar(value=next_constellation_label(current) if current else "constellation_1")
+        keep_true_distances_var = tk.BooleanVar(value=True)
 
-        ttk.Label(tab, text="Is this still the same constellation?").grid(
-            row=0,
-            column=0,
-            columnspan=2,
-            sticky="w",
-            pady=(0, 8),
-        )
-        ttk.Radiobutton(tab, text="Yes, same constellation", variable=mode_var, value="same").grid(
-            row=1,
-            column=0,
-            columnspan=2,
-            sticky="w",
-        )
-        ttk.Radiobutton(tab, text="No, new constellation", variable=mode_var, value="new").grid(
-            row=2,
-            column=0,
-            columnspan=2,
-            sticky="w",
-        )
-        ttk.Radiobutton(
-            tab,
-            text="New label, same distances (only LOS/NLOS changes)",
-            variable=mode_var,
-            value="same_distances",
-        ).grid(
-            row=3,
-            column=0,
-            columnspan=2,
-            sticky="w",
-            pady=(0, 8),
-        )
-        ttk.Label(tab, text="Constellation label").grid(row=4, column=0, sticky="w", pady=2)
-        label_entry = ttk.Entry(tab, textvariable=label_var, width=34)
-        label_entry.grid(row=4, column=1, sticky="ew", pady=2)
+        ttk.Label(frame, text="Constellation label").grid(row=0, column=0, sticky="w", pady=2)
+        label_entry = ttk.Entry(frame, textvariable=label_var, width=34)
+        label_entry.grid(row=0, column=1, sticky="ew", pady=2)
         label_entry.focus_set()
+        ttk.Checkbutton(
+            frame,
+            text="Keep true distances",
+            variable=keep_true_distances_var,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
-        button_row = ttk.Frame(tab)
-        button_row.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        button_row = ttk.Frame(frame)
+        button_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         button_row.columnconfigure(0, weight=1)
         ttk.Button(
             button_row,
             text="Save",
-            command=lambda: self._apply_constellation_choice(mode_var.get(), label_var.get(), window),
+            command=lambda: self._apply_new_constellation(
+                label_var.get(),
+                bool(keep_true_distances_var.get()),
+                window,
+            ),
         ).grid(row=0, column=0, sticky="e", padx=(0, 6))
         ttk.Button(button_row, text="Cancel", command=window.destroy).grid(row=0, column=1, sticky="e")
 
-    def _apply_constellation_choice(self, mode: str, label: str, window: Any) -> None:
-        current = self.constellation_var.get().strip()
+    def _apply_new_constellation(self, label: str, keep_true_distances: bool, window: Any) -> None:
         label = label.strip()
-        if mode == "same" and not label:
-            label = current
         if not label:
             messagebox.showerror(
                 "Missing constellation label",
@@ -3031,49 +3170,25 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             )
             return
 
-        if mode == "same":
-            self.constellation_var.set(label)
-            self._set_constellation_status(label)
-            self.log_raw(f"# Constellation confirmed unchanged: {label}")
-            window.destroy()
-            return
-
         was_capturing = bool(getattr(self, "capture_active", False))
         if was_capturing:
-            if mode == "same_distances":
-                question = (
-                    "Stop the current session and start a new one with this label? "
-                    "True distances are kept; only LOS/NLOS and measured data reset."
-                )
-            else:
-                question = (
-                    "Stop the current logging session and start a new one "
-                    "with this constellation label?"
-                )
             proceed = messagebox.askyesno(
                 "New constellation",
-                question,
+                "Stop the current logging session and start a new one with this constellation label?",
                 parent=window,
             )
             if not proceed:
                 return
             self.stop_capture()
 
-        if mode == "same_distances":
-            self.anchor_measured_distances.clear()
-            self.anchor_distance_history.clear()
-            self.anchor_los_nlos.clear()
-            self._refresh_anchor_truth_table()
-            self.log_raw(
-                f"# New constellation label: {label} (true distances kept, "
-                "LOS/NLOS and measured data reset)"
-            )
-        else:
-            self.log_raw(f"# New constellation label: {label}")
-
+        self._reset_constellation_live_state(keep_true_distances=keep_true_distances)
+        self.current_session_id = None
         self.constellation_var.set(label)
         self._set_constellation_status(label)
         window.destroy()
+        suffix = "true distances kept" if keep_true_distances else "true distances cleared"
+        self.log_raw(f"# New constellation label: {label} ({suffix})")
+        self._refresh_db_manager_sessions()
 
         if was_capturing:
             self.start_capture()
@@ -3130,6 +3245,16 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
                 original.now_local_iso(),
             ),
         )
+        store.conn.execute(
+            """
+            UPDATE samples
+            SET true_distance_m = ?
+            WHERE session_id = ?
+              AND anchor_id = ?
+              AND true_distance_m IS NULL
+            """,
+            (data["true_distance_m"], session_id, anchor_id),
+        )
         store.conn.commit()
 
     def _persist_all_anchor_true_distances(self) -> None:
@@ -3180,14 +3305,107 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             return UNKNOWN_LOS_NLOS
         return normalize_los_nlos(self.anchor_los_nlos.get(str(anchor_id).strip(), UNKNOWN_LOS_NLOS))
 
-    def start_capture(self) -> None:
-        super().start_capture()
-        if getattr(self, "store", None) is None or not getattr(self, "current_session_id", None):
-            return
+    def _prompt_for_constellation_label(self) -> bool:
+        current = self.constellation_var.get().strip()
+        if current:
+            return True
+        label = simpledialog.askstring(
+            "Constellation name",
+            "Enter a constellation name before collecting data.",
+            initialvalue="constellation_1",
+            parent=self,
+        )
+        if label is None:
+            return False
+        label = label.strip()
+        if not label:
+            messagebox.showwarning(
+                "Missing constellation name",
+                "A constellation name is required before collecting data.",
+                parent=self,
+            )
+            return False
+        self.constellation_var.set(label)
+        self._set_constellation_status(label)
+        self.log_raw(f"# Constellation label set before collection: {label}")
+        return True
+
+    def _store_matches_configured_db(self) -> bool:
+        store = getattr(self, "store", None)
+        if store is None or not hasattr(self, "db_path_var"):
+            return False
+        configured = Path(self.db_path_var.get()).expanduser()
+        if not configured.name and hasattr(self, "output_dir_var"):
+            configured = Path(self.output_dir_var.get()).expanduser() / original.DEFAULT_DB_NAME
+        try:
+            return store.db_path.expanduser().resolve() == configured.resolve()
+        except OSError:
+            return store.db_path == configured
+
+    def _begin_measurement_session(self, *, autosave: bool) -> bool:
+        if (
+            getattr(self, "capture_active", False)
+            and getattr(self, "store", None) is not None
+            and getattr(self, "current_session_id", None)
+        ):
+            return True
+        if not self._prompt_for_constellation_label():
+            return False
+
+        output_dir = Path(self.output_dir_var.get()).expanduser()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        db_path = Path(self.db_path_var.get()).expanduser()
+        if not db_path.name:
+            db_path = output_dir / original.DEFAULT_DB_NAME
+            self.db_path_var.set(str(db_path))
+
+        if getattr(self, "store", None) is None or not self._store_matches_configured_db():
+            if getattr(self, "store", None) is not None:
+                self.store.close()
+            self.store = original.MeasurementStore(db_path)
+
+        metadata = self.session_metadata()
+        self.current_session_id = self.store.create_session(metadata)
+        self.capture_active = True
+        self.sample_count_var.set("0")
+        self.alert_count_var.set("0")
+        self.raw_count_var.set("0")
+        self.last_alert_prompt.clear()
+        self.last_instability_prompt.clear()
+        self.anchor_distance_windows.clear()
+        self.last_sample_row_by_anchor.clear()
+        self._reset_trigger_collection_state()
         self._ensure_anchor_truth_schema()
         self._ensure_responder_label_schema()
         self._persist_all_anchor_true_distances()
         self._persist_all_anchor_los_nlos()
+        prefix = "Autosaving" if autosave else "Capturing"
+        self.session_status_var.set(f"{prefix}: {self.current_session_id[:8]}")
+        self.log_raw(f"# Started {'autosave ' if autosave else ''}session {self.current_session_id}")
+        self._refresh_db_manager_sessions()
+        return True
+
+    def _ensure_autosave_session_for_records(self, records: list[Any]) -> None:
+        if getattr(self, "capture_active", False):
+            return
+        if not self.constellation_var.get().strip():
+            return
+        if not any(getattr(record, "kind", None) in ("sample", "failure", "summary") for record in records):
+            return
+        self._begin_measurement_session(autosave=True)
+
+    def start_capture(self) -> None:
+        self._begin_measurement_session(autosave=False)
+
+    def stop_capture(self) -> None:
+        super().stop_capture()
+        self._refresh_db_manager_sessions()
+
+    def send_ml_start_collection(self, *, collection_mode: str | None = None) -> bool:
+        if getattr(self, "bluetooth_worker", None) is not None and not getattr(self, "ml_command_in_flight", False):
+            if not self._begin_measurement_session(autosave=True):
+                return False
+        return super().send_ml_start_collection(collection_mode=collection_mode)
 
     def disconnect_transport(self) -> None:
         if self.live_tracking_active:
@@ -3225,6 +3443,11 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
 
     def handle_serial_line(self, line: str) -> None:
         super().handle_serial_line(line)
+        self._refresh_db_manager_sessions()
+
+    def handle_protocol_packet(self, data: bytes) -> None:
+        super().handle_protocol_packet(data)
+        self._refresh_db_manager_sessions()
 
     def handle_records(self, records: list[Any]) -> None:
         normal_records: list[Any] = []
@@ -3236,11 +3459,17 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         if not normal_records:
             return
 
+        self._ensure_autosave_session_for_records(normal_records)
         localization_updated = False
         for record in normal_records:
             if record.anchor_id:
                 anchor_key = str(record.anchor_id).strip()
                 self._register_detected_anchor(record.anchor_id)
+                truth = self._anchor_true_distance_for(record.anchor_id)
+                if getattr(record, "kind", None) in ("sample", "failure"):
+                    record.los_nlos = self._anchor_los_nlos_for(record.anchor_id)
+                if truth and getattr(record, "kind", None) in ("sample", "failure", "summary"):
+                    record.true_distance_m = truth["true_distance_m"]
                 if self.live_tracking_active and record.kind in ("sample", "failure", "summary"):
                     self._record_live_tracking_sample(record)
                     continue
@@ -3258,6 +3487,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             self._try_live_tracking_solve()
         self._refresh_anchor_truth_table()
         super().handle_records(normal_records)
+        self._refresh_db_manager_sessions()
 
     def check_los_alert(self, record: Any) -> float | None:
         distance = self._record_range_m(record)
@@ -3275,7 +3505,7 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         if (
             getattr(self, "store", None) is not None
             and getattr(self, "current_session_id", None)
-            and self._anchor_los_nlos_for(record.anchor_id) == "LOS"
+            and normalize_los_nlos(getattr(record, "los_nlos", None)) == "LOS"
             and absolute_error > threshold
         ):
             anchor = record.anchor_id or "unknown"
@@ -3333,6 +3563,9 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
         display_time = datetime.now().strftime("%H:%M:%S")
         distance = self._record_range_m(record)
         truth = self._anchor_true_distance_for(record.anchor_id)
+        true_distance = getattr(record, "true_distance_m", None)
+        if true_distance is None and truth:
+            true_distance = truth["true_distance_m"]
         error = alert_error
         if error is None and truth and distance is not None:
             error = abs(float(distance) - float(truth["true_distance_m"]))
@@ -3348,6 +3581,8 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
             "" if record.cir_power is None else f"{float(record.cir_power):.2f}",
             record.status or "",
             record.source or "",
+            "" if true_distance is None else f"{float(true_distance):.3f}",
+            normalize_los_nlos(getattr(record, "los_nlos", None)),
         )
 
         tags: tuple[str, ...] = ()
@@ -3461,6 +3696,291 @@ class ExtendedUwbCaptureApp(original.UwbCaptureApp):
 
         messagebox.showinfo("Export complete", f"Wrote {output_path}", parent=self)
 
+    def _open_db_manager_store(self) -> tuple[Any | None, bool]:
+        active_store = getattr(self, "store", None)
+        if not hasattr(self, "db_path_var"):
+            return active_store, False
+        db_path = Path(self.db_path_var.get()).expanduser()
+        if active_store is not None:
+            try:
+                same_db = active_store.db_path.expanduser().resolve() == db_path.resolve()
+            except OSError:
+                same_db = active_store.db_path == db_path
+            if same_db or getattr(self, "capture_active", False):
+                return active_store, False
+        if not db_path.exists():
+            return None, False
+        return original.MeasurementStore(db_path), True
+
+    def _refresh_db_manager_sessions(self, *, preserve_selection: bool = True) -> None:
+        if not hasattr(self, "db_session_table"):
+            return
+        selected_before = set(self.db_session_table.selection()) if preserve_selection else set()
+        for item in self.db_session_table.get_children():
+            self.db_session_table.delete(item)
+
+        store, should_close = self._open_db_manager_store()
+        if store is None:
+            if hasattr(self, "db_manager_status_var"):
+                self.db_manager_status_var.set("No SQLite database exists yet.")
+            return
+        try:
+            rows = store.list_sessions()
+            for row in rows:
+                session_id = str(row["id"])
+                self.db_session_table.insert(
+                    "",
+                    tk.END,
+                    iid=session_id,
+                    values=(
+                        session_id[:8],
+                        row["started_at"] or "",
+                        row["stopped_at"] or "",
+                        row["constellation_label"] or "",
+                        row["sample_count"],
+                        row["anchor_count"],
+                    ),
+                )
+            selected_after = [session_id for session_id in selected_before if self.db_session_table.exists(session_id)]
+            if selected_after:
+                self.db_session_table.selection_set(*selected_after)
+            if hasattr(self, "db_manager_status_var"):
+                self.db_manager_status_var.set(f"{len(rows)} saved session(s).")
+        except Exception as exc:
+            if hasattr(self, "db_manager_status_var"):
+                self.db_manager_status_var.set(f"DB refresh failed: {exc}")
+        finally:
+            if should_close:
+                store.close()
+
+    def _selected_db_session_ids(self) -> list[str]:
+        selected = self.db_session_table.selection()
+        if not selected:
+            messagebox.showwarning("No session selected", "Select a saved session first.", parent=self)
+            return []
+        return [str(session_id) for session_id in selected]
+
+    def _selected_db_session_id(self) -> str | None:
+        selected = self._selected_db_session_ids()
+        if not selected:
+            return None
+        if len(selected) > 1:
+            messagebox.showwarning(
+                "Multiple sessions selected",
+                "Select one session for loading or export.",
+                parent=self,
+            )
+            return None
+        return selected[0]
+
+    def _load_selected_db_session(self) -> None:
+        session_id = self._selected_db_session_id()
+        if session_id is None:
+            return
+        try:
+            sample_count = self._load_db_session_into_live_table(session_id)
+        except Exception as exc:
+            messagebox.showerror("Load failed", str(exc), parent=self)
+            return
+        if hasattr(self, "db_manager_status_var"):
+            self.db_manager_status_var.set(
+                f"Loaded {sample_count} sample row(s) from session {session_id[:8]}."
+            )
+
+    def _load_db_session_into_live_table(self, session_id: str) -> int:
+        store, should_close = self._open_db_manager_store()
+        if store is None:
+            raise ValueError("No SQLite database exists yet.")
+        try:
+            session = store.session_row(session_id)
+            sample_rows = store.conn.execute(
+                "SELECT * FROM samples WHERE session_id = ? ORDER BY id",
+                (session_id,),
+            ).fetchall()
+            summary_rows = store.conn.execute(
+                "SELECT * FROM summaries WHERE session_id = ? ORDER BY id",
+                (session_id,),
+            ).fetchall()
+            self.anchor_true_distances = fetch_anchor_truths(store.conn, session_id)
+            self.anchor_los_nlos = fetch_anchor_los_nlos(store.conn, session_id)
+            counts = store.counts(session_id)
+        finally:
+            if should_close:
+                store.close()
+
+        self.clear_live_view()
+        self._reset_trigger_collection_state()
+        self.anchor_measured_distances.clear()
+        self.anchor_distance_history.clear()
+        self.anchor_distance_windows.clear()
+        self.detected_anchor_ids.clear()
+        self.current_session_id = session_id
+        self.constellation_var.set(session["constellation_label"] or "")
+        self._set_constellation_status(session["constellation_label"] or "")
+
+        for row in sample_rows:
+            record = parsed_record_from_sample_row(row)
+            if record.anchor_id:
+                anchor_id = str(record.anchor_id).strip()
+                self._register_detected_anchor(anchor_id)
+                if record.distance_m is not None:
+                    self.anchor_measured_distances[anchor_id] = float(record.distance_m)
+                    self.anchor_distance_history.setdefault(anchor_id, []).append(float(record.distance_m))
+            self.add_record_to_table(record)
+            self._add_cir_sample(record)
+
+        for row in summary_rows:
+            record = parsed_record_from_summary_row(row)
+            if record.anchor_id:
+                record.los_nlos = self._anchor_los_nlos_for(record.anchor_id)
+            if record.anchor_id:
+                anchor_id = str(record.anchor_id).strip()
+                self._register_detected_anchor(anchor_id)
+                if record.mean_distance_m is not None:
+                    self.anchor_measured_distances[anchor_id] = float(record.mean_distance_m)
+            self.add_record_to_table(record)
+
+        if hasattr(self, "anchor_id_combo"):
+            self.anchor_id_combo.configure(values=sorted(self.detected_anchor_ids, key=str))
+        if hasattr(self, "sample_count_var"):
+            self.sample_count_var.set(str(counts["samples"]))
+            self.alert_count_var.set(str(counts["alerts"]))
+            self.raw_count_var.set(str(counts["raw_lines"]))
+        self._refresh_anchor_truth_table()
+        self.log_raw(f"# Loaded saved session {session_id} into the live table.")
+        return len(sample_rows)
+
+    def _export_selected_db_session_excel(self) -> None:
+        session_id = self._selected_db_session_id()
+        if session_id is None:
+            return
+        store, should_close = self._open_db_manager_store()
+        if store is None:
+            messagebox.showwarning("No database", "No SQLite database exists yet.", parent=self)
+            return
+        try:
+            session = store.session_row(session_id)
+            default_name = (
+                f"{safe_filename(session['constellation_label'] or 'constellation')}_"
+                f"{session_id[:8]}_{export_timestamp()}.xlsx"
+            )
+        except Exception as exc:
+            if should_close:
+                store.close()
+            messagebox.showerror("Export failed", str(exc), parent=self)
+            return
+
+        output_path = filedialog.asksaveasfilename(
+            initialdir=self.output_dir_var.get(),
+            initialfile=default_name,
+            defaultextension=".xlsx",
+            filetypes=[("Excel workbook", "*.xlsx")],
+            parent=self,
+        )
+        if not output_path:
+            if should_close:
+                store.close()
+            return
+        try:
+            store.export_session_to_excel(session_id, Path(output_path))
+        except Exception as exc:
+            messagebox.showerror("Export failed", str(exc), parent=self)
+            return
+        finally:
+            if should_close:
+                store.close()
+        messagebox.showinfo("Export complete", f"Wrote {output_path}", parent=self)
+
+    def _export_selected_db_session_sqlite(self) -> None:
+        session_id = self._selected_db_session_id()
+        if session_id is None:
+            return
+        store, should_close = self._open_db_manager_store()
+        if store is None:
+            messagebox.showwarning("No database", "No SQLite database exists yet.", parent=self)
+            return
+        try:
+            session = store.session_row(session_id)
+            default_name = (
+                f"{safe_filename(session['constellation_label'] or 'constellation')}_"
+                f"{session_id[:8]}_{export_timestamp()}.sqlite"
+            )
+        except Exception as exc:
+            if should_close:
+                store.close()
+            messagebox.showerror("Export failed", str(exc), parent=self)
+            return
+
+        output_path = filedialog.asksaveasfilename(
+            initialdir=self.output_dir_var.get(),
+            initialfile=default_name,
+            defaultextension=".sqlite",
+            filetypes=[("SQLite database", "*.sqlite"), ("SQLite database", "*.db")],
+            parent=self,
+        )
+        if not output_path:
+            if should_close:
+                store.close()
+            return
+        try:
+            store.export_session_subset_to_sqlite(session_id, Path(output_path))
+        except Exception as exc:
+            messagebox.showerror("Export failed", str(exc), parent=self)
+            return
+        finally:
+            if should_close:
+                store.close()
+        messagebox.showinfo("Export complete", f"Wrote {output_path}", parent=self)
+
+    def _delete_selected_db_session(self) -> None:
+        session_ids = self._selected_db_session_ids()
+        if not session_ids:
+            return
+        active_session = getattr(self, "current_session_id", None)
+        if getattr(self, "capture_active", False) and active_session in session_ids:
+            messagebox.showwarning(
+                "Capture active",
+                "Stop the active capture before deleting its session.",
+                parent=self,
+            )
+            return
+        count = len(session_ids)
+        session_text = (
+            f"session {session_ids[0][:8]}"
+            if count == 1
+            else f"{count} selected sessions"
+        )
+        proceed = messagebox.askyesno(
+            "Delete sessions",
+            f"Delete {session_text} and all of their samples?",
+            parent=self,
+        )
+        if not proceed:
+            return
+
+        store, should_close = self._open_db_manager_store()
+        if store is None:
+            messagebox.showwarning("No database", "No SQLite database exists yet.", parent=self)
+            return
+        try:
+            for session_id in session_ids:
+                store.delete_session(session_id)
+        except Exception as exc:
+            messagebox.showerror("Delete failed", str(exc), parent=self)
+            return
+        finally:
+            if should_close:
+                store.close()
+        if active_session in session_ids:
+            self.current_session_id = None
+            self.clear_live_view()
+            self.anchor_measured_distances.clear()
+            self.anchor_distance_history.clear()
+            self._refresh_anchor_truth_table()
+        self._refresh_db_manager_sessions(preserve_selection=False)
+        if hasattr(self, "db_manager_status_var"):
+            self.db_manager_status_var.set(f"Deleted {count} session(s).")
+
 
 def table_exists(con: sqlite3.Connection, table_name: str) -> bool:
     row = con.execute(
@@ -3509,6 +4029,98 @@ def fetch_anchor_los_nlos(con: sqlite3.Connection, session_id: str) -> dict[str,
         str(row["anchor_id"]): normalize_los_nlos(row["ground_truth_los_nlos"])
         for row in rows
     }
+
+
+def table_columns(con: sqlite3.Connection, table_name: str) -> set[str]:
+    if not table_exists(con, table_name):
+        return set()
+    return {row["name"] for row in con.execute(f"PRAGMA table_info({table_name})").fetchall()}
+
+
+def row_value(row: sqlite3.Row, key: str, default: Any = None) -> Any:
+    return row[key] if key in row.keys() else default
+
+
+def sample_los_nlos(row: sqlite3.Row, fallback: str = UNKNOWN_LOS_NLOS) -> str:
+    value = normalize_los_nlos(row_value(row, "los_nlos"))
+    if value == UNKNOWN_LOS_NLOS:
+        return normalize_los_nlos(fallback)
+    return value
+
+
+def sample_true_distance(row: sqlite3.Row, fallback: float | None = None) -> float | None:
+    value = safe_float(row_value(row, "true_distance_m"))
+    if value is not None:
+        return value
+    return safe_float(fallback)
+
+
+def los_nlos_for_samples(samples: list[sqlite3.Row], fallback: str = UNKNOWN_LOS_NLOS) -> str:
+    labels = {
+        sample_los_nlos(row)
+        for row in samples
+        if sample_los_nlos(row) != UNKNOWN_LOS_NLOS
+    }
+    if len(labels) > 1:
+        return "Mixed"
+    if len(labels) == 1:
+        return next(iter(labels))
+    return normalize_los_nlos(fallback)
+
+
+def parsed_record_from_sample_row(row: sqlite3.Row) -> ParsedRecord:
+    distance = row_value(row, "distance_m")
+    status = str(row_value(row, "status") or "")
+    error_code = row_value(row, "error_code")
+    failure = distance is None and bool(status or error_code)
+    return ParsedRecord(
+        kind="failure" if failure else "sample",
+        anchor_id=row_value(row, "anchor_id"),
+        clicker_id=row_value(row, "clicker_id"),
+        sample_index=row_value(row, "sample_index"),
+        distance_m=distance,
+        rx_power_dbm=row_value(row, "rx_power_dbm"),
+        fp_power_dbm=row_value(row, "fp_power_dbm"),
+        cir_power=row_value(row, "cir_power"),
+        cir_raw=row_value(row, "cir_raw"),
+        status=row_value(row, "status"),
+        error_code=error_code,
+        source=row_value(row, "source"),
+        raw_line=row_value(row, "raw_line"),
+        los_nlos=normalize_los_nlos(row_value(row, "los_nlos")),
+        true_distance_m=row_value(row, "true_distance_m"),
+        event_seq=row_value(row, "event_seq"),
+        scheduled_sample_count=row_value(row, "scheduled_sample_count"),
+        quality=row_value(row, "quality"),
+        firmware_timestamp_ms=row_value(row, "firmware_timestamp_ms"),
+        phy_config_id=row_value(row, "phy_config_id"),
+        burst_id=row_value(row, "burst_id"),
+        tlv_json=row_value(row, "tlv_json"),
+        exchange_stride_us=row_value(row, "exchange_stride_us"),
+        burst_duration_ms=row_value(row, "burst_duration_ms"),
+        diag_status_flags=row_value(row, "diag_status_flags"),
+        diag_bytes_captured=row_value(row, "diag_bytes_captured"),
+        diag_bytes_transmitted=row_value(row, "diag_bytes_transmitted"),
+        report_fragment_count=row_value(row, "report_fragment_count"),
+        uwb_clock_offset_raw=row_value(row, "uwb_clock_offset_raw"),
+        uwb_carrier_integrator=row_value(row, "uwb_carrier_integrator"),
+        clicker_diag_bytes=row_value(row, "clicker_diag_bytes"),
+        cir_first_path_index=row_value(row, "cir_first_path_index"),
+        cir_start_index=row_value(row, "cir_start_index"),
+        diag_source=row_value(row, "diag_source"),
+    )
+
+
+def parsed_record_from_summary_row(row: sqlite3.Row) -> ParsedRecord:
+    return ParsedRecord(
+        kind="summary",
+        anchor_id=row_value(row, "anchor_id"),
+        mean_distance_m=row_value(row, "mean_distance_m"),
+        good_count=row_value(row, "good_count"),
+        status=row_value(row, "status"),
+        source=row_value(row, "source"),
+        raw_line=row_value(row, "raw_line"),
+    )
 
 
 def session_anchor_ids(con: sqlite3.Connection, session_id: str) -> list[str]:
@@ -3587,7 +4199,10 @@ def export_session_per_anchor(
         ).fetchall()
 
         truth = truths.get(anchor_id)
-        los_nlos = los_nlos_by_anchor.get(anchor_id, UNKNOWN_LOS_NLOS)
+        los_nlos = los_nlos_for_samples(
+            samples,
+            los_nlos_by_anchor.get(anchor_id, UNKNOWN_LOS_NLOS),
+        )
         mean_measured = measured_mean_for_anchor(
             samples,
             summaries,
@@ -3641,7 +4256,7 @@ def write_anchor_session_workbook(
     true_source = truth["distance_source"] if truth else ""
     side_a = truth.get("pythagorean_side_a_m") if truth else None
     side_b = truth.get("pythagorean_side_b_m") if truth else None
-    los_nlos = normalize_los_nlos(los_nlos)
+    los_nlos = "Mixed" if str(los_nlos).strip().lower() == "mixed" else normalize_los_nlos(los_nlos)
 
     columns = [
         "timestamp",
@@ -3674,9 +4289,10 @@ def write_anchor_session_workbook(
 
     for row in samples:
         measured = apply_range_offset(row["distance_m"], range_static_offset_m)
+        row_true_distance = sample_true_distance(row, true_distance)
         alert_metric = (
-            abs(float(measured) - float(true_distance))
-            if measured is not None and true_distance is not None
+            abs(float(measured) - float(row_true_distance))
+            if measured is not None and row_true_distance is not None
             else None
         )
         ws.append(
@@ -3688,11 +4304,11 @@ def write_anchor_session_workbook(
                 row["event_seq"],
                 row["scheduled_sample_count"],
                 measured,
-                true_distance,
+                row_true_distance,
                 true_source,
                 side_a,
                 side_b,
-                los_nlos,
+                sample_los_nlos(row, los_nlos),
                 row["rx_power_dbm"],
                 row["fp_power_dbm"],
                 row["cir_power"],
@@ -3709,6 +4325,12 @@ def write_anchor_session_workbook(
             ])
         )
 
+    add_rows_sheet(
+        wb,
+        "CIR Samples",
+        CIR_EXPORT_COLUMNS,
+        build_cir_export_rows(samples),
+    )
     add_rows_sheet(
         wb,
         "Summaries",
@@ -3833,9 +4455,16 @@ def build_measurement_rows(
             """
         ).fetchall()
 
+        samples_columns = table_columns(con, "samples")
+        sample_label_expr = "los_nlos" if "los_nlos" in samples_columns else "NULL AS los_nlos"
+        sample_true_distance_expr = (
+            "true_distance_m" if "true_distance_m" in samples_columns else "NULL AS true_distance_m"
+        )
         sample_rows = con.execute(
-            """
+            f"""
             SELECT session_id, anchor_id, distance_m
+                 , {sample_label_expr}
+                 , {sample_true_distance_expr}
             FROM samples
             WHERE distance_m IS NOT NULL
             """
@@ -3875,19 +4504,6 @@ def build_measurement_rows(
     finally:
         con.close()
 
-    samples_by_key: dict[tuple[str, str], list[float]] = {}
-    for row in sample_rows:
-        anchor_id = row["anchor_id"] or ""
-        key = (row["session_id"], anchor_id)
-        corrected = apply_range_offset(row["distance_m"], range_static_offset_m)
-        if corrected is not None:
-            samples_by_key.setdefault(key, []).append(corrected)
-
-    latest_summary_by_key: dict[tuple[str, str], sqlite3.Row] = {}
-    for row in summary_rows:
-        anchor_id = row["anchor_id"] or ""
-        latest_summary_by_key[(row["session_id"], anchor_id)] = row
-
     truth_by_key: dict[tuple[str, str], sqlite3.Row] = {}
     for row in truth_rows:
         anchor_id = row["anchor_id"] or ""
@@ -3898,23 +4514,52 @@ def build_measurement_rows(
         anchor_id = row["anchor_id"] or ""
         label_by_key[(row["session_id"], anchor_id)] = normalize_los_nlos(row["ground_truth_los_nlos"])
 
+    samples_by_key: dict[tuple[str, str, str, float | None], list[float]] = {}
+    for row in sample_rows:
+        anchor_id = row["anchor_id"] or ""
+        fallback_label = label_by_key.get((row["session_id"], anchor_id), UNKNOWN_LOS_NLOS)
+        label = sample_los_nlos(row, fallback_label)
+        truth = truth_by_key.get((row["session_id"], anchor_id))
+        fallback_true_distance = truth["true_distance_m"] if truth is not None else None
+        true_distance = sample_true_distance(row, fallback_true_distance)
+        key = (row["session_id"], anchor_id, label, true_distance)
+        corrected = apply_range_offset(row["distance_m"], range_static_offset_m)
+        if corrected is not None:
+            samples_by_key.setdefault(key, []).append(corrected)
+
+    latest_summary_by_key: dict[tuple[str, str, str, float | None], sqlite3.Row] = {}
+    for row in summary_rows:
+        anchor_id = row["anchor_id"] or ""
+        label = label_by_key.get((row["session_id"], anchor_id), UNKNOWN_LOS_NLOS)
+        truth = truth_by_key.get((row["session_id"], anchor_id))
+        true_distance = safe_float(truth["true_distance_m"]) if truth is not None else None
+        latest_summary_by_key[(row["session_id"], anchor_id, label, true_distance)] = row
+
     session_by_id = {row["id"]: row for row in sessions}
     keys = sorted(
         set(samples_by_key) | set(latest_summary_by_key),
-        key=lambda item: (session_by_id[item[0]]["started_at"], item[1]),
+        key=lambda item: (
+            session_by_id[item[0]]["started_at"],
+            item[1],
+            item[2],
+            -1.0 if item[3] is None else float(item[3]),
+        ),
     )
 
     rows: list[dict[str, Any]] = []
-    for session_id, anchor_id in keys:
+    for session_id, anchor_id, los_nlos, true_distance in keys:
         session = session_by_id[session_id]
-        values = samples_by_key.get((session_id, anchor_id), [])
-        latest_summary = latest_summary_by_key.get((session_id, anchor_id))
+        values = samples_by_key.get((session_id, anchor_id, los_nlos, true_distance), [])
+        latest_summary = latest_summary_by_key.get((session_id, anchor_id, los_nlos, true_distance))
         truth = truth_by_key.get((session_id, anchor_id))
+        row_true_distance = true_distance
+        if row_true_distance is None and truth is not None:
+            row_true_distance = truth["true_distance_m"]
         mean_distance = (
-            apply_range_offset(latest_summary["mean_distance_m"], range_static_offset_m)
-            if latest_summary is not None
-            else statistics.fmean(values)
+            statistics.fmean(values)
             if values
+            else apply_range_offset(latest_summary["mean_distance_m"], range_static_offset_m)
+            if latest_summary is not None
             else None
         )
         rows.append(
@@ -3929,13 +4574,13 @@ def build_measurement_rows(
                 "uwb_mean_distance_m": mean_distance,
                 "sample_count": len(values),
                 "sample_std_m": statistics.stdev(values) if len(values) > 1 else None,
-                "true_ground_truth_distance_m": truth["true_distance_m"] if truth is not None else None,
+                "true_ground_truth_distance_m": row_true_distance,
                 "true_distance_source": truth["distance_source"] if truth is not None else "",
                 "pythagorean_side_a_m": truth["pythagorean_side_a_m"] if truth is not None else None,
                 "pythagorean_side_b_m": truth["pythagorean_side_b_m"] if truth is not None else None,
                 "session_ground_truth_m": session["ground_truth_m"],
                 "outlier_threshold_m": session["outlier_threshold_m"],
-                "ground_truth_los_nlos": label_by_key.get((session_id, anchor_id), UNKNOWN_LOS_NLOS),
+                "ground_truth_los_nlos": los_nlos,
                 "status": latest_summary["status"] if latest_summary is not None else "",
                 "source": latest_summary["source"] if latest_summary is not None else "",
             }

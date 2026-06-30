@@ -67,6 +67,8 @@ class ParsedRecord:
     error_code: str | None = None
     source: str | None = None
     raw_line: str | None = None
+    los_nlos: str | None = None
+    true_distance_m: float | None = None
     # ML clicker diagnostic fields.
     event_seq: int | None = None
     scheduled_sample_count: int | None = None

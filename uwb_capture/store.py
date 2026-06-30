@@ -9,6 +9,7 @@ from typing import Any
 
 import openpyxl
 
+from .cir_export import CIR_EXPORT_COLUMNS, build_cir_export_rows
 from .common import ParsedRecord, now_local_iso
 
 class MeasurementStore:
@@ -86,6 +87,8 @@ class MeasurementStore:
                 cir_first_path_index INTEGER,
                 cir_start_index INTEGER,
                 diag_source INTEGER,
+                los_nlos TEXT,
+                true_distance_m REAL,
                 FOREIGN KEY(session_id) REFERENCES sessions(id)
             );
 
@@ -145,6 +148,8 @@ class MeasurementStore:
         "cir_first_path_index": "INTEGER",
         "cir_start_index": "INTEGER",
         "diag_source": "INTEGER",
+        "los_nlos": "TEXT",
+        "true_distance_m": "REAL",
     }
 
     def _migrate_samples_columns(self) -> None:
@@ -211,9 +216,10 @@ class MeasurementStore:
                 exchange_stride_us, burst_duration_ms, diag_status_flags,
                 diag_bytes_captured, diag_bytes_transmitted, report_fragment_count,
                 uwb_clock_offset_raw, uwb_carrier_integrator, clicker_diag_bytes,
-                cir_first_path_index, cir_start_index, diag_source
+                cir_first_path_index, cir_start_index, diag_source, los_nlos,
+                true_distance_m
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -249,6 +255,8 @@ class MeasurementStore:
                 record.cir_first_path_index,
                 record.cir_start_index,
                 record.diag_source,
+                record.los_nlos,
+                record.true_distance_m,
             ),
         )
         self.conn.commit()
@@ -344,6 +352,104 @@ class MeasurementStore:
             raise ValueError(f"Unknown session id: {session_id}")
         return row
 
+    def list_sessions(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """
+            SELECT
+                s.*,
+                (
+                    SELECT COUNT(*)
+                    FROM samples sample
+                    WHERE sample.session_id = s.id
+                ) AS sample_count,
+                (
+                    SELECT COUNT(DISTINCT sample.anchor_id)
+                    FROM samples sample
+                    WHERE sample.session_id = s.id AND sample.anchor_id IS NOT NULL
+                ) AS anchor_count
+            FROM sessions s
+            ORDER BY s.started_at DESC, s.id DESC
+            """
+        ).fetchall()
+
+    def delete_session(self, session_id: str) -> None:
+        self.session_row(session_id)
+        for table in (
+            "anchor_true_distances",
+            "responder_los_nlos_labels",
+            "raw_lines",
+            "alerts",
+            "summaries",
+            "samples",
+        ):
+            if self._table_exists(table):
+                self.conn.execute(f"DELETE FROM {table} WHERE session_id = ?", (session_id,))
+        self.conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        self.conn.commit()
+
+    def export_session_subset_to_sqlite(self, session_id: str, output_path: Path) -> None:
+        self.session_row(session_id)
+        output_path = Path(output_path)
+        if output_path.expanduser().resolve() == self.db_path.expanduser().resolve():
+            raise ValueError("Choose a different file for the session SQLite export.")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if output_path.exists():
+            output_path.unlink()
+
+        tables = [
+            table
+            for table in (
+                "sessions",
+                "raw_lines",
+                "samples",
+                "summaries",
+                "alerts",
+                "anchor_true_distances",
+                "responder_los_nlos_labels",
+            )
+            if self._table_exists(table)
+        ]
+
+        dest = sqlite3.connect(output_path)
+        dest.row_factory = sqlite3.Row
+        try:
+            for table in tables:
+                row = self.conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    (table,),
+                ).fetchone()
+                if row is not None and row["sql"]:
+                    dest.execute(row["sql"])
+
+            for table in tables:
+                if table == "sessions":
+                    rows = self.conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchall()
+                else:
+                    rows = self.conn.execute(f"SELECT * FROM {table} WHERE session_id = ?", (session_id,)).fetchall()
+                self._copy_rows(dest, table, rows)
+            dest.commit()
+        finally:
+            dest.close()
+
+    def _table_exists(self, table_name: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _copy_rows(dest: sqlite3.Connection, table: str, rows: list[sqlite3.Row]) -> None:
+        if not rows:
+            return
+        columns = list(rows[0].keys())
+        placeholders = ", ".join("?" for _ in columns)
+        column_sql = ", ".join(columns)
+        dest.executemany(
+            f"INSERT INTO {table} ({column_sql}) VALUES ({placeholders})",
+            ([row[column] for column in columns] for row in rows),
+        )
+
     def export_session_to_excel(self, session_id: str, output_path: Path) -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         wb = openpyxl.Workbook()
@@ -355,7 +461,12 @@ class MeasurementStore:
             session_sheet.append([key, session[key]])
         session_sheet.freeze_panes = "A2"
 
-        self._write_table_sheet(wb, "Samples", "SELECT * FROM samples WHERE session_id = ? ORDER BY id", session_id)
+        sample_rows = self.conn.execute(
+            "SELECT * FROM samples WHERE session_id = ? ORDER BY id",
+            (session_id,),
+        ).fetchall()
+        self._write_rows_sheet(wb, "Samples", sample_rows)
+        self._write_cir_samples_sheet(wb, sample_rows)
         self._write_table_sheet(wb, "Summaries", "SELECT * FROM summaries WHERE session_id = ? ORDER BY id", session_id)
         self._write_table_sheet(wb, "Alerts", "SELECT * FROM alerts WHERE session_id = ? ORDER BY id", session_id)
         self._write_table_sheet(
@@ -377,6 +488,13 @@ class MeasurementStore:
     def _write_table_sheet(self, wb: openpyxl.Workbook, title: str, sql: str, session_id: str) -> None:
         sheet = wb.create_sheet(title)
         rows = self.conn.execute(sql, (session_id,)).fetchall()
+        self._write_rows_to_sheet(sheet, rows)
+
+    def _write_rows_sheet(self, wb: openpyxl.Workbook, title: str, rows: list[sqlite3.Row]) -> None:
+        sheet = wb.create_sheet(title)
+        self._write_rows_to_sheet(sheet, rows)
+
+    def _write_rows_to_sheet(self, sheet: openpyxl.worksheet.worksheet.Worksheet, rows: list[sqlite3.Row]) -> None:
         if not rows:
             sheet.append(["No rows"])
             return
@@ -386,6 +504,12 @@ class MeasurementStore:
             sheet.append([row[key] for key in headers])
         sheet.freeze_panes = "A2"
 
+    def _write_cir_samples_sheet(self, wb: openpyxl.Workbook, sample_rows: list[sqlite3.Row]) -> None:
+        sheet = wb.create_sheet("CIR Samples")
+        sheet.append(CIR_EXPORT_COLUMNS)
+        for row in build_cir_export_rows(sample_rows):
+            sheet.append(row)
+        sheet.freeze_panes = "A2"
+
     def close(self) -> None:
         self.conn.close()
-
